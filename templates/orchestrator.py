@@ -136,6 +136,34 @@ def run_tests():
     return result.returncode == 0, result.stdout + result.stderr
 
 
+def file_size(path):
+    """Return file size in bytes, or 0 if the file doesn't exist."""
+    p = Path(path)
+    return p.stat().st_size if p.exists() else 0
+
+
+def check_regression(target_file, baseline_size):
+    """
+    Return True if the target file shrank by more than 80% vs baseline.
+    Catches cases where a model replaces a real file with a stub or stray command.
+    Only meaningful when the baseline was non-trivial (>50 bytes).
+    """
+    if baseline_size < 50:
+        return False
+    current = file_size(target_file)
+    return current < baseline_size * 0.2
+
+
+def revert_regression(target_file, baseline_size):
+    """Undo the last commit and print a warning."""
+    current = file_size(target_file)
+    print(
+        f"  [REGRESSION GUARD] {target_file} shrank from {baseline_size}B to {current}B "
+        f"(>{int((1 - current/baseline_size)*100)}% reduction) -- reverting commit."
+    )
+    subprocess.run(["git", "reset", "--hard", "HEAD~1"], check=True)
+
+
 def parse_target_file(spec_text):
     lines = spec_text.splitlines()
     for i, line in enumerate(lines):
@@ -216,6 +244,10 @@ def run_task(spec_file, default_branch):
     # --- Normal first run ---
     subprocess.run(["git", "checkout", "-b", branch_name], check=True)
 
+    # Snapshot target file size before any model writes, so we can detect
+    # regressions where a model replaces a real file with a stub or stray text.
+    baseline_size = file_size(target_file)
+
     primary_model, api_base = select_primary_model(spec_text)
     model_label = "Llama 4 Scout" if api_base is None else "Qwen3/Kimi K2/Scout via LiteLLM"
 
@@ -230,6 +262,10 @@ def run_task(spec_file, default_branch):
             run_aider(primary_model,
                 f"Tests failed. Output:\n{output}\nFix the code to pass all tests.",
                 target_file, api_base)
+        if check_regression(target_file, baseline_size):
+            revert_regression(target_file, baseline_size)
+            continue
+        baseline_size = max(baseline_size, file_size(target_file))
         passed, _ = run_tests()
         if passed:
             print(f"PASSED (Stage 1, attempt {attempt}): {task_name}")
@@ -244,6 +280,10 @@ def run_task(spec_file, default_branch):
         run_aider(ESCALATION_MODEL,
             f"Previous model failed. Tests output:\n{output}\nAnalyze carefully and fix.",
             target_file)
+        if check_regression(target_file, baseline_size):
+            revert_regression(target_file, baseline_size)
+            continue
+        baseline_size = max(baseline_size, file_size(target_file))
         passed, output = run_tests()
         if passed:
             print(f"PASSED (GPT-OSS 120B, attempt {attempt}): {task_name}")

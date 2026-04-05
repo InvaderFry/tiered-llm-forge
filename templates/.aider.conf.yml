@@ -1,0 +1,9 @@
+model: groq/qwen/qwen3-32b
+editor-model: groq/qwen/qwen3-32b
+weak-model: groq/llama-3.1-8b-instant
+auto-commits: true
+yes-always: true
+architect: true
+auto-test: true
+test-cmd: pytest tests/ -x
+commit-prompt: "Write a concise git commit message in imperative mood. Output ONLY the commit message text. Do not include reasoning, thinking steps, <think> tags, or any explanation outside the commit message itself."
