@@ -50,9 +50,10 @@ From here, follow the workflow in that project's `README.md`.
 5.  Review specs/ manually before running the pipeline
 6.  python3 orchestrator.py
 7.  For failures: back to claude
-    > "Fix task-NNN. Log is at specs/FAILED-task-NNN-name.log."
+    > "Fix the failures."
 8.  Repeat 6–7 until all tasks pass
-9.  Squash-merge each passing task branch
+9.  Back to claude for the final quality gate
+    > "Review the task branches and merge them."
 ```
 
 The pipeline (step 6) uses zero Claude tokens — it runs entirely on free Groq
@@ -94,7 +95,7 @@ tiered-llm-forge/
     ├── .aider.conf.yml
     ├── litellm-config.yaml
     ├── orchestrator.py
-    ├── README.md
+    ├── ORCHESTRATION.md
     ├── CLAUDE.md
     ├── src/__init__.py
     └── tests/conftest.py

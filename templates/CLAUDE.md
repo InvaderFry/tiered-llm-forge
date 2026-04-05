@@ -269,24 +269,84 @@ task-005  Integration / wiring (depends on all above)
 
 When a task lands in `specs/FAILED-task-NNN-name.log`, it means the primary
 model tier (Qwen3/Kimi K2/Llama 4 Scout) **and** GPT-OSS 120B both failed after
-their full retry budget. Bring in the failure like this:
+their full retry budget.
 
-```
-Look at specs/FAILED-task-003-api-endpoints.log and the code in
-src/api/endpoints.py on branch task/task-003-api-endpoints.
-The primary tier and GPT-OSS 120B both failed to pass the tests.
-Diagnose and fix so all tests in tests/test-003-api-endpoints.py pass.
-```
+### Trigger phrase
 
-When fixing a failed task:
-- Check out the task branch first: `git checkout task/task-003-api-endpoints`
-- Read the failure log to understand what the model attempted
-- Fix the implementation directly — do not regenerate from scratch unless the
-  spec itself was wrong
-- After fixing, run `pytest tests/test-003-api-endpoints.py -v` to confirm
-- Commit your fix: `git add . && git commit -m "fix: task-003 — [what you fixed]"`
-- Return to master and re-run `python3 orchestrator.py` — it will detect the passing
-  branch and skip it
+The user will say something like: **"Fix the failures"** or **"Fix task NNN"**
+
+### What you do
+
+For each failed task (or the specific task named):
+
+1. Read `specs/task-NNN-name.md` to understand what was asked.
+2. Read `specs/FAILED-task-NNN-name.log` to understand what the models attempted
+   and where they broke down.
+3. Checkout the branch: `git checkout task/task-NNN-name`
+4. Read the current state of the implementation file.
+5. Diagnose the root cause — is this a bad implementation, or a bad/untestable spec?
+   - If the **spec is the problem**: fix the spec AND the tests before touching
+     the implementation. A bad spec will just fail again on the next run.
+   - If the **implementation is the problem**: fix the code directly. Do not
+     regenerate from scratch unless the existing code is a total dead-end.
+6. Run `pytest tests/test-NNN-name.py -v` to confirm all tests pass.
+7. Commit: `git add <file> && git commit -m "fix: task-NNN — <what you fixed>"`
+8. Stay on the task branch — do not return to the default branch. The orchestrator
+   detects passing branches on re-run and skips them automatically.
+
+Repeat for each failed task, then tell the user to re-run `python3 orchestrator.py`.
+
+---
+
+## Pre-Merge Branch Review
+
+After the orchestrator reports all tasks passing, run a quality gate before
+squash-merging into the default branch.
+
+### Trigger phrase
+
+The user will say something like: **"Review the task branches"** or
+**"Review and merge the passing branches"**
+
+### What you do
+
+For each passing task branch, in alphabetical order:
+
+1. Read `specs/task-NNN-name.md`.
+2. Run `git diff main..task/task-NNN-name` to see the full diff.
+3. Evaluate against three criteria:
+   - **Correctness** — does the implementation satisfy every function signature,
+     type, and constraint in the spec?
+   - **Integration safety** — does the diff touch anything outside the spec's
+     target file? If so, is that change safe?
+   - **Code quality** — is the code readable and idiomatic? Minor style issues
+     are acceptable; fix anything that will create real maintenance debt.
+
+4. Make one of three decisions and act on it immediately:
+
+   **MERGE** — meets goals, acceptable quality.
+   ```
+   git checkout main
+   git merge --squash task/task-NNN-name
+   git commit -m "feat: task-NNN — <one-line description>"
+   git branch -d task/task-NNN-name
+   ```
+
+   **FIX THEN MERGE** — tests pass but a constraint was missed or there is a
+   correctable quality issue. Fix directly on the task branch, run
+   `pytest tests/test-NNN-name.py -v` to confirm, commit the fix, then
+   squash-merge as above.
+
+   **FLAG** — tests pass but the implementation fundamentally misses the spec's
+   intent (e.g. tests were too weak, logic is inverted, wrong abstraction chosen).
+   Do NOT merge. Write `specs/REVIEW-task-NNN-name.md` with:
+   - What the implementation does
+   - Why it doesn't meet the spec's intent
+   - What a correct implementation needs to do differently
+   Leave the branch in place. Tell the user this task needs a new attempt.
+
+5. After all branches: summarise what was merged, what was fixed-then-merged,
+   and what was flagged (with file paths to the REVIEW notes).
 
 ---
 
@@ -341,6 +401,7 @@ project-root/
 | "Review the specs" | Read specs/SpecsReadMe.md first, then flag issues and edit specs directly |
 | "Update the readme" | Update specs/SpecsReadMe.md to reflect current spec state |
 | "Run the pipeline" | Remind user to run `python3 orchestrator.py` — you don't run it |
-| "Fix task NNN" | Check out branch, read failure log, fix implementation, commit |
+| "Fix the failures" / "Fix task NNN" | Read spec + log, checkout branch, diagnose root cause, fix, run pytest, commit |
+| "Review the task branches" | Diff each branch against spec, then MERGE / FIX THEN MERGE / FLAG each one |
 | "Add a task for Y" | Write a new `specs/task-NNN-y.md` + `tests/test-NNN-y.py`, update SpecsReadMe.md |
 | "What's the status?" | Run `git branch --list "task/*"` and `ls specs/FAILED-*.log` |
