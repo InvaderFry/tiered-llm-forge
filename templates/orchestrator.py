@@ -102,13 +102,16 @@ def run_aider(model, message, target_file, api_base=None):
 
     fallback_wait = 15  # seconds, doubles each retry
     for attempt in range(1, AIDER_MAX_RATE_RETRIES + 1):
-        result = subprocess.run(cmd, capture_output=False, text=True, check=False)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        # Stream output so the user can see aider's progress
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="")
         if result.returncode == 0:
             return
 
-        # Capture stderr to check for rate limit
-        probe = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        combined = (probe.stdout or "") + (probe.stderr or "")
+        combined = (result.stdout or "") + (result.stderr or "")
 
         if "rate_limit_exceeded" in combined or "Rate limit reached" in combined:
             wait = _parse_retry_after(combined)
