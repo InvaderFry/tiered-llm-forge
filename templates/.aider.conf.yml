@@ -1,3 +1,6 @@
+# Aider defaults — model names match those in models.yaml.
+# The orchestrator overrides --model per invocation; these are fallback defaults
+# for manual aider usage.
 model: groq/qwen/qwen3-32b
 editor-model: groq/qwen/qwen3-32b
 weak-model: groq/llama-3.1-8b-instant

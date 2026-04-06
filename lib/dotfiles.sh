@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 # lib/dotfiles.sh — Install .env and .gitignore into the new project
 
 install_dotfiles() {

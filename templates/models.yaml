@@ -1,0 +1,33 @@
+# models.yaml — Single source of truth for all model configuration.
+# The orchestrator reads this file. Aider gets model names from here.
+# To add a new provider (e.g., Google AI Studio), add models to the appropriate tier.
+
+tiers:
+  - name: primary
+    models:
+      - groq/qwen/qwen3-32b
+      - groq/moonshotai/kimi-k2-instruct
+      - groq/meta-llama/llama-4-scout-17b-16e-instruct
+    retries: 3
+
+  - name: escalation
+    models:
+      - groq/openai/gpt-oss-120b
+    retries: 2
+
+# Weak model for commit messages and safe operations (low token cost)
+weak_model: groq/llama-3.1-8b-instant
+
+# Model used when a spec exceeds the large context threshold
+large_context_model: groq/meta-llama/llama-4-scout-17b-16e-instruct
+
+# Specs larger than this (in chars) route directly to the large context model
+large_context_chars: 16000
+
+# Spec compression thresholds
+spec_limits:
+  soft_limit_chars: 12000   # strip ## Context section above this
+  hard_limit_chars: 16000   # hard-truncate above this
+
+# Seconds to pause between tasks (lets Groq's per-minute TPM window reset)
+cooldown_seconds: 30

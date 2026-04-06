@@ -5,15 +5,21 @@ Claude plans and reviews. Free Groq models implement.
 
 ---
 
-## Phase 1: Set Your API Keys
+## Phase 1: Setup (once)
 
-Edit `.env` in the project root before running anything:
+### Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### Set your API keys
+
+Edit `.env` in the project root:
 
 ```bash
 nano .env
 ```
-
-Fill in your values:
 
 ```env
 GROQ_API_KEY=your-groq-key-here
@@ -24,191 +30,143 @@ Get keys from:
 - **Groq:** https://console.groq.com → API Keys
 - **Google AI Studio (optional):** https://aistudio.google.com → Get API Key
 
-> ⚠️ `.env` is in `.gitignore` — it will never be committed. Never paste keys
-> into any other file that gets committed.
+> `.env` is in `.gitignore` — it will never be committed.
 
-Load your keys into the shell before running the pipeline:
-
-```bash
-export $(cat .env | grep -v '#' | xargs)
-```
-
-Add that line to `~/.bashrc` to load keys automatically on every terminal open.
-
----
-
-## Phase 2: Start LiteLLM (once per reboot)
-
-LiteLLM is the routing proxy that handles Groq model fallback. Start it with Docker:
+Load keys into the shell:
 
 ```bash
 export $(cat .env | grep -v '#' | xargs)
-
-docker run -d --name litellm -p 4000:4000 \
-  -v $(pwd)/litellm-config.yaml:/app/config.yaml \
-  -e GROQ_API_KEY=$GROQ_API_KEY \
-  ghcr.io/berriai/litellm:main-latest \
-  --config /app/config.yaml
 ```
 
-After the first time, just run:
-
-```bash
-docker start litellm
-```
-
-Verify it's running:
-
-```bash
-curl http://localhost:4000/health
-```
+Add that line to `~/.bashrc` for automatic loading.
 
 ---
 
-## Phase 3: Plan with Claude Code
-
-Open Claude Code in this project directory:
+## Phase 2: Plan with Claude Code
 
 ```bash
 claude
 ```
 
-CLAUDE.md is already loaded — Claude Code knows the spec format, file locations,
-naming conventions, and its role. You just need to describe what you want to build.
-
-**Basic prompt (enough for most features):**
+CLAUDE.md is loaded automatically. Describe what you want to build:
 
 ```
 I want to build [feature]. Generate the specs and tests.
 ```
 
-**Better prompt (give context, get better decomposition):**
+Claude writes spec files with YAML frontmatter, test files, and a
+`specs/SpecsReadMe.md` summary.
+
+**Other useful prompts:**
 
 ```
-I want to build [feature]. It should [key behaviours]. Generate the specs and tests.
+Review the specs you just created.
+Add a task for [new requirement].
 ```
 
-Example:
+---
 
-```
-I want to build a rate limiter for an API. It should track requests per user
-per minute using a sliding window, reject over-limit requests with a 429
-response, and persist state in Redis so it survives restarts. Generate the
-specs and tests.
-```
+## Phase 3: Validate Specs
 
-**Other useful prompts to keep handy:**
+Before running the pipeline, validate all specs:
 
-After specs are generated, before running the pipeline:
-```
-Review the specs you just created. Check for dependency ordering issues,
-tasks that touch more than one file, and tests that might not be self-contained.
+```bash
+make validate
 ```
 
-Adding to an existing codebase:
-```
-I want to add [feature] to the existing codebase. Read src/ first, then
-generate specs that follow the same patterns already in use.
-```
+This checks:
+- Required frontmatter fields (target, test, dependencies)
+- Test files exist
+- No dependency cycles
+- Token budget compliance
+- Prints the dependency-ordered execution plan
 
-Fixing a failure:
-```
-Fix task-003. The log is at specs/FAILED-task-003-name.log.
-```
-
-Use `/status` inside Claude Code to check your remaining Pro usage budget.
-Planning is your most valuable use of Claude tokens — describe the feature
-well and let CLAUDE.md handle the process.
+Fix any errors before proceeding.
 
 ---
 
 ## Phase 4: Review Specs (Manual Checkpoint)
 
-Before running the pipeline, read through the specs Claude generated:
-
-- Each task touches only one file (or a minimal set)
-- Tests actually cover the acceptance criteria
-- Specs include enough context about existing code patterns
-- Tasks are ordered correctly (dependencies first)
+Read `specs/SpecsReadMe.md` and check:
+- Each task touches only one file
+- Tests cover acceptance criteria
+- Dependencies are ordered correctly
+- Specs include enough context about existing patterns
 
 Edit spec files directly if anything looks wrong. This is your last cheap
-chance to catch architectural mistakes before cheap models start generating code.
+chance to catch mistakes.
 
 ---
 
 ## Phase 5: Run the Pipeline
 
+Preview what will happen:
+
 ```bash
-export $(cat .env | grep -v '#' | xargs)
-python3 orchestrator.py
+make dry-run
 ```
 
-The orchestrator loops through every `specs/task-*.md` file and:
+Run for real:
+
+```bash
+make run
+```
+
+The orchestrator processes each spec in dependency order:
 
 1. Creates a `task/task-NNN-name` git branch
-2. Runs Aider with **Qwen3 32B → Kimi K2 → Llama 4 Scout** via LiteLLM (3 attempts)
-3. Escalates to **GPT-OSS 120B** directly if primary tier fails (2 attempts)
-4. Writes a `specs/FAILED-task-NNN-name.log` if all attempts fail
-5. Returns to the default branch and moves to the next task
+2. Tries all primary tier models with fallback (3 attempts)
+3. Escalates to the escalation tier if primary fails (2 attempts)
+4. Writes `specs/FAILED-task-NNN-name.log` if all attempts fail
+5. Returns to default branch, moves to next task
 
-**Re-running is safe.** Tasks with passing branches are skipped automatically.
-Tasks with failing branches go straight to Claude review without wasting retries.
+**Re-running is safe.** Passing branches are skipped. Failing branches go
+straight to Claude review.
 
 ### Model routing
 
-| Condition | Model used |
-|-----------|-----------|
-| Normal task | Qwen3 32B via LiteLLM (falls back to Kimi K2 → Llama 4 Scout on 429) |
-| Spec > ~4K tokens | Llama 4 Scout directly (30K TPM handles large context) |
-| Primary tier fails all retries | GPT-OSS 120B directly (never via LiteLLM) |
-| Commit messages | Llama 3.1 8B (14.4K RPD — never burns primary quota) |
+Models are configured in `models.yaml`. Default tiers:
+
+| Tier | Models | When used |
+|------|--------|-----------|
+| Primary | Qwen3 32B → Kimi K2 → Llama 4 Scout | Normal tasks, fallback on rate limit |
+| Escalation | GPT-OSS 120B | After primary tier exhausted |
+| Large context | Llama 4 Scout | Specs > 16K chars |
 
 ---
 
-## Phase 6: Review Failures with Claude
-
-After the pipeline finishes, check for failures:
+## Phase 6: Fix Failures with Claude
 
 ```bash
-ls specs/FAILED-*.log
+ls specs/FAILED-*.log    # check for failures
+claude
 ```
-
-If there are failures, open Claude Code and use this prompt:
 
 ```
 Fix the failures.
 ```
 
-Claude will find every `specs/FAILED-*.log`, diagnose each one (checking
-whether the spec or the implementation is at fault), fix the code on the task
-branch, and confirm tests pass before committing. To fix a single task:
+Claude reads the failure logs, diagnoses root cause, fixes on the task branch,
+and confirms tests pass. Then re-run:
 
+```bash
+make run
 ```
-Fix task-003.
-```
-
-After Claude finishes, re-run the pipeline. Fixed branches are detected as
-passing and skipped automatically.
 
 ---
 
-## Phase 7: Review and Merge Passing Tasks
+## Phase 7: Review and Merge
 
-After the pipeline prints "All tasks passing", hand off to Claude for the
-quality gate:
+After all tasks pass:
 
 ```
 Review the task branches and merge them.
 ```
 
-Claude will diff each branch against its spec and make one of three decisions:
-
-- **MERGE** — squash-merges the branch into main automatically
-- **FIX THEN MERGE** — corrects a quality issue on the branch, then merges
-- **FLAG** — writes `specs/REVIEW-task-NNN-name.md` explaining why the branch
-  doesn't meet the spec's intent; does not merge; you'll need to re-attempt
-
-Claude summarises the outcome for every branch when done.
+Claude diffs each branch against its spec and decides:
+- **MERGE** — squash-merge automatically
+- **FIX THEN MERGE** — correct quality issue, then merge
+- **FLAG** — writes REVIEW notes, does not merge
 
 ---
 
@@ -216,22 +174,18 @@ Claude summarises the outcome for every branch when done.
 
 ```
 1. cd ~/projects/{{PROJECT_NAME}}
-2. docker start litellm                         # if not already running
-3. export $(cat .env | grep -v '#' | xargs)
-4. claude                                       # open Claude Code
-   > "I want to build [feature]. Generate the specs and tests."
-   > "Review the specs you just created."      # optional sanity check
-5. Review specs/ manually                       # Phase 4: catch anything obvious
-6. python3 orchestrator.py                      # Phase 5: run pipeline
-7. For failures: claude                         # Phase 6: fix failures
+2. export $(cat .env | grep -v '#' | xargs)
+3. claude                                      # plan
+   > "Build [feature]. Generate specs and tests."
+4. make validate                               # check specs
+5. Review specs/ manually                      # catch anything obvious
+6. make run                                    # run pipeline
+7. claude                                      # fix failures (if any)
    > "Fix the failures."
-8. python3 orchestrator.py                      # re-run until all pass
-9. claude                                       # Phase 7: review and merge
+8. make run                                    # re-run until all pass
+9. claude                                      # review and merge
    > "Review the task branches and merge them."
 ```
-
-**Expected Claude Pro usage:** ~30–45 minutes of interactive Claude Code per day
-(planning + failure review). The pipeline itself uses zero Claude tokens.
 
 ---
 
@@ -239,33 +193,43 @@ Claude summarises the outcome for every branch when done.
 
 | What | Command |
 |------|---------|
+| Install deps | `pip install -r requirements.txt` |
 | Load env vars | `export $(cat .env \| grep -v '#' \| xargs)` |
-| Start LiteLLM | `docker start litellm` |
 | Open Claude Code | `claude` |
-| Check Claude usage | `/status` inside Claude Code |
-| Run pipeline | `python3 orchestrator.py` |
+| Validate specs | `make validate` |
+| Preview pipeline | `make dry-run` |
+| Run pipeline | `make run` |
 | Check failures | `ls specs/FAILED-*.log` |
 | See task branches | `git branch --list "task/*"` |
-| Diff a task branch | `git diff master..task/task-001-name` |
+| Pipeline state | `cat pipeline-state.json` |
+| See all commands | `make help` |
 
 ---
 
 ## Troubleshooting
 
 **Aider can't find Groq models**
-→ Run `export $(cat .env | grep -v '#' | xargs)` first. Add to `~/.bashrc` to make it permanent.
-
-**LiteLLM container exits immediately**
-→ Run `docker logs litellm`. Most common cause: missing `GROQ_API_KEY` env var or malformed `litellm-config.yaml`.
+→ Run `export $(cat .env | grep -v '#' | xargs)` first.
 
 **pytest can't import src modules**
 → Make sure `src/__init__.py` exists and you're running pytest from the project root.
 
 **Rate limit 429 from Groq**
-→ LiteLLM falls back automatically to Kimi K2 → Llama 4 Scout. If all three are exhausted, wait a few minutes — Groq limits reset hourly.
+→ The orchestrator automatically falls back through the model chain (configured
+in `models.yaml`). If all models are exhausted, wait a few minutes — Groq
+limits reset hourly.
 
-**Task branch already exists error**
-→ This shouldn't happen anymore. The orchestrator detects existing branches and either skips (if passing) or routes to Claude review (if failing).
+**Task branch already exists**
+→ The orchestrator handles this automatically: skips passing branches, escalates
+failing branches to Claude review.
 
-**Claude Code hits usage limits**
-→ Use `/status` to check budget before planning. Work during off-peak hours (before 5 AM PT or after 11 AM PT) to avoid tighter limits.
+**Spec validation errors**
+→ Run `make validate` and fix all errors before `make run`.
+
+**Pipeline crashed mid-run**
+→ Just re-run `make run`. The pipeline state and git branches persist. Passing
+tasks are skipped, failed tasks are detected.
+
+**Want to add a new model provider**
+→ Edit `models.yaml` and add models to the appropriate tier. The orchestrator
+reads model names directly — any model Aider supports will work.

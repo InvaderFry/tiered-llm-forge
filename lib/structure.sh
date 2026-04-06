@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 # lib/structure.sh — Create project directory layout and initialize git
 
 setup_structure() {
