@@ -13,4 +13,10 @@ install_python() {
     echo "✔  Makefile created"
     echo "✔  src/__init__.py created"
     echo "✔  tests/conftest.py created"
+
+    echo "→  Creating virtual environment (.venv)…"
+    python3 -m venv "$PROJECT_DIR/.venv"
+    "$PROJECT_DIR/.venv/bin/pip" install --quiet --upgrade pip
+    "$PROJECT_DIR/.venv/bin/pip" install --quiet -r "$PROJECT_DIR/requirements.txt"
+    echo "✔  .venv created and dependencies installed"
 }
