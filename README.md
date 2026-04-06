@@ -17,7 +17,7 @@ and copy of all the workflow files.
 
 - [Aider](https://aider.chat) installed and on your PATH
 - A [Groq API key](https://console.groq.com)
-- Python 3.10+ with `pip`
+- Python 3.10+ with `python3-venv` (`sudo apt install python3-venv` on Debian/Ubuntu)
 
 ---
 
@@ -27,12 +27,12 @@ and copy of all the workflow files.
 bash ~/projects/tiered-llm-forge/new-project.sh
 ```
 
-This creates `~/projects/my-project-YYYYMMDD-HHMMSS/` with everything you need.
-Then:
+This creates `~/projects/my-project-YYYYMMDD-HHMMSS/` with everything you need,
+including a `.venv` with dependencies already installed. Then:
 
 ```bash
 cd ~/projects/my-project-YYYYMMDD-HHMMSS/
-pip install -r requirements.txt
+source .venv/bin/activate
 ```
 
 From here, follow the workflow in that project's `ORCHESTRATION.md`.
