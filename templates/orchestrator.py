@@ -1,3 +1,4 @@
+import os
 import re
 import subprocess
 import time
@@ -63,11 +64,16 @@ def _parse_retry_after(stderr_text):
     """
     Extract the retry-after wait time from a Groq 429 error message.
     Groq includes 'Please try again in Xs.' in the error body.
+
+    Uses the LAST occurrence in the output — LiteLLM may retry internally and
+    print multiple rate-limit errors; the last one reflects the most recent
+    state of the sliding token window.
+
     Returns seconds as a float, or None if not found.
     """
-    match = re.search(r"try again in ([0-9.]+)s", stderr_text)
-    if match:
-        return float(match.group(1))
+    matches = re.findall(r"try again in ([0-9.]+)s", stderr_text)
+    if matches:
+        return float(matches[-1])
     return None
 
 
@@ -100,9 +106,16 @@ def run_aider(model, message, target_file, api_base=None):
     if api_base:
         cmd += ["--openai-api-base", api_base, "--openai-api-key", "sk-anything"]
 
+    # Disable LiteLLM's internal retry loop — it retries too aggressively
+    # (0.2s, 0.5s, ... 8s) without respecting Groq's "try again in Xs" hint,
+    # causing repeated 429s that burn through the token window. We handle all
+    # retry logic here with the correct wait times.
+    aider_env = os.environ.copy()
+    aider_env["LITELLM_NUM_RETRIES"] = "0"
+
     fallback_wait = 15  # seconds, doubles each retry
     for attempt in range(1, AIDER_MAX_RATE_RETRIES + 1):
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=aider_env)
         # Stream output so the user can see aider's progress
         if result.stdout:
             print(result.stdout, end="")
@@ -116,7 +129,7 @@ def run_aider(model, message, target_file, api_base=None):
         if "rate_limit_exceeded" in combined or "Rate limit reached" in combined:
             wait = _parse_retry_after(combined)
             if wait:
-                wait += 2  # small buffer so the window has definitely reset
+                wait += 5  # buffer so the sliding window has definitely reset
                 print(f"  [rate limit: sleeping {wait:.1f}s as instructed by Groq (attempt {attempt}/{AIDER_MAX_RATE_RETRIES})]")
             else:
                 wait = fallback_wait
