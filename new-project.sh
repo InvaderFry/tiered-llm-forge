@@ -3,7 +3,20 @@
 # Run from anywhere: bash /path/to/tiered-llm-forge/new-project.sh
 # Creates: ~/projects/my-project-YYYYMMDD-HHMMSS/
 
-set -e
+set -euo pipefail
+
+cleanup() {
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        echo ""
+        echo "ERROR: Project creation failed (exit code $exit_code)."
+        if [ -d "${PROJECT_DIR:-}" ]; then
+            echo "Partial project left at: $PROJECT_DIR"
+            echo "You may want to remove it: rm -rf $PROJECT_DIR"
+        fi
+    fi
+}
+trap cleanup EXIT
 
 FORGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
@@ -39,9 +52,9 @@ echo "  Project ready: $PROJECT_DIR"
 echo "=================================================="
 echo ""
 echo "Next steps:"
-echo "  1. Edit .env and add your GROQ_API_KEY"
-echo "  2. Start LiteLLM:  docker start litellm"
-echo "     (or start fresh: see README Phase 2)"
-echo "  3. Open Claude Code: cd $PROJECT_DIR && claude"
-echo "  4. See README.md for the full workflow"
+echo "  1. cd $PROJECT_DIR"
+echo "  2. pip install -r requirements.txt"
+echo "  3. Edit .env and add your GROQ_API_KEY"
+echo "  4. Open Claude Code: claude"
+echo "  5. See ORCHESTRATION.md for the full workflow"
 echo ""
