@@ -7,11 +7,16 @@ Claude plans and reviews. Free Groq models implement.
 
 ## Phase 1: Setup (once)
 
-### Install dependencies
+### Activate the virtual environment
+
+The bootstrap script already created `.venv` and installed dependencies.
+Just activate it:
 
 ```bash
-pip install -r requirements.txt
+source .venv/bin/activate
 ```
+
+To reinstall from scratch: `make setup`
 
 ### Set your API keys
 
@@ -193,7 +198,8 @@ Claude diffs each branch against its spec and decides:
 
 | What | Command |
 |------|---------|
-| Install deps | `pip install -r requirements.txt` |
+| Activate venv | `source .venv/bin/activate` |
+| Reinstall deps | `make setup` |
 | Load env vars | `export $(cat .env \| grep -v '#' \| xargs)` |
 | Open Claude Code | `claude` |
 | Validate specs | `make validate` |
