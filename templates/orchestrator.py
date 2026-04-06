@@ -147,7 +147,6 @@ def run_aider(model, message, target_file, api_base=None):
         "--auto-commits",
         "--no-stream",
         "--no-show-model-warnings",
-        "--no-summarize",
         "--no-auto-lint",
     ]
     if api_base:
