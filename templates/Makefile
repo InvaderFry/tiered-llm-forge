@@ -6,8 +6,13 @@ ifneq (,$(wildcard .env))
     export
 endif
 
-setup: ## Install Python dependencies
-	pip install -r requirements.txt
+PYTHON := .venv/bin/python3
+PIP    := .venv/bin/pip
+
+setup: ## Create .venv and install Python dependencies
+	python3 -m venv .venv
+	$(PIP) install --quiet --upgrade pip
+	$(PIP) install --quiet -r requirements.txt
 
 env: ## Print loaded environment (confirm keys are set)
 	@echo "GROQ_API_KEY=$${GROQ_API_KEY:+set (hidden)}"
@@ -17,13 +22,13 @@ plan: ## Open Claude Code for planning
 	claude
 
 validate: ## Validate all specs before running the pipeline
-	python3 -m orchestrator --validate
+	$(PYTHON) -m orchestrator --validate
 
 dry-run: ## Preview what the pipeline would do without running models
-	python3 -m orchestrator --dry-run
+	$(PYTHON) -m orchestrator --dry-run
 
 run: ## Run the orchestrator pipeline
-	python3 -m orchestrator
+	$(PYTHON) -m orchestrator
 
 fix: ## Open Claude Code to fix failures
 	@echo "Opening Claude Code — say 'Fix the failures.'"
