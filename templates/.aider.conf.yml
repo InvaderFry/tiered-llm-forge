@@ -4,6 +4,24 @@ weak-model: groq/llama-3.1-8b-instant
 auto-commits: true
 yes-always: true
 architect: true
-auto-test: true
-test-cmd: pytest tests/ -x
+# auto-test disabled: the orchestrator runs task-specific tests after each
+# aider invocation. Aider's built-in test-cmd can't target the right test file
+# per-task, and running the full suite risks vacuous passes.
+auto-test: false
 commit-prompt: "Write a concise git commit message in imperative mood. Output ONLY the commit message text. Do not include reasoning, thinking steps, <think> tags, or any explanation outside the commit message itself."
+
+# Prevent the editor model from rewriting entire files — diff mode sends only
+# the changed lines, which reduces both token usage and file-corruption risk.
+edit-format: diff
+
+# Disable features that waste tokens on rate-limited Groq free tier:
+# - summarize: commit summarization hits the weak model and causes 429s
+# - auto-lint: linter runs waste editor model tokens
+# - show-model-warnings: noisy warnings add to output without value
+no-summarize: true
+no-auto-lint: true
+no-show-model-warnings: true
+
+# Disable chat history file to prevent growing context from pushing past
+# Groq's token-per-minute limits on subsequent aider invocations.
+chat-history-file: /dev/null

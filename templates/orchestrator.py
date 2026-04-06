@@ -24,7 +24,20 @@ PRIMARY_RETRIES = 3
 ESCALATION_RETRIES = 2
 # Max attempts per run_aider call before giving up on that single invocation
 AIDER_MAX_RATE_RETRIES = 4
-TEST_CMD = "pytest tests/ -x --tb=short"
+
+# Seconds to pause between tasks so Groq's per-minute token window can reset.
+INTER_TASK_COOLDOWN = 30
+
+# Content markers used to sanity-check that a model didn't replace a source file
+# with garbage (e.g. a shell command or a filename string). Keyed by file extension.
+CONTENT_MARKERS = {
+    ".py":   ["def ", "class ", "import ", "from "],
+    ".java": ["class ", "interface ", "package ", "public ", "import "],
+    ".xml":  ["<", "<?xml"],
+    ".yml":  [":"],
+    ".yaml": [":"],
+    ".json": ["{", "["],
+}
 
 
 def compress_spec(spec_text, task_name):
@@ -84,6 +97,37 @@ def select_primary_model(spec_text):
     return LITELLM_MODEL, LITELLM_BASE
 
 
+def task_test_file(task_name):
+    """
+    Derive the pytest test file path from a task name.
+    task-001-pom -> tests/test_001_pom.py  (underscores, not hyphens)
+    """
+    slug = task_name.replace("task-", "", 1).replace("-", "_")
+    return f"tests/test_{slug}.py"
+
+
+def run_tests(task_name):
+    """
+    Run the task-specific test file instead of the full suite.
+    Returns (passed, output). Fails if the test file doesn't exist
+    or if pytest collects 0 items (vacuous pass guard).
+    """
+    test_file = task_test_file(task_name)
+    if not Path(test_file).exists():
+        return False, f"Test file {test_file} does not exist."
+
+    cmd = ["pytest", test_file, "-x", "--tb=short"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    output = result.stdout + result.stderr
+
+    # Guard against vacuous passes — if pytest collected 0 items the task
+    # did NOT actually pass, even though the exit code may be 0 (or 5).
+    if "no tests ran" in output or "collected 0 items" in output:
+        return False, f"Vacuous pass: pytest collected 0 tests from {test_file}.\n\n{output}"
+
+    return result.returncode == 0, output
+
+
 def run_aider(model, message, target_file, api_base=None):
     """
     Run aider with exponential backoff on Groq 429 rate-limit errors.
@@ -102,6 +146,9 @@ def run_aider(model, message, target_file, api_base=None):
         "--yes-always",
         "--auto-commits",
         "--no-stream",
+        "--no-show-model-warnings",
+        "--no-summarize",
+        "--no-auto-lint",
     ]
     if api_base:
         cmd += ["--openai-api-base", api_base, "--openai-api-key", "sk-anything"]
@@ -144,36 +191,70 @@ def run_aider(model, message, target_file, api_base=None):
         return
 
 
-def run_tests():
-    result = subprocess.run(TEST_CMD.split(), capture_output=True, text=True)
-    return result.returncode == 0, result.stdout + result.stderr
-
-
 def file_size(path):
     """Return file size in bytes, or 0 if the file doesn't exist."""
     p = Path(path)
     return p.stat().st_size if p.exists() else 0
 
 
+def _content_looks_valid(target_file):
+    """
+    Quick sanity check: does the file still look like source code for its type?
+    Returns True if the file contains at least one expected marker for its
+    extension, or if the extension is unknown (benefit of the doubt).
+    """
+    ext = Path(target_file).suffix.lower()
+    markers = CONTENT_MARKERS.get(ext)
+    if not markers:
+        return True  # unknown extension — skip check
+
+    p = Path(target_file)
+    if not p.exists() or p.stat().st_size == 0:
+        return True  # empty file is handled by size check, not here
+
+    try:
+        content = p.read_text(errors="replace")
+    except Exception:
+        return True  # can't read — don't block on I/O errors
+
+    return any(marker in content for marker in markers)
+
+
 def check_regression(target_file, baseline_size):
     """
-    Return True if the target file shrank by more than 80% vs baseline.
-    Catches cases where a model replaces a real file with a stub or stray command.
-    Only meaningful when the baseline was non-trivial (>50 bytes).
+    Return True if the target file looks corrupted after a model edit.
+
+    Two checks:
+    1. Size regression — file shrank by >80% vs baseline (catches stubs).
+    2. Content sanity — file no longer contains any expected language markers
+       (catches cases where a model replaces Java with a shell command, etc.).
     """
-    if baseline_size < 50:
-        return False
-    current = file_size(target_file)
-    return current < baseline_size * 0.2
+    # Size check (only meaningful when baseline was non-trivial)
+    if baseline_size >= 50:
+        current = file_size(target_file)
+        if current < baseline_size * 0.2:
+            return True
+
+    # Content marker check
+    if not _content_looks_valid(target_file):
+        return True
+
+    return False
 
 
 def revert_regression(target_file, baseline_size):
     """Undo the last commit and print a warning."""
     current = file_size(target_file)
-    print(
-        f"  [REGRESSION GUARD] {target_file} shrank from {baseline_size}B to {current}B "
-        f"(>{int((1 - current/baseline_size)*100)}% reduction) -- reverting commit."
-    )
+    if baseline_size > 0:
+        pct = int((1 - current / baseline_size) * 100)
+        print(
+            f"  [REGRESSION GUARD] {target_file} shrank from {baseline_size}B to {current}B "
+            f"(>{pct}% reduction) -- reverting commit."
+        )
+    else:
+        print(
+            f"  [REGRESSION GUARD] {target_file} content failed sanity check -- reverting commit."
+        )
     subprocess.run(["git", "reset", "--hard", "HEAD~1"], check=True)
 
 
@@ -240,7 +321,7 @@ def run_task(spec_file, default_branch):
     if branch_exists(branch_name):
         print(f"  Branch '{branch_name}' already exists -- checking previous result...")
         subprocess.run(["git", "checkout", branch_name], check=True)
-        passed, output = run_tests()
+        passed, output = run_tests(task_name)
         if passed:
             print(f"  Already passing -- skipping.")
             subprocess.run(["git", "checkout", default_branch], check=True)
@@ -271,7 +352,7 @@ def run_task(spec_file, default_branch):
         if attempt == 1:
             run_aider(primary_model, spec_text, target_file, api_base)
         else:
-            _, output = run_tests()
+            _, output = run_tests(task_name)
             run_aider(primary_model,
                 f"Tests failed. Output:\n{output}\nFix the code to pass all tests.",
                 target_file, api_base)
@@ -279,7 +360,7 @@ def run_task(spec_file, default_branch):
             revert_regression(target_file, baseline_size)
             continue
         baseline_size = max(baseline_size, file_size(target_file))
-        passed, _ = run_tests()
+        passed, _ = run_tests(task_name)
         if passed:
             print(f"PASSED (Stage 1, attempt {attempt}): {task_name}")
             subprocess.run(["git", "checkout", default_branch], check=True)
@@ -289,7 +370,7 @@ def run_task(spec_file, default_branch):
     print(f"Stage 2: GPT-OSS 120B ({ESCALATION_RETRIES} attempts)")
     for attempt in range(1, ESCALATION_RETRIES + 1):
         print(f"  Attempt {attempt}/{ESCALATION_RETRIES}...")
-        _, output = run_tests()
+        _, output = run_tests(task_name)
         run_aider(ESCALATION_MODEL,
             f"Previous model failed. Tests output:\n{output}\nAnalyze carefully and fix.",
             target_file)
@@ -297,14 +378,14 @@ def run_task(spec_file, default_branch):
             revert_regression(target_file, baseline_size)
             continue
         baseline_size = max(baseline_size, file_size(target_file))
-        passed, output = run_tests()
+        passed, output = run_tests(task_name)
         if passed:
             print(f"PASSED (GPT-OSS 120B, attempt {attempt}): {task_name}")
             subprocess.run(["git", "checkout", default_branch], check=True)
             return "passed"
 
     # --- Stage 3: Flag for Claude review ---
-    _, output = run_tests()
+    _, output = run_tests(task_name)
     fail_log = SPECS_DIR / f"FAILED-{task_name}.log"
     fail_log.write_text(
         f"Failed after primary tier ({PRIMARY_RETRIES}x) + GPT-OSS 120B ({ESCALATION_RETRIES}x).\n\n{output}"
@@ -362,8 +443,14 @@ if __name__ == "__main__":
 
     results = {"passed": [], "failed": [], "skipped": []}
 
-    for spec in specs:
+    for i, spec in enumerate(specs):
         outcome = run_task(spec, default_branch)
         results[outcome].append(spec.stem)
+
+        # Cooldown between tasks so Groq's per-minute token window can reset.
+        # Skip after the last task or if the task was already done (skipped).
+        if i < len(specs) - 1 and outcome != "skipped" and INTER_TASK_COOLDOWN > 0:
+            print(f"  [cooldown: sleeping {INTER_TASK_COOLDOWN}s between tasks]")
+            time.sleep(INTER_TASK_COOLDOWN)
 
     print_summary(results, default_branch)
