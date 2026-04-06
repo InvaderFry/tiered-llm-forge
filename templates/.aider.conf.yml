@@ -15,10 +15,8 @@ commit-prompt: "Write a concise git commit message in imperative mood. Output ON
 edit-format: diff
 
 # Disable features that waste tokens on rate-limited Groq free tier:
-# - summarize: commit summarization hits the weak model and causes 429s
 # - auto-lint: linter runs waste editor model tokens
 # - show-model-warnings: noisy warnings add to output without value
-no-summarize: true
 no-auto-lint: true
 no-show-model-warnings: true
 
