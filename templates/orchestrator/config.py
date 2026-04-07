@@ -3,7 +3,7 @@
 from pathlib import Path
 import yaml
 
-CONFIG_FILE = Path("models.yaml")
+CONFIG_FILE = Path(__file__).parent.parent / "models.yaml"
 
 _config = None
 

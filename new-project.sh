@@ -1,7 +1,7 @@
 #!/bin/bash
 # new-project.sh — Bootstrap a new tiered LLM coding workflow project
 # Run from anywhere: bash /path/to/tiered-llm-forge/new-project.sh
-# Creates: ~/projects/my-project-YYYYMMDD-HHMMSS/
+# Creates: <parent-of-forge-dir>/my-project-YYYYMMDD-HHMMSS/
 
 set -euo pipefail
 
@@ -21,7 +21,7 @@ trap cleanup EXIT
 FORGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 PROJECT_NAME="my-project-$TIMESTAMP"
-PROJECT_DIR="$HOME/projects/$PROJECT_NAME"
+PROJECT_DIR="$(dirname "$FORGE_DIR")/$PROJECT_NAME"
 
 source "$FORGE_DIR/lib/structure.sh"
 source "$FORGE_DIR/lib/dotfiles.sh"

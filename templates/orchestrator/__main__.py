@@ -25,7 +25,7 @@ from .git_ops import (
 )
 from .state import load_state, save_state, record_task
 
-SPECS_DIR = Path("specs")
+SPECS_DIR = Path(__file__).parent.parent / "specs"
 
 _URL_RE = re.compile(r"https?://\S+")
 
