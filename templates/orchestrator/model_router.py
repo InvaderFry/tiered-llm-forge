@@ -10,6 +10,49 @@ from .config import get_config, get_tier
 # Max retries within a single aider invocation for rate limit errors
 AIDER_MAX_RATE_RETRIES = 4
 
+# ---------------------------------------------------------------------------
+# Per-model rate-limit coordinator
+#
+# When a task hits a Groq 429 with a "try again in Ns" hint, the orchestrator
+# records a per-model "earliest safe request time". Subsequent tasks (and
+# subsequent retries within the same task) check this before each aider
+# invocation and sleep the remaining window instead of wasting the call.
+#
+# Keyed by full model name ("groq/qwen/qwen3-32b") — Groq rate limits are
+# per-model, not per-account, so hitting qwen3's window tells us nothing
+# about kimi's. Foreign providers (gemini/*, etc.) slot in automatically.
+#
+# The dict is process-local and not persisted — rate-limit windows are
+# seconds, shorter than typical between-run gaps.
+# ---------------------------------------------------------------------------
+_next_available_at: dict = {}
+
+# Indirected so tests can freeze time without monkeypatching stdlib
+_clock = time.time
+_sleep = time.sleep
+
+
+def _wait_for_model(model):
+    """Sleep until the cached rate-limit window for ``model`` has reset.
+
+    No-ops when the model has no recorded window or the window has passed.
+    """
+    earliest = _next_available_at.get(model, 0.0)
+    now = _clock()
+    if earliest > now:
+        wait = earliest - now
+        print(f"  [coordinator: {model} rate-limited, sleeping {wait:.1f}s before request]")
+        _sleep(wait)
+
+
+def _mark_rate_limited(model, retry_after, buffer=5.0):
+    """Record that ``model`` should not be called for ``retry_after`` seconds.
+
+    ``buffer`` adds headroom for Groq's sliding window reset imprecision and
+    matches the buffer already applied inside the local retry loop.
+    """
+    _next_available_at[model] = _clock() + retry_after + buffer
+
 
 def select_model_for_spec(spec_text):
     """
@@ -163,6 +206,10 @@ def run_aider(model, message, target_file, read_files=None):
     invocation_stats = _empty_stats()
     fallback_wait = 15
     for attempt in range(1, AIDER_MAX_RATE_RETRIES + 1):
+        # Respect any rate-limit window recorded for this model by a
+        # previous task or a previous attempt in this task.
+        _wait_for_model(model)
+
         result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=aider_env)
         if result.stdout:
             print(result.stdout, end="")
@@ -177,23 +224,25 @@ def run_aider(model, message, target_file, read_files=None):
 
         if "rate_limit_exceeded" in combined or "Rate limit reached" in combined:
             # "Request too large" means the request itself exceeds the TPM cap —
-            # no amount of waiting will help. Fail immediately so the tier
-            # fallback can try the next model.
+            # no amount of waiting will help, and it is not a time-based window
+            # so we do not record it in the coordinator.
             if "Request too large" in combined:
                 print(f"  [request too large for model {model} TPM cap — falling back]")
                 return False, invocation_stats
 
             wait = _parse_retry_after(combined)
             if wait:
+                _mark_rate_limited(model, wait)  # inform future tasks/attempts
                 wait += 5  # buffer for sliding window reset
                 print(f"  [rate limit: sleeping {wait:.1f}s as instructed by Groq (attempt {attempt}/{AIDER_MAX_RATE_RETRIES})]")
             else:
+                _mark_rate_limited(model, fallback_wait)  # best-effort record
                 wait = fallback_wait
                 print(f"  [rate limit: sleeping {wait}s (exponential backoff, attempt {attempt}/{AIDER_MAX_RATE_RETRIES})]")
                 fallback_wait = min(fallback_wait * 2, 120)
 
             if attempt < AIDER_MAX_RATE_RETRIES:
-                time.sleep(wait)
+                _sleep(wait)
                 continue
 
         # Non-rate-limit error or exhausted retries

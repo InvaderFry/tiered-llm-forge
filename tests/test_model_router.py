@@ -13,7 +13,10 @@ from orchestrator.model_router import (
     get_fallback_models,
     _parse_retry_after,
     _parse_usage,
+    _wait_for_model,
+    _mark_rate_limited,
 )
+import orchestrator.model_router as _mr
 from orchestrator import config as config_mod
 
 
@@ -74,6 +77,61 @@ class TestGetFallbackModels:
             "groq/meta-llama/llama-4-scout-17b-16e-instruct", "primary"
         )
         assert fallbacks == []
+
+
+class TestRateLimitCoordinator:
+    """Tests for the per-model rate-limit coordinator.
+
+    Time and sleep are injected via module-level _clock / _sleep so
+    tests never actually block.
+    """
+
+    def setup_method(self):
+        _mr._next_available_at.clear()
+        self._fake_now = [1000.0]
+        self._slept = []
+        _mr._clock = lambda: self._fake_now[0]
+        _mr._sleep = lambda s: self._slept.append(s)
+
+    def teardown_method(self):
+        import time as _t
+        _mr._clock = _t.time
+        _mr._sleep = _t.sleep
+        _mr._next_available_at.clear()
+
+    def test_wait_sleeps_remaining_window(self):
+        _mark_rate_limited("groq/qwen3-32b", 12.0, buffer=5.0)  # earliest = 1017
+        _wait_for_model("groq/qwen3-32b")
+        assert len(self._slept) == 1
+        assert abs(self._slept[0] - 17.0) < 0.01
+
+    def test_no_wait_when_window_passed(self):
+        _mark_rate_limited("groq/qwen3-32b", 12.0)
+        self._fake_now[0] += 100          # clock advances past the window
+        _wait_for_model("groq/qwen3-32b")
+        assert self._slept == []
+
+    def test_unknown_model_no_wait(self):
+        _wait_for_model("groq/never-seen")
+        assert self._slept == []
+
+    def test_models_tracked_independently(self):
+        _mark_rate_limited("groq/qwen3-32b", 12.0)
+        _wait_for_model("groq/kimi-k2-instruct")   # different model, no window
+        assert self._slept == []
+
+    def test_mark_updates_existing_entry(self):
+        _mark_rate_limited("groq/qwen3-32b", 5.0)
+        _mark_rate_limited("groq/qwen3-32b", 20.0)  # longer window overwrites
+        _wait_for_model("groq/qwen3-32b")
+        assert len(self._slept) == 1
+        assert abs(self._slept[0] - 25.0) < 0.01   # 20 + 5 buffer
+
+    def test_zero_buffer(self):
+        _mark_rate_limited("groq/qwen3-32b", 10.0, buffer=0.0)
+        _wait_for_model("groq/qwen3-32b")
+        assert len(self._slept) == 1
+        assert abs(self._slept[0] - 10.0) < 0.01
 
 
 class TestParseRetryAfter:
