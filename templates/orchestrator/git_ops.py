@@ -7,20 +7,52 @@ from .runner import file_size
 
 
 def get_default_branch():
-    """Determine the default branch name (main, master, etc.)."""
+    """Determine the default branch name (main, master, etc.).
+
+    Resolution order, from most to least authoritative:
+
+    1. ``refs/remotes/origin/HEAD`` symbolic ref — set by ``git clone``
+       and the only signal that survives a developer being checked out
+       on a feature branch.
+    2. ``init.defaultBranch`` git config — what ``git init`` would have
+       picked. Always set in modern git installs.
+    3. The current branch, but only if it isn't a working branch
+       (``task/*`` or ``integration/*``). Older guards only excluded
+       ``task/*``, which would silently treat an integration branch as
+       the default if the orchestrator was launched from one.
+    4. Fallback to ``master`` so callers always get a non-empty string.
+    """
+    # 1. origin/HEAD — works as soon as the repo has a remote
+    result = subprocess.run(
+        ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        ref = result.stdout.strip()
+        prefix = "refs/remotes/origin/"
+        if ref.startswith(prefix):
+            return ref[len(prefix):]
+
+    # 2. init.defaultBranch — git config fallback
+    result = subprocess.run(
+        ["git", "config", "--get", "init.defaultBranch"],
+        capture_output=True, text=True,
+    )
+    configured = result.stdout.strip()
+    if configured:
+        return configured
+
+    # 3. Current branch, only if it isn't one we create ourselves
     result = subprocess.run(
         ["git", "symbolic-ref", "--short", "HEAD"],
-        capture_output=True, text=True
+        capture_output=True, text=True,
     )
     branch = result.stdout.strip()
-    if branch and not branch.startswith("task/"):
+    if branch and not branch.startswith("task/") and not branch.startswith("integration/"):
         return branch
 
-    result2 = subprocess.run(
-        ["git", "config", "--get", "init.defaultBranch"],
-        capture_output=True, text=True
-    )
-    return result2.stdout.strip() or "master"
+    # 4. Last-ditch fallback
+    return "master"
 
 
 def ensure_default_branch_exists():
