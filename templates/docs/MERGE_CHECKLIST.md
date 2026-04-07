@@ -13,7 +13,19 @@ The user says: **"Review the task branches"** or **"Merge the passing branches"*
 
 ## Procedure
 
-For each passing task branch, in dependency order:
+First, resolve the default branch name for the current repo. None of the
+commands below assume `main` — some repos use `master`, `trunk`, or something
+else entirely, and `git init` picks whatever `init.defaultBranch` is set to.
+
+```bash
+DEFAULT=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
+    | sed 's@^refs/remotes/origin/@@') \
+    || DEFAULT=$(git config --get init.defaultBranch 2>/dev/null) \
+    || DEFAULT=master
+echo "Default branch: $DEFAULT"
+```
+
+Then, for each passing task branch, in dependency order:
 
 ### 1. Read the spec
 ```
@@ -23,7 +35,7 @@ Focus on: function signatures, constraints, expected behavior.
 
 ### 2. Read the diff
 ```bash
-git diff main..task/task-NNN-name
+git diff "$DEFAULT..task/task-NNN-name"
 ```
 
 ### 3. Evaluate three criteria
@@ -41,10 +53,10 @@ are fine. Fix anything that creates real maintenance debt.
 
 #### MERGE — Meets goals, acceptable quality
 ```bash
-git checkout main
-git merge --squash task/task-NNN-name
+git checkout "$DEFAULT"
+git merge --squash "task/task-NNN-name"
 git commit -m "feat: task-NNN — <one-line description>"
-git branch -d task/task-NNN-name
+git branch -d "task/task-NNN-name"
 ```
 
 #### FIX THEN MERGE — Tests pass but a constraint was missed or quality issue exists
