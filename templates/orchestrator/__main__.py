@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import re
 import sys
 import time
 from pathlib import Path
@@ -25,6 +26,13 @@ from .git_ops import (
 from .state import load_state, save_state, record_task
 
 SPECS_DIR = Path("specs")
+
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def _strip_urls(text):
+    """Remove URLs from test output so aider doesn't try to scrape them."""
+    return _URL_RE.sub("[URL]", text)
 
 
 def cmd_validate():
@@ -176,7 +184,7 @@ def run_task(spec, default_branch, state):
             _, test_output = run_tests(test_file)
             success, model_used = run_with_tier_fallback(
                 "primary",
-                f"Tests failed. Output:\n{test_output}\nFix the code to pass all tests.",
+                f"Tests failed. Output:\n{_strip_urls(test_output)}\nFix the code to pass all tests.",
                 target_file,
                 first_model,
             )
@@ -204,7 +212,7 @@ def run_task(spec, default_branch, state):
         _, test_output = run_tests(test_file)
         success, model_used = run_with_tier_fallback(
             "escalation",
-            f"Previous model failed. Tests output:\n{test_output}\nAnalyze carefully and fix.",
+            f"Previous model failed. Tests output:\n{_strip_urls(test_output)}\nAnalyze carefully and fix.",
             target_file,
         )
 

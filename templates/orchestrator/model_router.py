@@ -100,6 +100,13 @@ def run_aider(model, message, target_file):
         combined = (result.stdout or "") + (result.stderr or "")
 
         if "rate_limit_exceeded" in combined or "Rate limit reached" in combined:
+            # "Request too large" means the request itself exceeds the TPM cap —
+            # no amount of waiting will help. Fail immediately so the tier
+            # fallback can try the next model.
+            if "Request too large" in combined:
+                print(f"  [request too large for model {model} TPM cap — falling back]")
+                return False
+
             wait = _parse_retry_after(combined)
             if wait:
                 wait += 5  # buffer for sliding window reset

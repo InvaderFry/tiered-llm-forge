@@ -26,3 +26,7 @@ no-show-model-warnings: true
 # Disable chat history file to prevent growing context from pushing past
 # Groq's token-per-minute limits on subsequent aider invocations.
 chat-history-file: /dev/null
+
+# Prevent aider from trying to install playwright via /usr/bin/python3 when
+# it detects URLs in chat output (e.g. pytest warning links).
+no-check-update: true
