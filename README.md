@@ -68,12 +68,26 @@ Each `specs/task-NNN-name.md` file is a task with YAML frontmatter that declares
 the target file, test file, and dependencies. The orchestrator processes them in
 dependency order:
 
-1. Creates a `task/task-NNN-name` git branch
-2. Tries primary tier models with automatic fallback (3 attempts)
-3. Escalates to the escalation tier if primary fails (2 attempts)
-4. Writes `specs/FAILED-task-NNN-name.log` if all attempts fail
-5. Records state in `pipeline-state.json` for crash recovery
-6. Returns to default branch, moves to next task
+1. Creates a `task/task-NNN-name` git branch **from its dependency branch(es)**
+   — stacked on a single dep, or assembled via merge when there are several —
+   so the task actually runs against its upstream code.
+2. Attaches the spec file, test file, and every dependency's target file to
+   Aider as read-only context so the implementer model sees the real
+   upstream types and signatures, not just the isolated target file.
+3. Tries primary tier models with automatic fallback (3 attempts).
+4. Escalates to the escalation tier if primary fails (2 attempts).
+5. Writes `specs/FAILED-task-NNN-name.log` tagged with a failure class
+   (`rate_limit`, `assertion`, `missing_symbol`, etc.) if all attempts fail.
+6. Records per-task model, duration, attempts, and failure class in
+   `pipeline-state.json` for crash recovery and observability.
+7. Returns to the default branch, moves to next task.
+
+After every task passes, an **integration gate** assembles
+`integration/run-<timestamp>` by merging each task branch in dependency
+order and runs the full pytest suite against the combined result. Only a
+clean integration branch is considered ready for human merge review; any
+merge conflict or cross-task regression writes
+`specs/INTEGRATION-FAILED.log` and blocks the merge step.
 
 Re-running is safe — passing branches are skipped, failing branches go straight
 to Claude review. Pipeline state persists across crashes.
@@ -113,15 +127,17 @@ tiered-llm-forge/
 │   │   ├── config.py        # reads models.yaml
 │   │   ├── spec_parser.py   # frontmatter, compression, validation, topo sort
 │   │   ├── model_router.py  # model selection, fallback, rate limits
-│   │   ├── runner.py        # test execution, regression detection
-│   │   ├── git_ops.py       # branch management
+│   │   ├── runner.py        # per-task + full-suite test execution
+│   │   ├── git_ops.py       # branch management, stacking, merging
+│   │   ├── failure_class.py # classifies pytest/aider output
 │   │   └── state.py         # pipeline-state.json persistence
 │   ├── src/__init__.py
 │   └── tests/conftest.py
 └── tests/                   # tests for the forge's own orchestrator code
     ├── test_spec_parser.py
     ├── test_model_router.py
-    └── test_state.py
+    ├── test_state.py
+    └── test_failure_class.py
 ```
 
 To change what gets generated, edit files in `templates/` or add a new

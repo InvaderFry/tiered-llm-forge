@@ -1,7 +1,25 @@
 # Merge Checklist
 
-After the orchestrator reports all tasks passing, run a quality gate before
-merging into the default branch.
+After the orchestrator reports all tasks passing **and the integration
+gate has succeeded**, run a quality gate before merging into the
+default branch.
+
+### 0. Confirm the integration gate passed
+
+```bash
+python3 -c 'import json; s=json.load(open("pipeline-state.json")); print(s.get("integration", {}))'
+ls specs/INTEGRATION-FAILED.log 2>/dev/null && echo "BLOCKED: integration gate failed"
+git branch --list "integration/*"
+```
+
+You need `integration.status == "passed"` **and** no
+`INTEGRATION-FAILED.log`. The passing `integration/run-<timestamp>`
+branch already contains every task merged together with the full test
+suite green — treat it as the source of truth for the combined behaviour.
+
+If the integration gate did not pass, stop and follow
+`docs/FAILURE_PLAYBOOK.md` → *Integration gate failures* before
+reviewing individual task branches.
 
 ---
 
@@ -82,3 +100,20 @@ Summarize:
 - What was merged (and commit hashes)
 - What was fixed-then-merged (and what was fixed)
 - What was flagged (with paths to REVIEW notes)
+
+### Clean up the integration branch
+
+Once every task branch has been merged (or explicitly flagged), the
+`integration/run-<timestamp>` branch is no longer useful — it just
+duplicates history that is now on the default branch.
+
+```bash
+git branch -D "$(git branch --list 'integration/*' | tr -d ' *')"
+```
+
+If you prefer to preserve it as a snapshot of the combined tested
+state, tag it first:
+
+```bash
+git tag "integration-$(date +%Y%m%d)" "integration/run-<timestamp>"
+```

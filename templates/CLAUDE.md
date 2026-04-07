@@ -59,8 +59,15 @@ orchestrator to save tokens — keep important details in other sections.
 - **One target file per task.** Split multi-file work into separate tasks.
 - **Zero-padded three-digit task numbers:** `task-001`, `task-002`, etc.
 - **Keep specs under ~12,000 characters.** Longer specs get auto-compressed.
-- **Declare dependencies in frontmatter.** The orchestrator sorts by dependency
-  order, not alphabetical order.
+- **Declare dependencies in frontmatter.** The orchestrator both sorts *and*
+  stacks by dependency order: task N's git branch is created from the tip
+  of its dependency branch(es), so the implementer actually sees upstream
+  code. Missing a dependency means the implementer runs without it.
+- **Keep dependency graphs narrow.** A task with many simultaneous
+  dependencies is assembled by merging each dep branch together — if two
+  deps touch the same file, you will get a merge conflict and the task
+  will fail. Prefer a linear chain (A → B → C) over a fan-in (A, B, C → D)
+  whenever the tasks might touch overlapping code.
 - **Never include implementation code.** Signatures and types only.
 
 ---
@@ -109,11 +116,34 @@ task-004  API layer (depends on task-002 + task-003)
 **Playbook:** See `docs/FAILURE_PLAYBOOK.md` for the full procedure.
 
 Quick version:
-1. Read `specs/task-NNN-name.md` + `specs/FAILED-task-NNN-name.log`
-2. `git checkout task/task-NNN-name`
+1. Read `specs/task-NNN-name.md` + `specs/FAILED-task-NNN-name.log`.
+   The log header now includes a **failure class**
+   (`rate_limit`, `request_too_large`, `collection_error`,
+   `missing_symbol`, `assertion`, `timeout`, `regression_guard`,
+   `merge_conflict`, `unknown`) and the list of models tried —
+   use these to pick the right fix before reading the full output.
+2. `git checkout task/task-NNN-name` (the branch is already stacked
+   on its dependencies, so upstream code is present).
 3. Diagnose: bad spec or bad implementation?
-4. Fix, run `pytest tests/test_NNN_name.py -v`, commit
-5. Stay on branch — orchestrator detects passing branches on re-run
+4. Fix, run `pytest tests/test_NNN_name.py -v`, commit.
+5. Stay on branch — orchestrator detects passing branches on re-run.
+
+## Reviewing Integration Gate Failures
+
+**Trigger:** `specs/INTEGRATION-FAILED.log` exists, or
+`pipeline-state.json` shows `integration.status != "passed"`.
+
+Each task's own test file passes in isolation but combining them on
+the integration branch revealed a cross-task problem. Two classes:
+
+- **Merge conflict:** the log names the offending task branch. Fix by
+  reshaping the dependency graph (stack the conflicting tasks instead
+  of fanning them into a merge) or by editing the conflicting task's
+  spec so it does not collide.
+- **Test failure:** the `integration/run-*` branch is kept on disk.
+  Check it out, reproduce with `pytest tests/`, then fix the
+  regression on the **task branch** (not the integration branch). The
+  orchestrator rebuilds a fresh integration branch on the next run.
 
 ---
 
@@ -148,7 +178,7 @@ integration safety + code quality, then MERGE / FIX THEN MERGE / FLAG.
 | "Fix the failures" | Read spec + log, checkout branch, fix, pytest, commit |
 | "Review branches" | Diff each branch vs spec, MERGE / FIX / FLAG |
 | "Add task for Y" | Write new spec + test, update SpecsReadMe.md |
-| "What's the status?" | `git branch --list "task/*"` + `ls specs/FAILED-*.log` |
+| "What's the status?" | `git branch --list "task/*" "integration/*"` + `ls specs/FAILED-*.log specs/INTEGRATION-FAILED.log 2>/dev/null` |
 
 ---
 
@@ -163,12 +193,13 @@ project-root/
 │   ├── FAILURE_PLAYBOOK.md
 │   └── MERGE_CHECKLIST.md
 ├── orchestrator/           ← pipeline package
-│   ├── __main__.py         ← CLI entry point
+│   ├── __main__.py         ← CLI entry point + integration gate
 │   ├── config.py           ← reads models.yaml
 │   ├── spec_parser.py      ← frontmatter + compression + validation
 │   ├── model_router.py     ← model selection + rate limit handling
-│   ├── runner.py           ← test execution + regression detection
-│   ├── git_ops.py          ← branch management
+│   ├── runner.py           ← per-task + full-suite test execution
+│   ├── git_ops.py          ← branch management, stacking, merging
+│   ├── failure_class.py    ← classifies pytest/aider output
 │   └── state.py            ← pipeline-state.json persistence
 ├── models.yaml             ← model config (single source of truth)
 ├── .aider.conf.yml         ← Aider defaults
