@@ -15,13 +15,14 @@ from pathlib import Path
 from .config import load_config, get_config, get_tier
 from .spec_parser import load_spec, compress_spec, validate_specs, topological_sort
 from .model_router import select_model_for_spec, run_aider, run_with_tier_fallback
-from .runner import run_tests, file_size, check_regression
+from .runner import run_tests, run_full_suite, file_size, check_regression
 from .git_ops import (
     get_default_branch,
     ensure_default_branch_exists,
     branch_exists,
     branch_tip,
     checkout,
+    delete_branch,
     merge_branch,
     revert_last_commit,
 )
@@ -314,6 +315,103 @@ def run_task(spec, default_branch, state, specs_by_name=None):
     return "failed"
 
 
+def integration_gate(passed_task_names, default_branch, state):
+    """
+    Assemble an integration branch by merging all passing task branches and
+    run the full pytest suite against the result.
+
+    Behaviour:
+    - Creates ``integration/run-<timestamp>`` from the default branch.
+    - Merges each passing task branch (in the order provided) with --no-ff.
+    - On merge conflict or full-suite failure, writes
+      ``specs/INTEGRATION-FAILED.log``, deletes the integration branch,
+      and returns False so the caller can block merge.
+    - On success, leaves the integration branch in place for human review
+      and returns True.
+
+    The caller is responsible for returning to the default branch afterwards.
+    """
+    from datetime import datetime, timezone
+    import subprocess
+
+    if not passed_task_names:
+        print("\n[integration gate] No passing tasks — skipping.")
+        return True
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    integration_branch = f"integration/run-{timestamp}"
+
+    print(f"\n{'='*50}")
+    print(f"INTEGRATION GATE: {integration_branch}")
+    print(f"{'='*50}")
+
+    # Record where we came from so we can always get back to it
+    checkout(default_branch)
+    checkout(integration_branch, create=True, start_point=default_branch)
+
+    failed_merges = []
+    for task_name in passed_task_names:
+        branch = f"task/{task_name}"
+        if not branch_exists(branch):
+            print(f"  [skip] {branch} — branch missing")
+            continue
+        print(f"  merging {branch}")
+        if not merge_branch(branch, message=f"integration: merge {branch}"):
+            failed_merges.append(task_name)
+            break
+
+    log_path = SPECS_DIR / "INTEGRATION-FAILED.log"
+
+    if failed_merges:
+        msg = (
+            f"Integration gate failed: merge conflict on {failed_merges[0]}.\n"
+            "The per-task branches individually pass their own tests, but "
+            "they cannot be combined cleanly. Resolve conflicts manually or "
+            "rework the spec dependencies.\n"
+        )
+        log_path.write_text(msg)
+        print(f"\n  INTEGRATION FAILED (merge conflict). See {log_path}")
+        state["integration"] = {
+            "branch": integration_branch,
+            "status": "merge_conflict",
+            "failed_on": failed_merges[0],
+            "timestamp": timestamp,
+        }
+        save_state(state)
+        checkout(default_branch)
+        delete_branch(integration_branch, force=True)
+        return False
+
+    # Merges clean — run the full suite
+    print("  running full test suite on integration branch...")
+    passed, output = run_full_suite("tests")
+    if not passed:
+        log_path.write_text(
+            f"Integration gate failed: full test suite failed on {integration_branch}.\n\n"
+            f"{output}\n"
+        )
+        print(f"  INTEGRATION FAILED (test suite). See {log_path}")
+        state["integration"] = {
+            "branch": integration_branch,
+            "status": "tests_failed",
+            "timestamp": timestamp,
+        }
+        save_state(state)
+        checkout(default_branch)
+        # Keep the branch around so the human can reproduce the failure
+        return False
+
+    print(f"  INTEGRATION PASSED: {integration_branch} is ready to merge.")
+    state["integration"] = {
+        "branch": integration_branch,
+        "status": "passed",
+        "timestamp": timestamp,
+    }
+    save_state(state)
+    checkout(default_branch)
+    return True
+
+
 def print_summary(results, default_branch):
     """Print final summary of pipeline run."""
     passed = results["passed"]
@@ -395,6 +493,15 @@ def main():
             time.sleep(cooldown)
 
     print_summary(results, default_branch)
+
+    # Integration gate: only run if every task succeeded (passed or skipped).
+    # Failed tasks must be resolved before we try to assemble a merge.
+    if not results["failed"]:
+        all_task_names = [s["task_name"] for s in (load_spec(sf) for sf in ordered)]
+        integration_gate(all_task_names, default_branch, state)
+    else:
+        print("\n[integration gate] Skipped — resolve failed tasks first.")
+
     save_state(state)
 
 
