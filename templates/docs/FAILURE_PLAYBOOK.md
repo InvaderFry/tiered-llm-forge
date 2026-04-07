@@ -50,8 +50,12 @@ Use the failure class to pick a strategy before reading the body:
 
 You can also run `cat pipeline-state.json` and look at the task entry
 for its recorded `model`, `models_tried`, `duration_seconds`,
-`base_branch`, and `base_sha`. `base_branch` tells you which branch the
-task was stacked on — useful when diagnosing dependency ordering bugs.
+`tokens_sent`, `tokens_received`, `cost_usd`, `base_branch`, and
+`base_sha`. `base_branch` tells you which branch the task was stacked
+on — useful when diagnosing dependency ordering bugs. The token /
+cost fields tell you whether a failed task was cheap or expensive,
+and the FAILED log header now repeats the same totals for each
+escalation.
 
 ### 3. Get on the branch
 ```bash

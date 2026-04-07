@@ -267,6 +267,14 @@ def run_task(spec, default_branch, state, specs_by_name=None):
     primary_tier = get_tier("primary")
     escalation_tier = get_tier("escalation")
     total_attempts = 0
+    task_stats = {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0}
+
+    def _accumulate(stats):
+        if not stats:
+            return
+        task_stats["tokens_sent"] += stats.get("tokens_sent", 0)
+        task_stats["tokens_received"] += stats.get("tokens_received", 0)
+        task_stats["cost_usd"] += stats.get("cost_usd", 0.0)
 
     # --- Stage 1: Primary tier ---
     first_model = select_model_for_spec(spec["body"])
@@ -277,18 +285,19 @@ def run_task(spec, default_branch, state, specs_by_name=None):
         print(f"  Attempt {attempt}/{primary_tier['retries']}...")
 
         if attempt == 1:
-            success, model_used = run_with_tier_fallback(
+            success, model_used, stats = run_with_tier_fallback(
                 "primary", implement_message, target_file, first_model, read_files=read_files,
             )
         else:
             _, test_output = run_tests(test_file)
-            success, model_used = run_with_tier_fallback(
+            success, model_used, stats = run_with_tier_fallback(
                 "primary",
                 f"Tests failed. Output:\n{_strip_urls(test_output)}\nFix the code to pass all tests.",
                 target_file,
                 first_model,
                 read_files=read_files,
             )
+        _accumulate(stats)
         if model_used and model_used not in models_tried:
             models_tried.append(model_used)
 
@@ -311,6 +320,9 @@ def run_task(spec, default_branch, state, specs_by_name=None):
                 models_tried=models_tried,
                 base_branch=start_point,
                 base_sha=base_sha,
+                tokens_sent=task_stats["tokens_sent"],
+                tokens_received=task_stats["tokens_received"],
+                cost_usd=task_stats["cost_usd"],
             )
             save_state(state)
             return "passed"
@@ -323,12 +335,13 @@ def run_task(spec, default_branch, state, specs_by_name=None):
         print(f"  Attempt {attempt}/{escalation_tier['retries']}...")
 
         _, test_output = run_tests(test_file)
-        success, model_used = run_with_tier_fallback(
+        success, model_used, stats = run_with_tier_fallback(
             "escalation",
             f"Previous model failed. Tests output:\n{_strip_urls(test_output)}\nAnalyze carefully and fix.",
             target_file,
             read_files=read_files,
         )
+        _accumulate(stats)
         if model_used and model_used not in models_tried:
             models_tried.append(model_used)
 
@@ -351,6 +364,9 @@ def run_task(spec, default_branch, state, specs_by_name=None):
                 models_tried=models_tried,
                 base_branch=start_point,
                 base_sha=base_sha,
+                tokens_sent=task_stats["tokens_sent"],
+                tokens_received=task_stats["tokens_received"],
+                cost_usd=task_stats["cost_usd"],
             )
             save_state(state)
             return "passed"
@@ -363,7 +379,9 @@ def run_task(spec, default_branch, state, specs_by_name=None):
         f"Failed after primary tier ({primary_tier['retries']}x) "
         f"+ escalation ({escalation_tier['retries']}x).\n"
         f"Failure class: {failure_label}\n"
-        f"Models tried: {', '.join(models_tried) or 'none'}\n\n"
+        f"Models tried: {', '.join(models_tried) or 'none'}\n"
+        f"Tokens (sent/received): {task_stats['tokens_sent']} / {task_stats['tokens_received']}\n"
+        f"Cost: ${task_stats['cost_usd']:.4f}\n\n"
         f"{test_output}"
     )
     print(f"ESCALATE TO CLAUDE: {task_name} (failure_class={failure_label})")
@@ -378,6 +396,9 @@ def run_task(spec, default_branch, state, specs_by_name=None):
         failure_class=failure_label,
         base_branch=start_point,
         base_sha=base_sha,
+        tokens_sent=task_stats["tokens_sent"],
+        tokens_received=task_stats["tokens_received"],
+        cost_usd=task_stats["cost_usd"],
     )
     save_state(state)
     return "failed"
@@ -491,25 +512,51 @@ def print_summary(results, default_branch, state=None):
     print(f"SKIPPED: {len(skipped)} (already passing)")
     print(f"FAILED:  {len(failed)}")
 
-    # Observability roll-up: per-model success/failure counts and task timings.
+    # Observability roll-up: per-model success/failure counts, task
+    # timings, and token / cost totals scraped from aider's stdout.
     if state and state.get("tasks"):
         by_model = {}
         total_time = 0.0
+        total_tokens_sent = 0
+        total_tokens_received = 0
+        total_cost = 0.0
         for name, entry in state["tasks"].items():
             dur = entry.get("duration_seconds") or 0.0
             total_time += dur
+            total_tokens_sent += entry.get("tokens_sent", 0) or 0
+            total_tokens_received += entry.get("tokens_received", 0) or 0
+            total_cost += entry.get("cost_usd", 0.0) or 0.0
             model = entry.get("model") or "(none)"
-            bucket = by_model.setdefault(model, {"passed": 0, "failed": 0, "skipped": 0})
+            bucket = by_model.setdefault(
+                model,
+                {"passed": 0, "failed": 0, "skipped": 0,
+                 "tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0},
+            )
             bucket[entry["status"]] = bucket.get(entry["status"], 0) + 1
+            bucket["tokens_sent"] += entry.get("tokens_sent", 0) or 0
+            bucket["tokens_received"] += entry.get("tokens_received", 0) or 0
+            bucket["cost_usd"] += entry.get("cost_usd", 0.0) or 0.0
 
         print(f"\nTotal task time: {total_time:.1f}s")
+        if total_tokens_sent or total_tokens_received or total_cost:
+            print(
+                f"Total tokens: {total_tokens_sent:,} sent / "
+                f"{total_tokens_received:,} received    "
+                f"Total cost: ${total_cost:.4f}"
+            )
         print("By model:")
         for model, counts in sorted(by_model.items()):
-            print(
+            line = (
                 f"  {model}: {counts.get('passed', 0)} passed, "
                 f"{counts.get('failed', 0)} failed, "
                 f"{counts.get('skipped', 0)} skipped"
             )
+            if counts["tokens_sent"] or counts["cost_usd"]:
+                line += (
+                    f"  ({counts['tokens_sent']:,}+{counts['tokens_received']:,} tok, "
+                    f"${counts['cost_usd']:.4f})"
+                )
+            print(line)
 
         fail_classes = {}
         for entry in state["tasks"].values():

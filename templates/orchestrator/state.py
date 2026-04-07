@@ -43,12 +43,16 @@ def record_task(
     failure_class=None,
     base_branch=None,
     base_sha=None,
+    tokens_sent=None,
+    tokens_received=None,
+    cost_usd=None,
 ):
     """Record the outcome of a single task.
 
     Extra fields (all optional) provide the observability hooks needed to
-    answer questions like "which model fails most often?" and "how long
-    does each task take?" without scraping log files.
+    answer questions like "which model fails most often?", "how long
+    does each task take?", and "is the escalation tier worth its cost?"
+    without scraping log files.
     """
     entry = {
         "status": status,
@@ -66,6 +70,12 @@ def record_task(
         entry["base_branch"] = base_branch
     if base_sha is not None:
         entry["base_sha"] = base_sha
+    if tokens_sent is not None:
+        entry["tokens_sent"] = int(tokens_sent)
+    if tokens_received is not None:
+        entry["tokens_received"] = int(tokens_received)
+    if cost_usd is not None:
+        entry["cost_usd"] = round(float(cost_usd), 6)
 
     state["tasks"][task_name] = entry
     return state

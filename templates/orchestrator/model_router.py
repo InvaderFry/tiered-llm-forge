@@ -58,6 +58,65 @@ def _parse_retry_after(stderr_text):
     return None
 
 
+# Aider stdout reports usage on lines like:
+#   Tokens: 1.2k sent, 234 received.
+#   Cost: $0.0034 message, $0.0102 session.
+# We grab the per-message numbers and sum across every "Tokens:" line in
+# a single aider invocation, since aider may make several model calls
+# per --message (commit message generation, retries, etc.).
+_TOKENS_RE = re.compile(
+    r"Tokens?:\s*([\d.]+)\s*([kKmM]?)\s*sent[^,]*,\s*([\d.]+)\s*([kKmM]?)\s*received",
+    re.IGNORECASE,
+)
+_COST_RE = re.compile(
+    r"Cost:\s*\$([\d.]+)\s*message",
+    re.IGNORECASE,
+)
+
+_UNIT_MULT = {"": 1, "k": 1_000, "K": 1_000, "m": 1_000_000, "M": 1_000_000}
+
+
+def _parse_usage(output):
+    """Extract aggregated token/cost stats from a single aider invocation.
+
+    Returns a dict with ``tokens_sent``, ``tokens_received``, and
+    ``cost_usd`` (always present, zero when nothing matched). Sums
+    across multiple usage lines because one --message can trigger
+    several model calls.
+    """
+    sent = 0
+    received = 0
+    cost = 0.0
+
+    for match in _TOKENS_RE.finditer(output or ""):
+        s_num, s_unit, r_num, r_unit = match.groups()
+        try:
+            sent += int(float(s_num) * _UNIT_MULT.get(s_unit, 1))
+            received += int(float(r_num) * _UNIT_MULT.get(r_unit, 1))
+        except ValueError:
+            continue
+
+    for match in _COST_RE.finditer(output or ""):
+        try:
+            cost += float(match.group(1))
+        except ValueError:
+            continue
+
+    return {"tokens_sent": sent, "tokens_received": received, "cost_usd": cost}
+
+
+def _empty_stats():
+    return {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0}
+
+
+def _add_stats(a, b):
+    return {
+        "tokens_sent": a["tokens_sent"] + b["tokens_sent"],
+        "tokens_received": a["tokens_received"] + b["tokens_received"],
+        "cost_usd": a["cost_usd"] + b["cost_usd"],
+    }
+
+
 def run_aider(model, message, target_file, read_files=None):
     """
     Run aider with a specific model, handling rate limit retries.
@@ -66,7 +125,10 @@ def run_aider(model, message, target_file, read_files=None):
     context (spec, test, dependency target files, etc.). Missing paths are
     silently skipped so a single stale reference doesn't kill the run.
 
-    Returns True if aider exited successfully, False otherwise.
+    Returns ``(success, stats)`` where ``stats`` is the dict produced by
+    ``_parse_usage`` summed across every internal retry. Failed runs
+    still return whatever stats accrued before the failure (a model can
+    burn tokens before crashing).
     """
     cfg = get_config()
     weak_model = cfg.get("weak_model", "groq/llama-3.1-8b-instant")
@@ -98,6 +160,7 @@ def run_aider(model, message, target_file, read_files=None):
     aider_env = os.environ.copy()
     aider_env["LITELLM_NUM_RETRIES"] = "0"
 
+    invocation_stats = _empty_stats()
     fallback_wait = 15
     for attempt in range(1, AIDER_MAX_RATE_RETRIES + 1):
         result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=aider_env)
@@ -105,10 +168,12 @@ def run_aider(model, message, target_file, read_files=None):
             print(result.stdout, end="")
         if result.stderr:
             print(result.stderr, end="")
-        if result.returncode == 0:
-            return True
 
         combined = (result.stdout or "") + (result.stderr or "")
+        invocation_stats = _add_stats(invocation_stats, _parse_usage(combined))
+
+        if result.returncode == 0:
+            return True, invocation_stats
 
         if "rate_limit_exceeded" in combined or "Rate limit reached" in combined:
             # "Request too large" means the request itself exceeds the TPM cap —
@@ -116,7 +181,7 @@ def run_aider(model, message, target_file, read_files=None):
             # fallback can try the next model.
             if "Request too large" in combined:
                 print(f"  [request too large for model {model} TPM cap — falling back]")
-                return False
+                return False, invocation_stats
 
             wait = _parse_retry_after(combined)
             if wait:
@@ -132,9 +197,9 @@ def run_aider(model, message, target_file, read_files=None):
                 continue
 
         # Non-rate-limit error or exhausted retries
-        return False
+        return False, invocation_stats
 
-    return False
+    return False, invocation_stats
 
 
 def run_with_tier_fallback(tier_name, message, target_file, start_model=None, read_files=None):
@@ -142,8 +207,10 @@ def run_with_tier_fallback(tier_name, message, target_file, start_model=None, re
     Try all models in a tier with fallback.
 
     Tries each model in the tier. On rate limit exhaustion for one model,
-    moves to the next. Returns (success, model_used). ``read_files`` is
-    forwarded to aider as read-only context.
+    moves to the next. Returns ``(success, model_used, stats)``. The
+    ``stats`` dict aggregates token / cost usage across every model
+    attempted in this call (including failed attempts that still spent
+    tokens). ``read_files`` is forwarded to aider as read-only context.
     """
     tier = get_tier(tier_name)
     models = tier["models"]
@@ -152,10 +219,12 @@ def run_with_tier_fallback(tier_name, message, target_file, start_model=None, re
         idx = models.index(start_model)
         models = models[idx:]
 
+    aggregate = _empty_stats()
     for model in models:
         print(f"  Trying {model}...")
-        success = run_aider(model, message, target_file, read_files=read_files)
+        success, stats = run_aider(model, message, target_file, read_files=read_files)
+        aggregate = _add_stats(aggregate, stats)
         if success:
-            return True, model
+            return True, model, aggregate
 
-    return False, None
+    return False, None, aggregate
