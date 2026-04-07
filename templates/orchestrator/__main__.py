@@ -27,6 +27,7 @@ from .git_ops import (
     revert_last_commit,
 )
 from .state import load_state, save_state, record_task
+from .failure_class import classify as classify_failure
 
 SPECS_DIR = Path(__file__).parent.parent / "specs"
 
@@ -174,6 +175,11 @@ def run_task(spec, default_branch, state, specs_by_name=None):
     test_file = spec["test"]
     branch_name = f"task/{task_name}"
     dependencies = spec.get("dependencies", []) or []
+    task_started = time.time()
+    models_tried = []
+
+    def _elapsed():
+        return time.time() - task_started
 
     print(f"\n{'='*50}\n{task_name}\n{'='*50}")
 
@@ -188,7 +194,7 @@ def run_task(spec, default_branch, state, specs_by_name=None):
         if passed:
             print(f"  Already passing -- skipping.")
             checkout(default_branch)
-            record_task(state, task_name, "skipped")
+            record_task(state, task_name, "skipped", duration_seconds=_elapsed())
             save_state(state)
             return "skipped"
         else:
@@ -196,12 +202,20 @@ def run_task(spec, default_branch, state, specs_by_name=None):
             fail_log = SPECS_DIR / f"FAILED-{task_name}.log"
             fail_log.write_text(f"Previously attempted -- still failing on re-run.\n\n{output}")
             checkout(default_branch)
-            record_task(state, task_name, "failed", attempts=0)
+            record_task(
+                state,
+                task_name,
+                "failed",
+                attempts=0,
+                duration_seconds=_elapsed(),
+                failure_class=classify_failure(output),
+            )
             save_state(state)
             return "failed"
 
     # --- Normal first run: branch from dependency tip(s) ---
     start_point, extra_merges = _resolve_dependency_base(dependencies, default_branch)
+    base_sha = branch_tip(start_point)
     if start_point != default_branch or extra_merges:
         print(f"  Branching from '{start_point}' (deps: {', '.join(dependencies) or 'none'})")
     checkout(branch_name, create=True, start_point=start_point)
@@ -217,7 +231,16 @@ def run_task(spec, default_branch, state, specs_by_name=None):
                 "or fix the conflict manually and re-run the orchestrator.\n"
             )
             checkout(default_branch)
-            record_task(state, task_name, "failed", attempts=0)
+            record_task(
+                state,
+                task_name,
+                "failed",
+                attempts=0,
+                duration_seconds=_elapsed(),
+                failure_class="merge_conflict",
+                base_branch=start_point,
+                base_sha=base_sha,
+            )
             save_state(state)
             return "failed"
 
@@ -259,6 +282,8 @@ def run_task(spec, default_branch, state, specs_by_name=None):
                 first_model,
                 read_files=read_files,
             )
+        if model_used and model_used not in models_tried:
+            models_tried.append(model_used)
 
         if check_regression(target_file, baseline_size):
             revert_last_commit(target_file, baseline_size)
@@ -269,7 +294,17 @@ def run_task(spec, default_branch, state, specs_by_name=None):
         if passed:
             print(f"PASSED (Stage 1, attempt {attempt}): {task_name}")
             checkout(default_branch)
-            record_task(state, task_name, "passed", model=model_used, attempts=total_attempts)
+            record_task(
+                state,
+                task_name,
+                "passed",
+                model=model_used,
+                attempts=total_attempts,
+                duration_seconds=_elapsed(),
+                models_tried=models_tried,
+                base_branch=start_point,
+                base_sha=base_sha,
+            )
             save_state(state)
             return "passed"
 
@@ -287,6 +322,8 @@ def run_task(spec, default_branch, state, specs_by_name=None):
             target_file,
             read_files=read_files,
         )
+        if model_used and model_used not in models_tried:
+            models_tried.append(model_used)
 
         if check_regression(target_file, baseline_size):
             revert_last_commit(target_file, baseline_size)
@@ -297,20 +334,44 @@ def run_task(spec, default_branch, state, specs_by_name=None):
         if passed:
             print(f"PASSED (Escalation, attempt {attempt}): {task_name}")
             checkout(default_branch)
-            record_task(state, task_name, "passed", model=model_used, attempts=total_attempts)
+            record_task(
+                state,
+                task_name,
+                "passed",
+                model=model_used,
+                attempts=total_attempts,
+                duration_seconds=_elapsed(),
+                models_tried=models_tried,
+                base_branch=start_point,
+                base_sha=base_sha,
+            )
             save_state(state)
             return "passed"
 
     # --- Stage 3: Flag for Claude review ---
     _, test_output = run_tests(test_file)
+    failure_label = classify_failure(test_output)
     fail_log = SPECS_DIR / f"FAILED-{task_name}.log"
     fail_log.write_text(
         f"Failed after primary tier ({primary_tier['retries']}x) "
-        f"+ escalation ({escalation_tier['retries']}x).\n\n{test_output}"
+        f"+ escalation ({escalation_tier['retries']}x).\n"
+        f"Failure class: {failure_label}\n"
+        f"Models tried: {', '.join(models_tried) or 'none'}\n\n"
+        f"{test_output}"
     )
-    print(f"ESCALATE TO CLAUDE: {task_name}")
+    print(f"ESCALATE TO CLAUDE: {task_name} (failure_class={failure_label})")
     checkout(default_branch)
-    record_task(state, task_name, "failed", attempts=total_attempts)
+    record_task(
+        state,
+        task_name,
+        "failed",
+        attempts=total_attempts,
+        duration_seconds=_elapsed(),
+        models_tried=models_tried,
+        failure_class=failure_label,
+        base_branch=start_point,
+        base_sha=base_sha,
+    )
     save_state(state)
     return "failed"
 
@@ -412,7 +473,7 @@ def integration_gate(passed_task_names, default_branch, state):
     return True
 
 
-def print_summary(results, default_branch):
+def print_summary(results, default_branch, state=None):
     """Print final summary of pipeline run."""
     passed = results["passed"]
     failed = results["failed"]
@@ -422,6 +483,36 @@ def print_summary(results, default_branch):
     print(f"PASSED:  {len(passed)}")
     print(f"SKIPPED: {len(skipped)} (already passing)")
     print(f"FAILED:  {len(failed)}")
+
+    # Observability roll-up: per-model success/failure counts and task timings.
+    if state and state.get("tasks"):
+        by_model = {}
+        total_time = 0.0
+        for name, entry in state["tasks"].items():
+            dur = entry.get("duration_seconds") or 0.0
+            total_time += dur
+            model = entry.get("model") or "(none)"
+            bucket = by_model.setdefault(model, {"passed": 0, "failed": 0, "skipped": 0})
+            bucket[entry["status"]] = bucket.get(entry["status"], 0) + 1
+
+        print(f"\nTotal task time: {total_time:.1f}s")
+        print("By model:")
+        for model, counts in sorted(by_model.items()):
+            print(
+                f"  {model}: {counts.get('passed', 0)} passed, "
+                f"{counts.get('failed', 0)} failed, "
+                f"{counts.get('skipped', 0)} skipped"
+            )
+
+        fail_classes = {}
+        for entry in state["tasks"].values():
+            fc = entry.get("failure_class")
+            if fc:
+                fail_classes[fc] = fail_classes.get(fc, 0) + 1
+        if fail_classes:
+            print("Failure classes:")
+            for fc, n in sorted(fail_classes.items(), key=lambda x: -x[1]):
+                print(f"  {fc}: {n}")
 
     if failed:
         print(f"\n{'='*50}")
@@ -492,7 +583,7 @@ def main():
             print(f"  [cooldown: sleeping {cooldown}s between tasks]")
             time.sleep(cooldown)
 
-    print_summary(results, default_branch)
+    print_summary(results, default_branch, state)
 
     # Integration gate: only run if every task succeeded (passed or skipped).
     # Failed tasks must be resolved before we try to assemble a merge.

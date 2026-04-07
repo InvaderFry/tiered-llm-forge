@@ -32,12 +32,40 @@ def _empty_state():
     }
 
 
-def record_task(state, task_name, status, model=None, attempts=0):
-    """Record the outcome of a single task."""
-    state["tasks"][task_name] = {
+def record_task(
+    state,
+    task_name,
+    status,
+    model=None,
+    attempts=0,
+    duration_seconds=None,
+    models_tried=None,
+    failure_class=None,
+    base_branch=None,
+    base_sha=None,
+):
+    """Record the outcome of a single task.
+
+    Extra fields (all optional) provide the observability hooks needed to
+    answer questions like "which model fails most often?" and "how long
+    does each task take?" without scraping log files.
+    """
+    entry = {
         "status": status,
         "model": model,
         "attempts": attempts,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if duration_seconds is not None:
+        entry["duration_seconds"] = round(float(duration_seconds), 2)
+    if models_tried is not None:
+        entry["models_tried"] = list(models_tried)
+    if failure_class is not None:
+        entry["failure_class"] = failure_class
+    if base_branch is not None:
+        entry["base_branch"] = base_branch
+    if base_sha is not None:
+        entry["base_sha"] = base_sha
+
+    state["tasks"][task_name] = entry
     return state
