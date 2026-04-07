@@ -14,7 +14,6 @@ from orchestrator.spec_parser import (
     parse_frontmatter,
     parse_target_file,
     load_spec,
-    compress_spec,
     validate_specs,
     topological_sort,
 )
@@ -34,8 +33,6 @@ def mock_config(monkeypatch, tmp_path):
             models: ["groq/openai/gpt-oss-120b"]
             retries: 2
         weak_model: groq/llama-3.1-8b-instant
-        large_context_model: groq/meta-llama/llama-4-scout-17b-16e-instruct
-        large_context_chars: 16000
         spec_limits:
           soft_limit_chars: 100
           hard_limit_chars: 200
@@ -131,25 +128,6 @@ class TestLoadSpec:
         spec_file.write_text("---\ntarget: src/auth.py\n---\n# Body")
         spec = load_spec(spec_file)
         assert spec["test"] == "tests/test_002_auth.py"
-
-
-class TestCompressSpec:
-    def test_no_compression_under_soft_limit(self):
-        spec = "short spec"
-        assert compress_spec(spec, "task-001") == spec
-
-    def test_strips_context_section(self):
-        # Soft limit is 100 in our test config
-        spec = "A" * 50 + "\n## Context\nLong context here\n## Next\n" + "B" * 60
-        result = compress_spec(spec, "task-001")
-        assert "## Context" not in result
-        assert "Long context" not in result
-
-    def test_hard_truncates_when_still_too_large(self):
-        # Hard limit is 200 in our test config
-        spec = "A" * 300
-        result = compress_spec(spec, "task-001")
-        assert len(result) == 200
 
 
 class TestValidateSpecs:

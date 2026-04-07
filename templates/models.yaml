@@ -18,16 +18,14 @@ tiers:
 # Weak model for commit messages and safe operations (low token cost)
 weak_model: groq/llama-3.1-8b-instant
 
-# Model used when a spec exceeds the large context threshold
-large_context_model: groq/meta-llama/llama-4-scout-17b-16e-instruct
-
-# Specs larger than this (in chars) route directly to the large context model
-large_context_chars: 16000
-
-# Spec compression thresholds
+# Spec size warning thresholds. The orchestrator no longer compresses or
+# truncates spec text — the spec is attached to Aider as a read-only file
+# instead — but oversized specs still warn during validation so authors
+# get a chance to split them before hitting the model's effective context
+# window.
 spec_limits:
-  soft_limit_chars: 12000   # strip ## Context section above this
-  hard_limit_chars: 16000   # hard-truncate above this
+  soft_limit_chars: 12000   # validation warning above this
+  hard_limit_chars: 16000   # validation warning + likely TPM trouble above this
 
 # Seconds to pause between tasks (lets Groq's per-minute TPM window reset)
 cooldown_seconds: 30

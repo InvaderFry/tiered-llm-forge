@@ -82,14 +82,25 @@ file before editing yours."
 - **One target file per task.** If a feature needs multiple files, split into
   multiple tasks with dependency ordering.
 - **Zero-padded three digits:** `task-001`, `task-002`, etc.
-- **Hard token budget: ~12,000 characters (~3,000 words).** The orchestrator
-  strips `## Context` first, then hard-truncates. Stay under the limit by
-  splitting tasks, not trimming details.
-- **Specs over ~16,000 characters route to a weaker model** (Llama 4 Scout).
-  Another reason to keep specs small.
+- **Soft token budget: ~12,000 characters (~3,000 words).** The orchestrator
+  attaches the full spec to the implementer model as a read-only file, so
+  oversized specs eat into the model's effective context window. Validation
+  warns above 12K characters and again above 16K. Stay under by splitting
+  tasks, not trimming details.
 - **Never reference files that don't exist yet** as dependencies. If task-002
   depends on task-001's output, declare it in the frontmatter `dependencies`.
 - **No implementation code in specs.** Function signatures and type hints only.
+
+### Language coverage caveat
+
+The orchestrator's regression guard (`runner.py:_content_looks_valid`)
+only recognises Python, Java, XML, JSON, and YAML markers. For any
+other target language — TypeScript, Go, Rust, Ruby, Kotlin, C#, Swift,
+C/C++ — the guard silently passes everything, so a model that
+truncates the file to a stub will not be caught and reverted; only the
+test suite will notice. Until the guard is extended, write
+exhaustive tests for non-Python targets and review post-task diffs
+carefully.
 
 ---
 

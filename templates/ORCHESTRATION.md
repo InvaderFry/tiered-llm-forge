@@ -299,10 +299,13 @@ they no longer run in parallel. Then `make run`.
 offending task branch (not the integration branch), and `make run`.
 The orchestrator will rebuild a fresh integration branch on the next pass.
 
-**I want to see per-model stats and failure classes**
+**I want to see per-model stats, costs, and failure classes**
 → `cat pipeline-state.json` — each task records `model`, `models_tried`,
-`duration_seconds`, and `failure_class`. `make run` also prints a rolled-up
-summary at the end.
+`duration_seconds`, `failure_class`, `tokens_sent`, `tokens_received`,
+and `cost_usd` (scraped from aider's stdout). `make run` also prints a
+rolled-up summary at the end with totals and per-model token / dollar
+counts so you can see whether the escalation tier is actually
+earning its keep.
 
 **Want to add a new model provider**
 → Edit `models.yaml` and add models to the appropriate tier. The orchestrator
