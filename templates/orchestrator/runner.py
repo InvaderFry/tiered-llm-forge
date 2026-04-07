@@ -72,7 +72,15 @@ def check_regression(target_file, baseline_size):
     return False
 
 
-# Content markers for sanity-checking source files by extension
+# Content markers for sanity-checking source files by extension.
+#
+# TODO(language-coverage): this dict only knows Python, Java, XML, JSON,
+# and YAML. _content_looks_valid() returns True for unknown extensions,
+# so any other language (TypeScript, Go, Rust, Ruby, Kotlin, C#, Swift,
+# C/C++, etc.) silently bypasses the corruption check — a model that
+# truncates a Go file down to one line will currently slip through.
+# When new-project.sh grows non-Python templates, extend this map (or
+# replace the heuristic with a tree-sitter / parser-based check).
 _CONTENT_MARKERS = {
     ".py":   ["def ", "class ", "import ", "from "],
     ".java": ["class ", "interface ", "package ", "public ", "import "],
