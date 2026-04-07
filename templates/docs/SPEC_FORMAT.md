@@ -54,6 +54,27 @@ Keep important technical details in other sections.
 | `test` | Yes | Path to the test file for this task |
 | `dependencies` | No | List of task names this depends on (e.g., `["task-001-models"]`) |
 
+### How `dependencies` is used
+
+The orchestrator does **two** things with the dependency list, not one:
+
+1. **Topological ordering** — tasks with no unmet deps run first.
+2. **Branch stacking** — task N's git branch is created from the tip of
+   its dependency branch(es). With a single dep, the new branch is
+   stacked directly on top (one linear history). With multiple deps,
+   the new branch starts from the default branch and each dep branch
+   is merged into it before the implementer model runs.
+
+This means the implementer model actually sees upstream code. It also
+means a dependency you forget to declare will hide upstream code from
+the model and the task will probably fail with a `missing_symbol` or
+`collection_error` failure class.
+
+The implementer also receives the spec file, the test file, and every
+dependency's **target file** as read-only context for Aider — so
+declaring a dependency is also how you tell the model "go read this
+file before editing yours."
+
 ---
 
 ## Critical Rules
@@ -158,3 +179,26 @@ task-003  Storage layer (depends on 001)
 task-004  API/service layer (depends on 002 + 003)
 task-005  Integration wiring (depends on all above)
 ```
+
+### A note on fan-in dependencies
+
+When a task declares several dependencies, the orchestrator assembles
+its branch by merging each dep branch in turn. If two dependency
+branches touch the **same file**, the merge will conflict and the task
+will fail with a `merge_conflict` failure class.
+
+Avoid fan-in for tasks that modify overlapping files. Prefer:
+
+- A linear chain (A → B → C) when the later tasks extend the earlier
+  ones' files.
+- A fan-in only when the dependencies touch strictly disjoint files
+  (e.g., `task-004` depends on `task-002` and `task-003`, but `002`
+  edits only `src/auth.py` and `003` edits only `src/storage.py`).
+- A "merge point" task when several siblings need to combine into one
+  target — extract the combination into its own spec and make it
+  depend on the siblings; the siblings themselves stay independent.
+
+The final **integration gate** catches any residual cross-task
+regression by running the full test suite against the assembled
+branch, but it is cheaper to avoid conflicts at spec time than to
+debug them after the fact.

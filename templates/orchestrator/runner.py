@@ -26,6 +26,27 @@ def run_tests(test_file):
     return result.returncode == 0, output
 
 
+def run_full_suite(tests_dir="tests"):
+    """
+    Run the full pytest suite under ``tests_dir``.
+
+    Returns (passed, output). Used by the integration gate after all
+    per-task tests pass to catch cross-task regressions before merge.
+    """
+    tests_path = Path(tests_dir)
+    if not tests_path.exists():
+        return False, f"Tests directory {tests_dir} does not exist."
+
+    cmd = ["pytest", str(tests_path), "--tb=short", "-q"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    output = result.stdout + result.stderr
+
+    if "no tests ran" in output or "collected 0 items" in output:
+        return False, f"Vacuous pass: pytest collected 0 tests from {tests_dir}.\n\n{output}"
+
+    return result.returncode == 0, output
+
+
 def file_size(path):
     """Return file size in bytes, or 0 if the file doesn't exist."""
     p = Path(path)

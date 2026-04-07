@@ -1,7 +1,25 @@
 # Merge Checklist
 
-After the orchestrator reports all tasks passing, run a quality gate before
-merging into the default branch.
+After the orchestrator reports all tasks passing **and the integration
+gate has succeeded**, run a quality gate before merging into the
+default branch.
+
+### 0. Confirm the integration gate passed
+
+```bash
+python3 -c 'import json; s=json.load(open("pipeline-state.json")); print(s.get("integration", {}))'
+ls specs/INTEGRATION-FAILED.log 2>/dev/null && echo "BLOCKED: integration gate failed"
+git branch --list "integration/*"
+```
+
+You need `integration.status == "passed"` **and** no
+`INTEGRATION-FAILED.log`. The passing `integration/run-<timestamp>`
+branch already contains every task merged together with the full test
+suite green — treat it as the source of truth for the combined behaviour.
+
+If the integration gate did not pass, stop and follow
+`docs/FAILURE_PLAYBOOK.md` → *Integration gate failures* before
+reviewing individual task branches.
 
 ---
 
@@ -13,7 +31,19 @@ The user says: **"Review the task branches"** or **"Merge the passing branches"*
 
 ## Procedure
 
-For each passing task branch, in dependency order:
+First, resolve the default branch name for the current repo. None of the
+commands below assume `main` — some repos use `master`, `trunk`, or something
+else entirely, and `git init` picks whatever `init.defaultBranch` is set to.
+
+```bash
+DEFAULT=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
+    | sed 's@^refs/remotes/origin/@@') \
+    || DEFAULT=$(git config --get init.defaultBranch 2>/dev/null) \
+    || DEFAULT=master
+echo "Default branch: $DEFAULT"
+```
+
+Then, for each passing task branch, in dependency order:
 
 ### 1. Read the spec
 ```
@@ -23,7 +53,7 @@ Focus on: function signatures, constraints, expected behavior.
 
 ### 2. Read the diff
 ```bash
-git diff main..task/task-NNN-name
+git diff "$DEFAULT..task/task-NNN-name"
 ```
 
 ### 3. Evaluate three criteria
@@ -41,10 +71,10 @@ are fine. Fix anything that creates real maintenance debt.
 
 #### MERGE — Meets goals, acceptable quality
 ```bash
-git checkout main
-git merge --squash task/task-NNN-name
+git checkout "$DEFAULT"
+git merge --squash "task/task-NNN-name"
 git commit -m "feat: task-NNN — <one-line description>"
-git branch -d task/task-NNN-name
+git branch -d "task/task-NNN-name"
 ```
 
 #### FIX THEN MERGE — Tests pass but a constraint was missed or quality issue exists
@@ -70,3 +100,20 @@ Summarize:
 - What was merged (and commit hashes)
 - What was fixed-then-merged (and what was fixed)
 - What was flagged (with paths to REVIEW notes)
+
+### Clean up the integration branch
+
+Once every task branch has been merged (or explicitly flagged), the
+`integration/run-<timestamp>` branch is no longer useful — it just
+duplicates history that is now on the default branch.
+
+```bash
+git branch -D "$(git branch --list 'integration/*' | tr -d ' *')"
+```
+
+If you prefer to preserve it as a snapshot of the combined tested
+state, tag it first:
+
+```bash
+git tag "integration-$(date +%Y%m%d)" "integration/run-<timestamp>"
+```

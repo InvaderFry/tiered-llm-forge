@@ -15,15 +15,19 @@ from pathlib import Path
 from .config import load_config, get_config, get_tier
 from .spec_parser import load_spec, compress_spec, validate_specs, topological_sort
 from .model_router import select_model_for_spec, run_aider, run_with_tier_fallback
-from .runner import run_tests, file_size, check_regression
+from .runner import run_tests, run_full_suite, file_size, check_regression
 from .git_ops import (
     get_default_branch,
     ensure_default_branch_exists,
     branch_exists,
+    branch_tip,
     checkout,
+    delete_branch,
+    merge_branch,
     revert_last_commit,
 )
 from .state import load_state, save_state, record_task
+from .failure_class import classify as classify_failure
 
 SPECS_DIR = Path(__file__).parent.parent / "specs"
 
@@ -122,7 +126,37 @@ def cmd_dry_run():
     return 0
 
 
-def run_task(spec, default_branch, state):
+def _resolve_dependency_base(dependencies, default_branch):
+    """
+    Determine the start point for a new task branch based on its dependencies.
+
+    - 0 deps   -> default branch
+    - 1 dep    -> that dep's task branch (stacked)
+    - N deps   -> default branch (caller will merge deps in afterwards)
+
+    Returns (start_point, extra_merges) where ``extra_merges`` is the list
+    of dependency branches the caller still needs to merge in after checkout.
+    Any dependency whose branch does not exist is skipped with a warning.
+    """
+    dep_branches = []
+    for dep in dependencies:
+        dep_branch = f"task/{dep}"
+        if branch_exists(dep_branch):
+            dep_branches.append(dep_branch)
+        else:
+            print(
+                f"  [dependency '{dep}' has no branch — falling back to default for that dep]"
+            )
+
+    if not dep_branches:
+        return default_branch, []
+    if len(dep_branches) == 1:
+        return dep_branches[0], []
+    # Multiple deps: start from default and merge each one in
+    return default_branch, dep_branches
+
+
+def run_task(spec, default_branch, state, specs_by_name=None):
     """
     Run a task through the full model escalation ladder.
 
@@ -130,11 +164,22 @@ def run_task(spec, default_branch, state):
     - Branch exists + tests pass  -> skip (return 'skipped')
     - Branch exists + tests fail  -> flag for Claude review (return 'failed')
     - Branch does not exist       -> normal first run
+
+    Dependency handling:
+    The task branch is created from the tip of its dependency branch(es) so
+    task N actually runs against task N-1's code. With multiple dependencies
+    they are merged together onto a fresh branch rooted at ``default_branch``.
     """
     task_name = spec["task_name"]
     target_file = spec["target"]
     test_file = spec["test"]
     branch_name = f"task/{task_name}"
+    dependencies = spec.get("dependencies", []) or []
+    task_started = time.time()
+    models_tried = []
+
+    def _elapsed():
+        return time.time() - task_started
 
     print(f"\n{'='*50}\n{task_name}\n{'='*50}")
 
@@ -149,7 +194,7 @@ def run_task(spec, default_branch, state):
         if passed:
             print(f"  Already passing -- skipping.")
             checkout(default_branch)
-            record_task(state, task_name, "skipped")
+            record_task(state, task_name, "skipped", duration_seconds=_elapsed())
             save_state(state)
             return "skipped"
         else:
@@ -157,13 +202,59 @@ def run_task(spec, default_branch, state):
             fail_log = SPECS_DIR / f"FAILED-{task_name}.log"
             fail_log.write_text(f"Previously attempted -- still failing on re-run.\n\n{output}")
             checkout(default_branch)
-            record_task(state, task_name, "failed", attempts=0)
+            record_task(
+                state,
+                task_name,
+                "failed",
+                attempts=0,
+                duration_seconds=_elapsed(),
+                failure_class=classify_failure(output),
+            )
             save_state(state)
             return "failed"
 
-    # --- Normal first run ---
-    checkout(branch_name, create=True)
+    # --- Normal first run: branch from dependency tip(s) ---
+    start_point, extra_merges = _resolve_dependency_base(dependencies, default_branch)
+    base_sha = branch_tip(start_point)
+    if start_point != default_branch or extra_merges:
+        print(f"  Branching from '{start_point}' (deps: {', '.join(dependencies) or 'none'})")
+    checkout(branch_name, create=True, start_point=start_point)
+
+    for dep_branch in extra_merges:
+        print(f"  Merging dependency branch {dep_branch} into {branch_name}")
+        if not merge_branch(dep_branch, message=f"merge: {dep_branch} into {branch_name}"):
+            fail_log = SPECS_DIR / f"FAILED-{task_name}.log"
+            fail_log.write_text(
+                f"Merge conflict while assembling dependencies for {task_name}.\n"
+                f"Conflicting branch: {dep_branch}\n"
+                "Resolve by running the tasks with fewer simultaneous dependencies, "
+                "or fix the conflict manually and re-run the orchestrator.\n"
+            )
+            checkout(default_branch)
+            record_task(
+                state,
+                task_name,
+                "failed",
+                attempts=0,
+                duration_seconds=_elapsed(),
+                failure_class="merge_conflict",
+                base_branch=start_point,
+                base_sha=base_sha,
+            )
+            save_state(state)
+            return "failed"
+
     baseline_size = file_size(target_file)
+
+    # Assemble read-only context for the implementer model:
+    # the full spec file, the test file, and the target files of every
+    # declared dependency. Missing paths are dropped inside run_aider.
+    read_files = [str(spec["path"]), test_file]
+    if specs_by_name:
+        for dep_name in dependencies:
+            dep_spec = specs_by_name.get(dep_name)
+            if dep_spec and dep_spec.get("target"):
+                read_files.append(dep_spec["target"])
 
     cfg = get_config()
     primary_tier = get_tier("primary")
@@ -179,7 +270,9 @@ def run_task(spec, default_branch, state):
         print(f"  Attempt {attempt}/{primary_tier['retries']}...")
 
         if attempt == 1:
-            success, model_used = run_with_tier_fallback("primary", spec_text, target_file, first_model)
+            success, model_used = run_with_tier_fallback(
+                "primary", spec_text, target_file, first_model, read_files=read_files,
+            )
         else:
             _, test_output = run_tests(test_file)
             success, model_used = run_with_tier_fallback(
@@ -187,7 +280,10 @@ def run_task(spec, default_branch, state):
                 f"Tests failed. Output:\n{_strip_urls(test_output)}\nFix the code to pass all tests.",
                 target_file,
                 first_model,
+                read_files=read_files,
             )
+        if model_used and model_used not in models_tried:
+            models_tried.append(model_used)
 
         if check_regression(target_file, baseline_size):
             revert_last_commit(target_file, baseline_size)
@@ -198,7 +294,17 @@ def run_task(spec, default_branch, state):
         if passed:
             print(f"PASSED (Stage 1, attempt {attempt}): {task_name}")
             checkout(default_branch)
-            record_task(state, task_name, "passed", model=model_used, attempts=total_attempts)
+            record_task(
+                state,
+                task_name,
+                "passed",
+                model=model_used,
+                attempts=total_attempts,
+                duration_seconds=_elapsed(),
+                models_tried=models_tried,
+                base_branch=start_point,
+                base_sha=base_sha,
+            )
             save_state(state)
             return "passed"
 
@@ -214,7 +320,10 @@ def run_task(spec, default_branch, state):
             "escalation",
             f"Previous model failed. Tests output:\n{_strip_urls(test_output)}\nAnalyze carefully and fix.",
             target_file,
+            read_files=read_files,
         )
+        if model_used and model_used not in models_tried:
+            models_tried.append(model_used)
 
         if check_regression(target_file, baseline_size):
             revert_last_commit(target_file, baseline_size)
@@ -225,25 +334,146 @@ def run_task(spec, default_branch, state):
         if passed:
             print(f"PASSED (Escalation, attempt {attempt}): {task_name}")
             checkout(default_branch)
-            record_task(state, task_name, "passed", model=model_used, attempts=total_attempts)
+            record_task(
+                state,
+                task_name,
+                "passed",
+                model=model_used,
+                attempts=total_attempts,
+                duration_seconds=_elapsed(),
+                models_tried=models_tried,
+                base_branch=start_point,
+                base_sha=base_sha,
+            )
             save_state(state)
             return "passed"
 
     # --- Stage 3: Flag for Claude review ---
     _, test_output = run_tests(test_file)
+    failure_label = classify_failure(test_output)
     fail_log = SPECS_DIR / f"FAILED-{task_name}.log"
     fail_log.write_text(
         f"Failed after primary tier ({primary_tier['retries']}x) "
-        f"+ escalation ({escalation_tier['retries']}x).\n\n{test_output}"
+        f"+ escalation ({escalation_tier['retries']}x).\n"
+        f"Failure class: {failure_label}\n"
+        f"Models tried: {', '.join(models_tried) or 'none'}\n\n"
+        f"{test_output}"
     )
-    print(f"ESCALATE TO CLAUDE: {task_name}")
+    print(f"ESCALATE TO CLAUDE: {task_name} (failure_class={failure_label})")
     checkout(default_branch)
-    record_task(state, task_name, "failed", attempts=total_attempts)
+    record_task(
+        state,
+        task_name,
+        "failed",
+        attempts=total_attempts,
+        duration_seconds=_elapsed(),
+        models_tried=models_tried,
+        failure_class=failure_label,
+        base_branch=start_point,
+        base_sha=base_sha,
+    )
     save_state(state)
     return "failed"
 
 
-def print_summary(results, default_branch):
+def integration_gate(passed_task_names, default_branch, state):
+    """
+    Assemble an integration branch by merging all passing task branches and
+    run the full pytest suite against the result.
+
+    Behaviour:
+    - Creates ``integration/run-<timestamp>`` from the default branch.
+    - Merges each passing task branch (in the order provided) with --no-ff.
+    - On merge conflict or full-suite failure, writes
+      ``specs/INTEGRATION-FAILED.log``, deletes the integration branch,
+      and returns False so the caller can block merge.
+    - On success, leaves the integration branch in place for human review
+      and returns True.
+
+    The caller is responsible for returning to the default branch afterwards.
+    """
+    from datetime import datetime, timezone
+    import subprocess
+
+    if not passed_task_names:
+        print("\n[integration gate] No passing tasks — skipping.")
+        return True
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    integration_branch = f"integration/run-{timestamp}"
+
+    print(f"\n{'='*50}")
+    print(f"INTEGRATION GATE: {integration_branch}")
+    print(f"{'='*50}")
+
+    # Record where we came from so we can always get back to it
+    checkout(default_branch)
+    checkout(integration_branch, create=True, start_point=default_branch)
+
+    failed_merges = []
+    for task_name in passed_task_names:
+        branch = f"task/{task_name}"
+        if not branch_exists(branch):
+            print(f"  [skip] {branch} — branch missing")
+            continue
+        print(f"  merging {branch}")
+        if not merge_branch(branch, message=f"integration: merge {branch}"):
+            failed_merges.append(task_name)
+            break
+
+    log_path = SPECS_DIR / "INTEGRATION-FAILED.log"
+
+    if failed_merges:
+        msg = (
+            f"Integration gate failed: merge conflict on {failed_merges[0]}.\n"
+            "The per-task branches individually pass their own tests, but "
+            "they cannot be combined cleanly. Resolve conflicts manually or "
+            "rework the spec dependencies.\n"
+        )
+        log_path.write_text(msg)
+        print(f"\n  INTEGRATION FAILED (merge conflict). See {log_path}")
+        state["integration"] = {
+            "branch": integration_branch,
+            "status": "merge_conflict",
+            "failed_on": failed_merges[0],
+            "timestamp": timestamp,
+        }
+        save_state(state)
+        checkout(default_branch)
+        delete_branch(integration_branch, force=True)
+        return False
+
+    # Merges clean — run the full suite
+    print("  running full test suite on integration branch...")
+    passed, output = run_full_suite("tests")
+    if not passed:
+        log_path.write_text(
+            f"Integration gate failed: full test suite failed on {integration_branch}.\n\n"
+            f"{output}\n"
+        )
+        print(f"  INTEGRATION FAILED (test suite). See {log_path}")
+        state["integration"] = {
+            "branch": integration_branch,
+            "status": "tests_failed",
+            "timestamp": timestamp,
+        }
+        save_state(state)
+        checkout(default_branch)
+        # Keep the branch around so the human can reproduce the failure
+        return False
+
+    print(f"  INTEGRATION PASSED: {integration_branch} is ready to merge.")
+    state["integration"] = {
+        "branch": integration_branch,
+        "status": "passed",
+        "timestamp": timestamp,
+    }
+    save_state(state)
+    checkout(default_branch)
+    return True
+
+
+def print_summary(results, default_branch, state=None):
     """Print final summary of pipeline run."""
     passed = results["passed"]
     failed = results["failed"]
@@ -253,6 +483,36 @@ def print_summary(results, default_branch):
     print(f"PASSED:  {len(passed)}")
     print(f"SKIPPED: {len(skipped)} (already passing)")
     print(f"FAILED:  {len(failed)}")
+
+    # Observability roll-up: per-model success/failure counts and task timings.
+    if state and state.get("tasks"):
+        by_model = {}
+        total_time = 0.0
+        for name, entry in state["tasks"].items():
+            dur = entry.get("duration_seconds") or 0.0
+            total_time += dur
+            model = entry.get("model") or "(none)"
+            bucket = by_model.setdefault(model, {"passed": 0, "failed": 0, "skipped": 0})
+            bucket[entry["status"]] = bucket.get(entry["status"], 0) + 1
+
+        print(f"\nTotal task time: {total_time:.1f}s")
+        print("By model:")
+        for model, counts in sorted(by_model.items()):
+            print(
+                f"  {model}: {counts.get('passed', 0)} passed, "
+                f"{counts.get('failed', 0)} failed, "
+                f"{counts.get('skipped', 0)} skipped"
+            )
+
+        fail_classes = {}
+        for entry in state["tasks"].values():
+            fc = entry.get("failure_class")
+            if fc:
+                fail_classes[fc] = fail_classes.get(fc, 0) + 1
+        if fail_classes:
+            print("Failure classes:")
+            for fc, n in sorted(fail_classes.items(), key=lambda x: -x[1]):
+                print(f"  {fc}: {n}")
 
     if failed:
         print(f"\n{'='*50}")
@@ -311,9 +571,11 @@ def main():
     state = load_state()
     results = {"passed": [], "failed": [], "skipped": []}
 
+    specs_by_name = {load_spec(sf)["task_name"]: load_spec(sf) for sf in ordered}
+
     for i, sf in enumerate(ordered):
         spec = load_spec(sf)
-        outcome = run_task(spec, default_branch, state)
+        outcome = run_task(spec, default_branch, state, specs_by_name=specs_by_name)
         results[outcome].append(spec["task_name"])
 
         # Cooldown between tasks
@@ -321,7 +583,16 @@ def main():
             print(f"  [cooldown: sleeping {cooldown}s between tasks]")
             time.sleep(cooldown)
 
-    print_summary(results, default_branch)
+    print_summary(results, default_branch, state)
+
+    # Integration gate: only run if every task succeeded (passed or skipped).
+    # Failed tasks must be resolved before we try to assemble a merge.
+    if not results["failed"]:
+        all_task_names = [s["task_name"] for s in (load_spec(sf) for sf in ordered)]
+        integration_gate(all_task_names, default_branch, state)
+    else:
+        print("\n[integration gate] Skipped — resolve failed tasks first.")
+
     save_state(state)
 
 

@@ -119,11 +119,23 @@ make run
 
 The orchestrator processes each spec in dependency order:
 
-1. Creates a `task/task-NNN-name` git branch
-2. Tries all primary tier models with fallback (3 attempts)
-3. Escalates to the escalation tier if primary fails (2 attempts)
-4. Writes `specs/FAILED-task-NNN-name.log` if all attempts fail
-5. Returns to default branch, moves to next task
+1. Creates a `task/task-NNN-name` git branch **from its dependency branch(es)**,
+   not from the default branch. A task with one dependency is stacked on
+   that dependency; a task with several dependencies starts from the
+   default branch and merges each dep branch in before running Aider.
+2. Attaches the spec file, test file, and every dependency's target file
+   as read-only context for Aider, so the implementer model sees the
+   upstream interfaces instead of guessing from the spec alone.
+3. Tries all primary tier models with fallback (3 attempts).
+4. Escalates to the escalation tier if primary fails (2 attempts).
+5. Writes `specs/FAILED-task-NNN-name.log` (tagged with a failure class)
+   if all attempts fail.
+6. Records per-task model, duration, attempts, base SHA, and failure class
+   in `pipeline-state.json`.
+7. Returns to default branch, moves to next task.
+
+After every task passes, the orchestrator runs an **integration gate**
+(see Phase 7 below).
 
 **Re-running is safe.** Passing branches are skipped. Failing branches go
 straight to Claude review.
@@ -160,9 +172,40 @@ make run
 
 ---
 
-## Phase 7: Review and Merge
+## Phase 7: Integration Gate (automatic)
 
-After all tasks pass:
+When the per-task loop finishes with zero failures, the orchestrator
+automatically assembles an integration branch and runs the full test
+suite against it:
+
+1. Creates `integration/run-<timestamp>` from the default branch.
+2. Merges each passing `task/*` branch with `--no-ff` in dependency
+   order.
+3. Runs `pytest tests/` on the combined result.
+
+Outcomes:
+
+- **Clean:** the integration branch is left in place and ready for
+  human merge review in Phase 8. `pipeline-state.json` records
+  `integration.status = "passed"`.
+- **Merge conflict:** writes `specs/INTEGRATION-FAILED.log` with the
+  offending task branch and deletes the integration branch. Resolve
+  by reworking the spec's dependency graph or the conflicting task,
+  then re-run `make run`.
+- **Tests failed on the combined branch:** writes
+  `specs/INTEGRATION-FAILED.log` with the full pytest output and
+  **keeps** the integration branch so you can reproduce the failure
+  with `git checkout integration/run-<timestamp>` and iterate.
+
+The integration gate is skipped if any task in the current run failed.
+Fix the per-task failures first, then re-run — the passing tasks are
+skipped automatically and the gate runs when the last one clears.
+
+---
+
+## Phase 8: Review and Merge
+
+After the integration gate passes:
 
 ```
 Review the task branches and merge them.
@@ -172,6 +215,9 @@ Claude diffs each branch against its spec and decides:
 - **MERGE** — squash-merge automatically
 - **FIX THEN MERGE** — correct quality issue, then merge
 - **FLAG** — writes REVIEW notes, does not merge
+
+See `docs/MERGE_CHECKLIST.md` for the full procedure. The checklist
+resolves the default branch dynamically instead of assuming `main`.
 
 ---
 
@@ -184,13 +230,17 @@ Claude diffs each branch against its spec and decides:
    > "Build [feature]. Generate specs and tests."
 4. make validate                               # check specs
 5. Review specs/ manually                      # catch anything obvious
-6. make run                                    # run pipeline
+6. make run                                    # run pipeline + integration gate
 7. claude                                      # fix failures (if any)
    > "Fix the failures."
-8. make run                                    # re-run until all pass
+8. make run                                    # re-run until all pass + gate is clean
 9. claude                                      # review and merge
    > "Review the task branches and merge them."
 ```
+
+Steps 6 and 8 run the integration gate automatically once every task
+passes. A clean gate leaves an `integration/run-*` branch behind for
+Phase 8; a failed gate writes `specs/INTEGRATION-FAILED.log`.
 
 ---
 
@@ -206,6 +256,7 @@ Claude diffs each branch against its spec and decides:
 | Preview pipeline | `make dry-run` |
 | Run pipeline | `make run` |
 | Check failures | `ls specs/FAILED-*.log` |
+| Check integration gate | `ls specs/INTEGRATION-FAILED.log 2>/dev/null; git branch --list "integration/*"` |
 | See task branches | `git branch --list "task/*"` |
 | Pipeline state | `cat pipeline-state.json` |
 | See all commands | `make help` |
@@ -235,6 +286,23 @@ failing branches to Claude review.
 **Pipeline crashed mid-run**
 → Just re-run `make run`. The pipeline state and git branches persist. Passing
 tasks are skipped, failed tasks are detected.
+
+**Integration gate failed with a merge conflict**
+→ Read `specs/INTEGRATION-FAILED.log` for the offending branch. Two tasks
+are touching overlapping code — either split the overlap into a new spec
+that both depend on, or add one of them as a dependency of the other so
+they no longer run in parallel. Then `make run`.
+
+**Integration gate failed the test suite**
+→ The `integration/run-*` branch is kept on disk. `git checkout` it, run
+`pytest tests/` to reproduce, fix the cross-task regression on the
+offending task branch (not the integration branch), and `make run`.
+The orchestrator will rebuild a fresh integration branch on the next pass.
+
+**I want to see per-model stats and failure classes**
+→ `cat pipeline-state.json` — each task records `model`, `models_tried`,
+`duration_seconds`, and `failure_class`. `make run` also prints a rolled-up
+summary at the end.
 
 **Want to add a new model provider**
 → Edit `models.yaml` and add models to the appropriate tier. The orchestrator
