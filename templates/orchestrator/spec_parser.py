@@ -90,40 +90,6 @@ def load_spec(spec_file):
     }
 
 
-def compress_spec(spec_text, task_name):
-    """
-    Reduce spec size to stay within Groq TPM limits.
-
-    Strategy:
-    1. If over soft limit, strip the ## Context section.
-    2. If still over hard limit, hard-truncate with a warning.
-    """
-    cfg = get_config()
-    limits = cfg.get("spec_limits", {})
-    soft = limits.get("soft_limit_chars", 12_000)
-    hard = limits.get("hard_limit_chars", 16_000)
-
-    if len(spec_text) <= soft:
-        return spec_text
-
-    # Strip ## Context section
-    compressed = re.sub(
-        r"## Context\n.*?(?=\n##|\Z)",
-        "",
-        spec_text,
-        flags=re.DOTALL,
-    ).strip()
-
-    if len(compressed) <= hard:
-        print(f"  [spec compressed: stripped ## Context, {len(spec_text)} -> {len(compressed)} chars]")
-        return compressed
-
-    # Hard truncate
-    truncated = compressed[:hard]
-    print(f"  [WARNING: spec hard-truncated to {hard} chars for {task_name} -- split this task]")
-    return truncated
-
-
 def validate_specs(specs_dir):
     """
     Validate all spec files in the specs directory.
@@ -176,11 +142,13 @@ def validate_specs(specs_dir):
 
         if len(spec["raw_text"]) > hard:
             warnings.append(
-                f"{task_name}: spec is {len(spec['raw_text'])} chars (hard limit {hard}) — will be truncated"
+                f"{task_name}: spec is {len(spec['raw_text'])} chars (hard limit {hard}) — "
+                f"likely to overflow the model's effective context window; split this task"
             )
         elif len(spec["raw_text"]) > soft:
             warnings.append(
-                f"{task_name}: spec is {len(spec['raw_text'])} chars (soft limit {soft}) — Context will be stripped"
+                f"{task_name}: spec is {len(spec['raw_text'])} chars (soft limit {soft}) — "
+                f"approaching the context budget; consider splitting"
             )
 
     # Check dependencies reference valid tasks

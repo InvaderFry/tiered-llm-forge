@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 from .config import load_config, get_config, get_tier
-from .spec_parser import load_spec, compress_spec, validate_specs, topological_sort
+from .spec_parser import load_spec, validate_specs, topological_sort
 from .model_router import select_model_for_spec, run_aider, run_with_tier_fallback
 from .runner import run_tests, run_full_suite, file_size, check_regression
 from .git_ops import (
@@ -111,14 +111,12 @@ def cmd_dry_run():
         branch = f"task/{spec['task_name']}"
         status = "EXISTS" if branch_exists(branch) else "NEW"
         model = select_model_for_spec(spec["body"])
-        compressed = compress_spec(spec["raw_text"], spec["task_name"])
-        pct = int(len(compressed) / max(len(spec["raw_text"]), 1) * 100)
 
         print(f"  {i}. [{status}] {spec['task_name']}")
         print(f"     Target: {spec['target']}")
         print(f"     Test:   {spec['test']}")
         print(f"     Model:  {model}")
-        print(f"     Spec:   {len(spec['raw_text'])} chars -> {len(compressed)} chars ({pct}%)")
+        print(f"     Spec:   {len(spec['raw_text'])} chars (attached to aider as --read)")
         if spec["dependencies"]:
             print(f"     Deps:   {', '.join(spec['dependencies'])}")
         print()
@@ -183,8 +181,17 @@ def run_task(spec, default_branch, state, specs_by_name=None):
 
     print(f"\n{'='*50}\n{task_name}\n{'='*50}")
 
-    # Compress spec
-    spec_text = compress_spec(spec["raw_text"], task_name)
+    # The full spec is attached to aider as a --read file (see read_files
+    # below), so the implementer message is a short pointer instead of
+    # the spec body. This avoids paying for the same content twice and
+    # lets aider treat the spec as authoritative file context rather
+    # than mid-prompt instructions.
+    implement_message = (
+        f"Implement the task described in {spec['path']}. "
+        f"All requirements (function signatures, types, constraints) live in "
+        f"that file. Edit {target_file} so that the tests in {test_file} pass. "
+        f"Do not modify the test file."
+    )
 
     # --- Handle re-run: branch already exists ---
     if branch_exists(branch_name):
@@ -262,7 +269,7 @@ def run_task(spec, default_branch, state, specs_by_name=None):
     total_attempts = 0
 
     # --- Stage 1: Primary tier ---
-    first_model = select_model_for_spec(spec_text)
+    first_model = select_model_for_spec(spec["body"])
     print(f"Stage 1: Primary tier ({primary_tier['retries']} attempts)")
 
     for attempt in range(1, primary_tier["retries"] + 1):
@@ -271,7 +278,7 @@ def run_task(spec, default_branch, state, specs_by_name=None):
 
         if attempt == 1:
             success, model_used = run_with_tier_fallback(
-                "primary", spec_text, target_file, first_model, read_files=read_files,
+                "primary", implement_message, target_file, first_model, read_files=read_files,
             )
         else:
             _, test_output = run_tests(test_file)
