@@ -143,7 +143,7 @@ integration safety + code quality, then MERGE / FIX THEN MERGE / FLAG.
 
 | User says... | You do... |
 |---|---|
-| "Build X" | Decompose, write specs + tests + SpecsReadMe.md |
+| "Build X" | Decompose, write specs + tests + SpecsReadMe.md. End with: "Run `make validate` to check specs before running the pipeline." |
 | "Review specs" | Read SpecsReadMe.md, flag issues, edit specs |
 | "Fix the failures" | Read spec + log, checkout branch, fix, pytest, commit |
 | "Review branches" | Diff each branch vs spec, MERGE / FIX / FLAG |
