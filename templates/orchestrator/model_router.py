@@ -13,26 +13,17 @@ AIDER_MAX_RATE_RETRIES = 4
 
 def select_model_for_spec(spec_text):
     """
-    Choose the right model based on spec size.
+    Choose the starting model for a task.
 
-    Returns the model string (e.g., 'groq/qwen/qwen3-32b').
-    Large specs route directly to the large context model.
-
-    TODO: The large-context branch below is dead code. compress_spec() hard-caps
-    specs at hard_limit_chars (16,000) before this function is called, so
-    len(spec_text) > large_context_chars (also 16,000) can never be true.
-    Remove large_context_model and large_context_chars from models.yaml and
-    delete the branch below once confirmed unnecessary.
+    Always returns the first model in the primary tier — the tier
+    fallback machinery handles model rotation from there. The previous
+    "large context" branch was unreachable (compress_spec hard-capped
+    at the same threshold) and the spec is now attached as a read-only
+    file rather than embedded in the prompt, so spec length no longer
+    drives model choice. ``spec_text`` is kept on the signature so
+    future heuristics (e.g. routing by language or function count)
+    can be layered in without changing call sites.
     """
-    cfg = get_config()
-    large_threshold = cfg.get("large_context_chars", 16_000)
-
-    if len(spec_text) > large_threshold:
-        model = cfg["large_context_model"]
-        print(f"  [large context -- routing directly to {model}]")
-        return model
-
-    # Return first model in primary tier
     primary = get_tier("primary")
     return primary["models"][0]
 

@@ -32,8 +32,6 @@ def mock_config(tmp_path):
               - groq/openai/gpt-oss-120b
             retries: 2
         weak_model: groq/llama-3.1-8b-instant
-        large_context_model: groq/meta-llama/llama-4-scout-17b-16e-instruct
-        large_context_chars: 16000
         spec_limits:
           soft_limit_chars: 12000
           hard_limit_chars: 16000
@@ -50,9 +48,12 @@ class TestSelectModel:
         model = select_model_for_spec("small spec")
         assert model == "groq/qwen/qwen3-32b"
 
-    def test_large_spec_uses_large_context_model(self):
+    def test_large_spec_still_uses_first_primary(self):
+        # The historical "large context" branch was dead code: spec text is
+        # now attached as a read-only file, not embedded in the prompt, so
+        # length no longer routes to a different model.
         model = select_model_for_spec("x" * 20_000)
-        assert model == "groq/meta-llama/llama-4-scout-17b-16e-instruct"
+        assert model == "groq/qwen/qwen3-32b"
 
 
 class TestGetFallbackModels:

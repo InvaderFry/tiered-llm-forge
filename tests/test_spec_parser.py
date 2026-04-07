@@ -34,8 +34,6 @@ def mock_config(monkeypatch, tmp_path):
             models: ["groq/openai/gpt-oss-120b"]
             retries: 2
         weak_model: groq/llama-3.1-8b-instant
-        large_context_model: groq/meta-llama/llama-4-scout-17b-16e-instruct
-        large_context_chars: 16000
         spec_limits:
           soft_limit_chars: 100
           hard_limit_chars: 200
