@@ -20,7 +20,9 @@ from .git_ops import (
     get_default_branch,
     ensure_default_branch_exists,
     branch_exists,
+    branch_tip,
     checkout,
+    merge_branch,
     revert_last_commit,
 )
 from .state import load_state, save_state, record_task
@@ -122,7 +124,37 @@ def cmd_dry_run():
     return 0
 
 
-def run_task(spec, default_branch, state):
+def _resolve_dependency_base(dependencies, default_branch):
+    """
+    Determine the start point for a new task branch based on its dependencies.
+
+    - 0 deps   -> default branch
+    - 1 dep    -> that dep's task branch (stacked)
+    - N deps   -> default branch (caller will merge deps in afterwards)
+
+    Returns (start_point, extra_merges) where ``extra_merges`` is the list
+    of dependency branches the caller still needs to merge in after checkout.
+    Any dependency whose branch does not exist is skipped with a warning.
+    """
+    dep_branches = []
+    for dep in dependencies:
+        dep_branch = f"task/{dep}"
+        if branch_exists(dep_branch):
+            dep_branches.append(dep_branch)
+        else:
+            print(
+                f"  [dependency '{dep}' has no branch — falling back to default for that dep]"
+            )
+
+    if not dep_branches:
+        return default_branch, []
+    if len(dep_branches) == 1:
+        return dep_branches[0], []
+    # Multiple deps: start from default and merge each one in
+    return default_branch, dep_branches
+
+
+def run_task(spec, default_branch, state, specs_by_name=None):
     """
     Run a task through the full model escalation ladder.
 
@@ -130,11 +162,17 @@ def run_task(spec, default_branch, state):
     - Branch exists + tests pass  -> skip (return 'skipped')
     - Branch exists + tests fail  -> flag for Claude review (return 'failed')
     - Branch does not exist       -> normal first run
+
+    Dependency handling:
+    The task branch is created from the tip of its dependency branch(es) so
+    task N actually runs against task N-1's code. With multiple dependencies
+    they are merged together onto a fresh branch rooted at ``default_branch``.
     """
     task_name = spec["task_name"]
     target_file = spec["target"]
     test_file = spec["test"]
     branch_name = f"task/{task_name}"
+    dependencies = spec.get("dependencies", []) or []
 
     print(f"\n{'='*50}\n{task_name}\n{'='*50}")
 
@@ -161,8 +199,27 @@ def run_task(spec, default_branch, state):
             save_state(state)
             return "failed"
 
-    # --- Normal first run ---
-    checkout(branch_name, create=True)
+    # --- Normal first run: branch from dependency tip(s) ---
+    start_point, extra_merges = _resolve_dependency_base(dependencies, default_branch)
+    if start_point != default_branch or extra_merges:
+        print(f"  Branching from '{start_point}' (deps: {', '.join(dependencies) or 'none'})")
+    checkout(branch_name, create=True, start_point=start_point)
+
+    for dep_branch in extra_merges:
+        print(f"  Merging dependency branch {dep_branch} into {branch_name}")
+        if not merge_branch(dep_branch, message=f"merge: {dep_branch} into {branch_name}"):
+            fail_log = SPECS_DIR / f"FAILED-{task_name}.log"
+            fail_log.write_text(
+                f"Merge conflict while assembling dependencies for {task_name}.\n"
+                f"Conflicting branch: {dep_branch}\n"
+                "Resolve by running the tasks with fewer simultaneous dependencies, "
+                "or fix the conflict manually and re-run the orchestrator.\n"
+            )
+            checkout(default_branch)
+            record_task(state, task_name, "failed", attempts=0)
+            save_state(state)
+            return "failed"
+
     baseline_size = file_size(target_file)
 
     cfg = get_config()
@@ -311,9 +368,11 @@ def main():
     state = load_state()
     results = {"passed": [], "failed": [], "skipped": []}
 
+    specs_by_name = {load_spec(sf)["task_name"]: load_spec(sf) for sf in ordered}
+
     for i, sf in enumerate(ordered):
         spec = load_spec(sf)
-        outcome = run_task(spec, default_branch, state)
+        outcome = run_task(spec, default_branch, state, specs_by_name=specs_by_name)
         results[outcome].append(spec["task_name"])
 
         # Cooldown between tasks
