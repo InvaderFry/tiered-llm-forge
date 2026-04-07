@@ -1,5 +1,7 @@
 .PHONY: setup env plan run validate dry-run fix review status clean
 
+SHELL := /bin/bash
+
 # Load .env automatically for all targets
 ifneq (,$(wildcard .env))
     include .env
@@ -22,13 +24,13 @@ plan: ## Open Claude Code for planning
 	claude
 
 validate: ## Validate all specs before running the pipeline
-	$(PYTHON) -m orchestrator --validate
+	set -o pipefail && $(PYTHON) -m orchestrator --validate 2>&1 | tee validate.log
 
 dry-run: ## Preview what the pipeline would do without running models
-	$(PYTHON) -m orchestrator --dry-run
+	set -o pipefail && $(PYTHON) -m orchestrator --dry-run 2>&1 | tee dry-run.log
 
 run: ## Run the orchestrator pipeline
-	$(PYTHON) -m orchestrator
+	set -o pipefail && $(PYTHON) -m orchestrator 2>&1 | tee run.log
 
 fix: ## Open Claude Code to fix failures
 	@echo "Opening Claude Code — say 'Fix the failures.'"

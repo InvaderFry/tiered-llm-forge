@@ -17,6 +17,12 @@ def select_model_for_spec(spec_text):
 
     Returns the model string (e.g., 'groq/qwen/qwen3-32b').
     Large specs route directly to the large context model.
+
+    TODO: The large-context branch below is dead code. compress_spec() hard-caps
+    specs at hard_limit_chars (16,000) before this function is called, so
+    len(spec_text) > large_context_chars (also 16,000) can never be true.
+    Remove large_context_model and large_context_chars from models.yaml and
+    delete the branch below once confirmed unnecessary.
     """
     cfg = get_config()
     large_threshold = cfg.get("large_context_chars", 16_000)
