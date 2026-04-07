@@ -272,9 +272,14 @@ Phase 8; a failed gate writes `specs/INTEGRATION-FAILED.log`.
 → Make sure `src/__init__.py` exists and you're running pytest from the project root.
 
 **Rate limit 429 from Groq**
-→ The orchestrator automatically falls back through the model chain (configured
-in `models.yaml`). If all models are exhausted, wait a few minutes — Groq
-limits reset hourly.
+→ The orchestrator handles this at two levels. First, a per-model coordinator
+records the "try again in Ns" hint from each 429 and sleeps exactly that
+long before the next request to that model — across tasks, not just within
+one retry loop. Second, `cooldown_seconds` in `models.yaml` provides a
+defensive baseline between tasks for signals the parser misses. If you are
+still seeing 429s at the start of each task, raise `cooldown_seconds`. If
+all models exhaust their retries, wait a few minutes — Groq limits reset
+hourly.
 
 **Task branch already exists**
 → The orchestrator handles this automatically: skips passing branches, escalates

@@ -27,5 +27,15 @@ spec_limits:
   soft_limit_chars: 12000   # validation warning above this
   hard_limit_chars: 16000   # validation warning + likely TPM trouble above this
 
-# Seconds to pause between tasks (lets Groq's per-minute TPM window reset)
+# Seconds to pause between tasks as a defensive baseline.
+#
+# The orchestrator also keeps a per-model rate-limit coordinator: when any
+# task receives a Groq 429 with a "try again in Ns" hint, that exact wait
+# is recorded and honoured before the next request to that model, across
+# tasks and retries. So in practice the coordinator handles the precise
+# case and cooldown_seconds is a fallback for signals the parser misses.
+#
+# You can lower this if your tasks are short and the coordinator is
+# catching most rate limits; raise it if you are still seeing 429s at the
+# start of each task.
 cooldown_seconds: 30
