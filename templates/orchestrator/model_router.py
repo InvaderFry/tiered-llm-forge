@@ -67,9 +67,13 @@ def _parse_retry_after(stderr_text):
     return None
 
 
-def run_aider(model, message, target_file):
+def run_aider(model, message, target_file, read_files=None):
     """
     Run aider with a specific model, handling rate limit retries.
+
+    ``read_files`` is an optional iterable of paths to attach as read-only
+    context (spec, test, dependency target files, etc.). Missing paths are
+    silently skipped so a single stale reference doesn't kill the run.
 
     Returns True if aider exited successfully, False otherwise.
     """
@@ -88,6 +92,16 @@ def run_aider(model, message, target_file):
         "--no-show-model-warnings",
         "--no-auto-lint",
     ]
+
+    if read_files:
+        from pathlib import Path as _Path
+        seen = set()
+        for rf in read_files:
+            if not rf or rf == target_file or rf in seen:
+                continue
+            seen.add(rf)
+            if _Path(rf).exists():
+                cmd.extend(["--read", rf])
 
     # Disable LiteLLM's internal retry loop — we handle retries with correct wait times
     aider_env = os.environ.copy()
@@ -132,12 +146,13 @@ def run_aider(model, message, target_file):
     return False
 
 
-def run_with_tier_fallback(tier_name, message, target_file, start_model=None):
+def run_with_tier_fallback(tier_name, message, target_file, start_model=None, read_files=None):
     """
     Try all models in a tier with fallback.
 
     Tries each model in the tier. On rate limit exhaustion for one model,
-    moves to the next. Returns (success, model_used).
+    moves to the next. Returns (success, model_used). ``read_files`` is
+    forwarded to aider as read-only context.
     """
     tier = get_tier(tier_name)
     models = tier["models"]
@@ -148,7 +163,7 @@ def run_with_tier_fallback(tier_name, message, target_file, start_model=None):
 
     for model in models:
         print(f"  Trying {model}...")
-        success = run_aider(model, message, target_file)
+        success = run_aider(model, message, target_file, read_files=read_files)
         if success:
             return True, model
 

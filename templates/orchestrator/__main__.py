@@ -222,6 +222,16 @@ def run_task(spec, default_branch, state, specs_by_name=None):
 
     baseline_size = file_size(target_file)
 
+    # Assemble read-only context for the implementer model:
+    # the full spec file, the test file, and the target files of every
+    # declared dependency. Missing paths are dropped inside run_aider.
+    read_files = [str(spec["path"]), test_file]
+    if specs_by_name:
+        for dep_name in dependencies:
+            dep_spec = specs_by_name.get(dep_name)
+            if dep_spec and dep_spec.get("target"):
+                read_files.append(dep_spec["target"])
+
     cfg = get_config()
     primary_tier = get_tier("primary")
     escalation_tier = get_tier("escalation")
@@ -236,7 +246,9 @@ def run_task(spec, default_branch, state, specs_by_name=None):
         print(f"  Attempt {attempt}/{primary_tier['retries']}...")
 
         if attempt == 1:
-            success, model_used = run_with_tier_fallback("primary", spec_text, target_file, first_model)
+            success, model_used = run_with_tier_fallback(
+                "primary", spec_text, target_file, first_model, read_files=read_files,
+            )
         else:
             _, test_output = run_tests(test_file)
             success, model_used = run_with_tier_fallback(
@@ -244,6 +256,7 @@ def run_task(spec, default_branch, state, specs_by_name=None):
                 f"Tests failed. Output:\n{_strip_urls(test_output)}\nFix the code to pass all tests.",
                 target_file,
                 first_model,
+                read_files=read_files,
             )
 
         if check_regression(target_file, baseline_size):
@@ -271,6 +284,7 @@ def run_task(spec, default_branch, state, specs_by_name=None):
             "escalation",
             f"Previous model failed. Tests output:\n{_strip_urls(test_output)}\nAnalyze carefully and fix.",
             target_file,
+            read_files=read_files,
         )
 
         if check_regression(target_file, baseline_size):
