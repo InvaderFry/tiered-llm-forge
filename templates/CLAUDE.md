@@ -165,7 +165,19 @@ integration safety + code quality, then MERGE / FIX THEN MERGE / FLAG.
 | `make validate` | Check all specs for errors before running |
 | `make dry-run` | Preview pipeline without calling models |
 | `make run` | Run the full pipeline |
+| `make resume` | Resume failed tasks from last attempt instead of flagging for review |
+| `make parallel` | Group independent tasks into waves (sequential within each wave for now) |
 | `make status` | Show branches, failures, and pipeline state |
+
+### CLI flags (can also be passed directly)
+
+| Flag | Effect |
+|------|--------|
+| `--resume` | Resume from the exact attempt that crashed/failed |
+| `--parallel [N]` | Group tasks into dependency waves (concurrent execution pending worktree support) |
+| `--verbose` | Enable debug-level output with timestamps |
+
+All runs write debug-level output to `orchestrator.log` for post-mortem analysis.
 
 ---
 
@@ -193,12 +205,17 @@ project-root/
 │   ├── FAILURE_PLAYBOOK.md
 │   └── MERGE_CHECKLIST.md
 ├── orchestrator/           ← pipeline package
-│   ├── __main__.py         ← CLI entry point + integration gate
+│   ├── __main__.py         ← CLI entry point (arg parsing, dispatch)
 │   ├── config.py           ← reads models.yaml
-│   ├── spec_parser.py      ← frontmatter + compression + validation
+│   ├── spec_parser.py      ← frontmatter + validation + topo sort
 │   ├── model_router.py     ← model selection + rate limit handling
 │   ├── runner.py           ← per-task + full-suite test execution
 │   ├── git_ops.py          ← branch management, stacking, merging
+│   ├── task_runner.py      ← per-task orchestration + model escalation
+│   ├── integration.py      ← integration gate (merge + full suite)
+│   ├── summary.py          ← pipeline run summary + observability
+│   ├── parallel.py         ← parallel task execution via thread pool
+│   ├── log.py              ← logging config (console + orchestrator.log)
 │   ├── failure_class.py    ← classifies pytest/aider output
 │   └── state.py            ← pipeline-state.json persistence
 ├── models.yaml             ← model config (single source of truth)

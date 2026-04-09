@@ -3,12 +3,18 @@
 import os
 import re
 import subprocess
+import threading
 import time
 
 from .config import get_config, get_tier
+from .log import get_logger
+
+log = get_logger("model_router")
 
 # Max retries within a single aider invocation for rate limit errors
 AIDER_MAX_RATE_RETRIES = 4
+# Timeout for a single aider invocation (seconds)
+AIDER_TIMEOUT = 300
 
 # ---------------------------------------------------------------------------
 # Per-model rate-limit coordinator
@@ -26,6 +32,7 @@ AIDER_MAX_RATE_RETRIES = 4
 # seconds, shorter than typical between-run gaps.
 # ---------------------------------------------------------------------------
 _next_available_at: dict = {}
+_rate_limit_lock = threading.Lock()
 
 # Indirected so tests can freeze time without monkeypatching stdlib
 _clock = time.time
@@ -36,12 +43,14 @@ def _wait_for_model(model):
     """Sleep until the cached rate-limit window for ``model`` has reset.
 
     No-ops when the model has no recorded window or the window has passed.
+    Thread-safe: reads the window under a lock, then sleeps outside it.
     """
-    earliest = _next_available_at.get(model, 0.0)
+    with _rate_limit_lock:
+        earliest = _next_available_at.get(model, 0.0)
     now = _clock()
     if earliest > now:
         wait = earliest - now
-        print(f"  [coordinator: {model} rate-limited, sleeping {wait:.1f}s before request]")
+        log.info("  [coordinator: %s rate-limited, sleeping %.1fs before request]", model, wait)
         _sleep(wait)
 
 
@@ -50,8 +59,10 @@ def _mark_rate_limited(model, retry_after, buffer=5.0):
 
     ``buffer`` adds headroom for Groq's sliding window reset imprecision and
     matches the buffer already applied inside the local retry loop.
+    Thread-safe: writes under a lock.
     """
-    _next_available_at[model] = _clock() + retry_after + buffer
+    with _rate_limit_lock:
+        _next_available_at[model] = _clock() + retry_after + buffer
 
 
 def select_model_for_spec(spec_text):
@@ -210,11 +221,18 @@ def run_aider(model, message, target_file, read_files=None):
         # previous task or a previous attempt in this task.
         _wait_for_model(model)
 
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=aider_env)
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, check=False,
+                env=aider_env, timeout=AIDER_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("  [aider timed out after %ds on model %s]", AIDER_TIMEOUT, model)
+            return False, invocation_stats
         if result.stdout:
-            print(result.stdout, end="")
+            log.info("%s", result.stdout.rstrip())
         if result.stderr:
-            print(result.stderr, end="")
+            log.debug("%s", result.stderr.rstrip())
 
         combined = (result.stdout or "") + (result.stderr or "")
         invocation_stats = _add_stats(invocation_stats, _parse_usage(combined))
@@ -227,18 +245,18 @@ def run_aider(model, message, target_file, read_files=None):
             # no amount of waiting will help, and it is not a time-based window
             # so we do not record it in the coordinator.
             if "Request too large" in combined:
-                print(f"  [request too large for model {model} TPM cap — falling back]")
+                log.warning("  [request too large for model %s TPM cap -- falling back]", model)
                 return False, invocation_stats
 
             wait = _parse_retry_after(combined)
             if wait:
                 _mark_rate_limited(model, wait)  # inform future tasks/attempts
                 wait += 5  # buffer for sliding window reset
-                print(f"  [rate limit: sleeping {wait:.1f}s as instructed by Groq (attempt {attempt}/{AIDER_MAX_RATE_RETRIES})]")
+                log.info("  [rate limit: sleeping %.1fs as instructed by Groq (attempt %d/%d)]", wait, attempt, AIDER_MAX_RATE_RETRIES)
             else:
                 _mark_rate_limited(model, fallback_wait)  # best-effort record
                 wait = fallback_wait
-                print(f"  [rate limit: sleeping {wait}s (exponential backoff, attempt {attempt}/{AIDER_MAX_RATE_RETRIES})]")
+                log.info("  [rate limit: sleeping %ds (exponential backoff, attempt %d/%d)]", wait, attempt, AIDER_MAX_RATE_RETRIES)
                 fallback_wait = min(fallback_wait * 2, 120)
 
             if attempt < AIDER_MAX_RATE_RETRIES:
@@ -270,7 +288,7 @@ def run_with_tier_fallback(tier_name, message, target_file, start_model=None, re
 
     aggregate = _empty_stats()
     for model in models:
-        print(f"  Trying {model}...")
+        log.info("  Trying %s...", model)
         success, stats = run_aider(model, message, target_file, read_files=read_files)
         aggregate = _add_stats(aggregate, stats)
         if success:

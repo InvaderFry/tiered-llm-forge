@@ -148,7 +148,6 @@ Models are configured in `models.yaml`. Default tiers:
 |------|--------|-----------|
 | Primary | Qwen3 32B → Kimi K2 → Llama 4 Scout | Normal tasks, fallback on rate limit |
 | Escalation | GPT-OSS 120B | After primary tier exhausted |
-| Large context | Llama 4 Scout | Specs > 16K chars |
 
 ---
 
@@ -255,10 +254,13 @@ Phase 8; a failed gate writes `specs/INTEGRATION-FAILED.log`.
 | Validate specs | `make validate` |
 | Preview pipeline | `make dry-run` |
 | Run pipeline | `make run` |
+| Resume crashed run | `make resume` |
+| Group tasks into dependency waves | `make parallel` |
 | Check failures | `ls specs/FAILED-*.log` |
 | Check integration gate | `ls specs/INTEGRATION-FAILED.log 2>/dev/null; git branch --list "integration/*"` |
 | See task branches | `git branch --list "task/*"` |
 | Pipeline state | `cat pipeline-state.json` |
+| Debug log (all runs) | `cat orchestrator.log` |
 | See all commands | `make help` |
 
 ---
@@ -289,8 +291,10 @@ failing branches to Claude review.
 → Run `make validate` and fix all errors before `make run`.
 
 **Pipeline crashed mid-run**
-→ Just re-run `make run`. The pipeline state and git branches persist. Passing
-tasks are skipped, failed tasks are detected.
+→ Run `make resume`. This resumes each task from the exact attempt where it
+left off (using the per-attempt log in `pipeline-state.json`) instead of
+re-evaluating the whole branch. If you prefer a fresh start, `make run`
+still works — passing branches are skipped, failing branches go to review.
 
 **Integration gate failed with a merge conflict**
 → Read `specs/INTEGRATION-FAILED.log` for the offending branch. Two tasks

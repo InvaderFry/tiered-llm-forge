@@ -3,4 +3,6 @@ __pycache__/
 *.pyc
 .aider*
 pipeline-state.json
+orchestrator.log
+.worktrees/
 .venv/

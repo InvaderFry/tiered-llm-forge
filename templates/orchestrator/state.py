@@ -1,10 +1,14 @@
 """Pipeline state persistence for crash recovery and reporting."""
 
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 STATE_FILE = Path("pipeline-state.json")
+
+# Protects concurrent access to the state dict and file in --parallel mode
+_state_lock = threading.Lock()
 
 
 def load_state(path=None):
@@ -17,11 +21,12 @@ def load_state(path=None):
 
 
 def save_state(state, path=None):
-    """Write pipeline state to disk."""
+    """Write pipeline state to disk. Thread-safe."""
     state_path = path or STATE_FILE
-    state["updated_at"] = datetime.now(timezone.utc).isoformat()
-    with open(state_path, "w") as f:
-        json.dump(state, f, indent=2)
+    with _state_lock:
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        with open(state_path, "w") as f:
+            json.dump(state, f, indent=2)
 
 
 def _empty_state():
@@ -77,5 +82,49 @@ def record_task(
     if cost_usd is not None:
         entry["cost_usd"] = round(float(cost_usd), 6)
 
-    state["tasks"][task_name] = entry
+    with _state_lock:
+        state["tasks"][task_name] = entry
     return state
+
+
+def record_attempt(state, task_name, attempt_num, tier, model, aider_success, tests_passed=None):
+    """Record a single attempt within a task for granular crash recovery.
+
+    Stored under ``state["tasks"][task_name]["attempts_log"]`` as a list,
+    so ``--resume`` can pick up from the exact point of failure instead of
+    re-evaluating the whole branch. Thread-safe.
+    """
+    with _state_lock:
+        entry = state["tasks"].setdefault(task_name, {"status": "in_progress"})
+        log = entry.setdefault("attempts_log", [])
+        log.append({
+            "attempt": attempt_num,
+            "tier": tier,
+            "model": model,
+            "aider_success": aider_success,
+            "tests_passed": tests_passed,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+
+def get_resume_point(state, task_name):
+    """Determine where to resume a task from its attempt log.
+
+    Returns a dict with:
+    - ``tier``: "primary" or "escalation"
+    - ``attempt``: the attempt number to start from (1-based)
+    - ``total_attempts``: how many attempts have been made so far
+
+    Returns None if no prior attempts exist (fresh start).
+    """
+    entry = state.get("tasks", {}).get(task_name, {})
+    log = entry.get("attempts_log", [])
+    if not log:
+        return None
+
+    last = log[-1]
+    return {
+        "tier": last["tier"],
+        "attempt": last["attempt"],
+        "total_attempts": len(log),
+    }

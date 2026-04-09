@@ -4,6 +4,12 @@ import subprocess
 from pathlib import Path
 
 from .runner import file_size
+from .log import get_logger
+
+log = get_logger("git_ops")
+
+# Timeout for git commands (seconds)
+GIT_TIMEOUT = 30
 
 
 def get_default_branch():
@@ -25,7 +31,7 @@ def get_default_branch():
     # 1. origin/HEAD — works as soon as the repo has a remote
     result = subprocess.run(
         ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=GIT_TIMEOUT,
     )
     if result.returncode == 0:
         ref = result.stdout.strip()
@@ -36,7 +42,7 @@ def get_default_branch():
     # 2. init.defaultBranch — git config fallback
     result = subprocess.run(
         ["git", "config", "--get", "init.defaultBranch"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=GIT_TIMEOUT,
     )
     configured = result.stdout.strip()
     if configured:
@@ -45,7 +51,7 @@ def get_default_branch():
     # 3. Current branch, only if it isn't one we create ourselves
     result = subprocess.run(
         ["git", "symbolic-ref", "--short", "HEAD"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=GIT_TIMEOUT,
     )
     branch = result.stdout.strip()
     if branch and not branch.startswith("task/") and not branch.startswith("integration/"):
@@ -57,11 +63,14 @@ def get_default_branch():
 
 def ensure_default_branch_exists():
     """Create an initial commit if the repo has no commits yet."""
-    result = subprocess.run(["git", "log", "--oneline", "-1"], capture_output=True, text=True)
+    result = subprocess.run(
+        ["git", "log", "--oneline", "-1"],
+        capture_output=True, text=True, timeout=GIT_TIMEOUT,
+    )
     if result.returncode != 0:
         subprocess.run(
             ["git", "commit", "--allow-empty", "-m", "chore: initial commit"],
-            check=True
+            check=True, timeout=GIT_TIMEOUT,
         )
 
 
@@ -69,7 +78,7 @@ def branch_exists(branch_name):
     """Check if a git branch exists locally."""
     result = subprocess.run(
         ["git", "branch", "--list", branch_name],
-        capture_output=True, text=True
+        capture_output=True, text=True, timeout=GIT_TIMEOUT,
     )
     return bool(result.stdout.strip())
 
@@ -87,14 +96,14 @@ def checkout(branch_name, create=False, start_point=None):
     cmd.append(branch_name)
     if create and start_point:
         cmd.append(start_point)
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, timeout=GIT_TIMEOUT)
 
 
 def current_branch():
     """Return the current branch name, or empty string if detached."""
     result = subprocess.run(
         ["git", "symbolic-ref", "--short", "HEAD"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=GIT_TIMEOUT,
     )
     return result.stdout.strip()
 
@@ -109,12 +118,12 @@ def merge_branch(branch_name, message=None):
         message = f"merge: {branch_name}"
     result = subprocess.run(
         ["git", "merge", "--no-ff", "--no-edit", "-m", message, branch_name],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=GIT_TIMEOUT,
     )
     if result.returncode != 0:
         # Abort any in-progress merge so the working tree stays clean
-        subprocess.run(["git", "merge", "--abort"], capture_output=True)
-        print(f"  [merge conflict merging {branch_name}: {result.stdout}{result.stderr}]")
+        subprocess.run(["git", "merge", "--abort"], capture_output=True, timeout=GIT_TIMEOUT)
+        log.warning("  [merge conflict merging %s: %s%s]", branch_name, result.stdout, result.stderr)
         return False
     return True
 
@@ -124,7 +133,7 @@ def delete_branch(branch_name, force=False):
     flag = "-D" if force else "-d"
     subprocess.run(
         ["git", "branch", flag, branch_name],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=GIT_TIMEOUT,
     )
 
 
@@ -132,7 +141,7 @@ def branch_tip(branch_name):
     """Return the SHA of a branch tip, or empty string if it doesn't exist."""
     result = subprocess.run(
         ["git", "rev-parse", branch_name],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=GIT_TIMEOUT,
     )
     return result.stdout.strip() if result.returncode == 0 else ""
 
@@ -142,12 +151,13 @@ def revert_last_commit(target_file, baseline_size):
     current = file_size(target_file)
     if baseline_size > 0:
         pct = int((1 - current / baseline_size) * 100)
-        print(
-            f"  [REGRESSION GUARD] {target_file} shrank from {baseline_size}B to {current}B "
-            f"(>{pct}% reduction) -- reverting commit."
+        log.warning(
+            "  [REGRESSION GUARD] %s shrank from %dB to %dB (>%d%% reduction) -- reverting commit.",
+            target_file, baseline_size, current, pct,
         )
     else:
-        print(
-            f"  [REGRESSION GUARD] {target_file} content failed sanity check -- reverting commit."
+        log.warning(
+            "  [REGRESSION GUARD] %s content failed sanity check -- reverting commit.",
+            target_file,
         )
-    subprocess.run(["git", "reset", "--hard", "HEAD~1"], check=True)
+    subprocess.run(["git", "reset", "--hard", "HEAD~1"], check=True, timeout=GIT_TIMEOUT)

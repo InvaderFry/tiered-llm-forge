@@ -1,7 +1,27 @@
 """Test execution and regression detection."""
 
+import shutil
 import subprocess
+import sys
 from pathlib import Path
+
+
+def _pytest_cmd():
+    """Return the command prefix for invoking pytest.
+
+    Prefers a bare ``pytest`` when it is on PATH (the common case inside a
+    virtualenv).  Falls back to ``sys.executable -m pytest`` so the
+    orchestrator works even when the ``pytest`` console-script was installed
+    into a directory that isn't on PATH.
+    """
+    if shutil.which("pytest"):
+        return ["pytest"]
+    return [sys.executable, "-m", "pytest"]
+
+# Timeout for per-task test runs (seconds)
+TEST_TIMEOUT = 120
+# Timeout for the full integration test suite (seconds)
+SUITE_TIMEOUT = 300
 
 
 def run_tests(test_file):
@@ -15,8 +35,12 @@ def run_tests(test_file):
     if not test_path.exists():
         return False, f"Test file {test_file} does not exist."
 
-    cmd = ["pytest", test_file, "-x", "--tb=short"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    cmd = [*_pytest_cmd(), test_file, "-x", "--tb=short"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=TEST_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, f"Timeout: pytest exceeded {TEST_TIMEOUT}s on {test_file}."
+
     output = result.stdout + result.stderr
 
     # Guard against vacuous passes
@@ -37,8 +61,12 @@ def run_full_suite(tests_dir="tests"):
     if not tests_path.exists():
         return False, f"Tests directory {tests_dir} does not exist."
 
-    cmd = ["pytest", str(tests_path), "--tb=short", "-q"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    cmd = [*_pytest_cmd(), str(tests_path), "--tb=short", "-q"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=SUITE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, f"Timeout: full test suite exceeded {SUITE_TIMEOUT}s."
+
     output = result.stdout + result.stderr
 
     if "no tests ran" in output or "collected 0 items" in output:
@@ -74,20 +102,26 @@ def check_regression(target_file, baseline_size):
 
 # Content markers for sanity-checking source files by extension.
 #
-# TODO(language-coverage): this dict only knows Python, Java, XML, JSON,
-# and YAML. _content_looks_valid() returns True for unknown extensions,
-# so any other language (TypeScript, Go, Rust, Ruby, Kotlin, C#, Swift,
-# C/C++, etc.) silently bypasses the corruption check — a model that
-# truncates a Go file down to one line will currently slip through.
-# When new-project.sh grows non-Python templates, extend this map (or
-# replace the heuristic with a tree-sitter / parser-based check).
 _CONTENT_MARKERS = {
-    ".py":   ["def ", "class ", "import ", "from "],
-    ".java": ["class ", "interface ", "package ", "public ", "import "],
-    ".xml":  ["<", "<?xml"],
-    ".yml":  [":"],
-    ".yaml": [":"],
-    ".json": ["{", "["],
+    ".py":    ["def ", "class ", "import ", "from "],
+    ".java":  ["class ", "interface ", "package ", "public ", "import "],
+    ".ts":    ["import ", "export ", "function ", "const ", "interface "],
+    ".tsx":   ["import ", "export ", "function ", "const ", "interface "],
+    ".js":    ["import ", "export ", "function ", "const ", "require("],
+    ".jsx":   ["import ", "export ", "function ", "const ", "require("],
+    ".go":    ["package ", "func ", "import "],
+    ".rs":    ["fn ", "use ", "mod ", "struct ", "impl "],
+    ".rb":    ["def ", "class ", "module ", "require "],
+    ".kt":    ["fun ", "class ", "package ", "import "],
+    ".cs":    ["class ", "namespace ", "using "],
+    ".swift": ["func ", "class ", "import ", "struct "],
+    ".c":     ["#include", "int ", "void "],
+    ".cpp":   ["#include", "class ", "namespace "],
+    ".h":     ["#include", "#ifndef", "#pragma"],
+    ".xml":   ["<", "<?xml"],
+    ".yml":   [":"],
+    ".yaml":  [":"],
+    ".json":  ["{", "["],
 }
 
 
@@ -105,7 +139,7 @@ def _content_looks_valid(target_file):
 
     p = Path(target_file)
     if not p.exists() or p.stat().st_size == 0:
-        return True
+        return False
 
     try:
         content = p.read_text(errors="replace")

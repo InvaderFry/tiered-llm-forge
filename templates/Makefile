@@ -1,4 +1,4 @@
-.PHONY: setup env plan run validate dry-run fix review status clean
+.PHONY: setup env plan run resume parallel validate dry-run fix review status clean
 
 SHELL := /bin/bash
 
@@ -32,6 +32,12 @@ dry-run: ## Preview what the pipeline would do without running models
 run: ## Run the orchestrator pipeline
 	set -o pipefail && $(PYTHON) -m orchestrator 2>&1 | tee run.log
 
+resume: ## Resume a crashed/failed run from where it left off
+	set -o pipefail && $(PYTHON) -m orchestrator --resume 2>&1 | tee run.log
+
+parallel: ## Group tasks into dependency waves (sequential within waves for now)
+	set -o pipefail && $(PYTHON) -m orchestrator --parallel 2>&1 | tee run.log
+
 fix: ## Open Claude Code to fix failures
 	@echo "Opening Claude Code — say 'Fix the failures.'"
 	claude
@@ -50,9 +56,9 @@ status: ## Show task branch status and failure logs
 	@echo "=== Pipeline state ==="
 	@cat pipeline-state.json 2>/dev/null || echo "  (no state file — pipeline hasn't run yet)"
 
-clean: ## Remove failure logs and pipeline state (branches are preserved)
-	rm -f specs/FAILED-*.log pipeline-state.json
-	@echo "Cleaned failure logs and pipeline state."
+clean: ## Remove failure logs, pipeline state, and debug log (branches are preserved)
+	rm -f specs/FAILED-*.log pipeline-state.json orchestrator.log
+	@echo "Cleaned failure logs, pipeline state, and debug log."
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \

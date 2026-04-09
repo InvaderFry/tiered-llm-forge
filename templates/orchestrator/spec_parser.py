@@ -84,7 +84,7 @@ def load_spec(spec_file):
         "task_id": meta.get("task", task_id),
         "target": meta.get("target", parse_target_file(raw_text)),
         "test": test,
-        "dependencies": meta.get("dependencies", []),
+        "dependencies": meta.get("dependencies") or [],
         "raw_text": raw_text,
         "body": body,
     }

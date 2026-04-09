@@ -113,7 +113,7 @@ tiered-llm-forge/
 │   ├── .gitignore
 │   ├── .aider.conf.yml
 │   ├── models.yaml          # single source of model configuration
-│   ├── requirements.txt     # Python dependencies (pyyaml, pytest)
+│   ├── requirements.txt     # Python dependencies (pyyaml, pytest, pytest-timeout)
 │   ├── Makefile             # convenience recipes (make run, make validate, etc.)
 │   ├── ORCHESTRATION.md
 │   ├── CLAUDE.md
@@ -122,13 +122,18 @@ tiered-llm-forge/
 │   │   ├── FAILURE_PLAYBOOK.md
 │   │   └── MERGE_CHECKLIST.md
 │   ├── orchestrator/        # pipeline package
-│   │   ├── __init__.py
+│   │   ├── __init__.py      # package init + shared SPECS_DIR
 │   │   ├── __main__.py      # CLI entry (python3 -m orchestrator)
 │   │   ├── config.py        # reads models.yaml
-│   │   ├── spec_parser.py   # frontmatter, compression, validation, topo sort
+│   │   ├── spec_parser.py   # frontmatter, validation, topo sort
 │   │   ├── model_router.py  # model selection, fallback, rate limits
 │   │   ├── runner.py        # per-task + full-suite test execution
 │   │   ├── git_ops.py       # branch management, stacking, merging
+│   │   ├── task_runner.py   # per-task orchestration + model escalation
+│   │   ├── integration.py   # integration gate (merge + full suite)
+│   │   ├── summary.py       # pipeline run summary + observability
+│   │   ├── parallel.py      # parallel task execution via thread pool
+│   │   ├── log.py           # logging configuration (console + file)
 │   │   ├── failure_class.py # classifies pytest/aider output
 │   │   └── state.py         # pipeline-state.json persistence
 │   ├── src/__init__.py
@@ -136,6 +141,8 @@ tiered-llm-forge/
 └── tests/                   # tests for the forge's own orchestrator code
     ├── test_spec_parser.py
     ├── test_model_router.py
+    ├── test_runner.py
+    ├── test_git_ops.py
     ├── test_state.py
     └── test_failure_class.py
 ```
