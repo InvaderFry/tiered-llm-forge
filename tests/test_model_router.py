@@ -88,6 +88,7 @@ class TestRateLimitCoordinator:
 
     def setup_method(self):
         _mr._next_available_at.clear()
+        _mr._request_too_large.clear()
         self._fake_now = [1000.0]
         self._slept = []
         _mr._clock = lambda: self._fake_now[0]
@@ -98,6 +99,7 @@ class TestRateLimitCoordinator:
         _mr._clock = _t.time
         _mr._sleep = _t.sleep
         _mr._next_available_at.clear()
+        _mr._request_too_large.clear()
 
     def test_wait_sleeps_remaining_window(self):
         _mark_rate_limited("groq/qwen3-32b", 12.0, buffer=5.0)  # earliest = 1017

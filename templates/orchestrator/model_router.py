@@ -32,6 +32,7 @@ AIDER_TIMEOUT = 300
 # seconds, shorter than typical between-run gaps.
 # ---------------------------------------------------------------------------
 _next_available_at: dict = {}
+_request_too_large: set = set()   # models whose context exceeds TPM cap this session
 _rate_limit_lock = threading.Lock()
 
 # Indirected so tests can freeze time without monkeypatching stdlib
@@ -52,6 +53,27 @@ def _wait_for_model(model):
         wait = earliest - now
         log.info("  [coordinator: %s rate-limited, sleeping %.1fs before request]", model, wait)
         _sleep(wait)
+
+
+def _mark_request_too_large(model):
+    """Record that this model cannot handle the current request size.
+
+    Unlike time-based rate limits, "Request too large" is permanent for
+    the session: no amount of waiting fixes a TPM-cap exceeded error.
+    We track this so retry attempts within the same task (and subsequent
+    tasks of similar context size) can skip the model immediately rather
+    than burning another 60+ second aider invocation on a request that
+    will never succeed.
+    Thread-safe.
+    """
+    with _rate_limit_lock:
+        _request_too_large.add(model)
+
+
+def is_request_too_large(model):
+    """Return True if this model is flagged as too-large for the current task."""
+    with _rate_limit_lock:
+        return model in _request_too_large
 
 
 def _mark_rate_limited(model, retry_after, buffer=5.0):
@@ -236,20 +258,30 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
         if result.stdout:
             log.info("%s", result.stdout.rstrip())
         if result.stderr:
-            log.debug("%s", result.stderr.rstrip())
+            # Filter GIO URL-open noise: aider prints billing URLs and the OS
+            # tries to open them as GIO URIs, producing spurious "Operation not
+            # supported" lines that clutter the debug log.
+            stderr_clean = "\n".join(
+                line for line in (result.stderr or "").splitlines()
+                if not line.startswith("gio:")
+            )
+            if stderr_clean:
+                log.debug("%s", stderr_clean.rstrip())
 
         combined = (result.stdout or "") + (result.stderr or "")
         invocation_stats = _add_stats(invocation_stats, _parse_usage(combined))
 
-        if result.returncode == 0:
-            return True, invocation_stats
-
+        # Check for rate-limit / too-large errors BEFORE trusting the exit code.
+        # Aider exits 0 when it exhausts its own retries on "Request too large"
+        # (it creates/touches the file but writes nothing). If we blindly trust
+        # returncode == 0 here, run_with_tier_fallback never tries the next model.
         if "rate_limit_exceeded" in combined or "Rate limit reached" in combined:
             # "Request too large" means the request itself exceeds the TPM cap —
             # no amount of waiting will help, and it is not a time-based window
             # so we do not record it in the coordinator.
             if "Request too large" in combined:
                 log.warning("  [request too large for model %s TPM cap -- falling back]", model)
+                _mark_request_too_large(model)
                 return False, invocation_stats
 
             wait = _parse_retry_after(combined)
@@ -266,6 +298,10 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
             if attempt < AIDER_MAX_RATE_RETRIES:
                 _sleep(wait)
                 continue
+
+        # No rate-limit error — trust the exit code.
+        if result.returncode == 0:
+            return True, invocation_stats
 
         # Non-rate-limit error or exhausted retries
         return False, invocation_stats
@@ -293,6 +329,9 @@ def run_with_tier_fallback(tier_name, message, target_file, start_model=None, re
 
     aggregate = _empty_stats()
     for model in models:
+        if is_request_too_large(model):
+            log.info("  Skipping %s -- request too large (already seen this session)", model)
+            continue
         log.info("  Trying %s...", model)
         success, stats = run_aider(model, message, target_file, read_files=read_files, cwd=cwd)
         aggregate = _add_stats(aggregate, stats)

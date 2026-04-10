@@ -9,7 +9,11 @@ from .log import get_logger
 
 log = get_logger("task_runner")
 from .config import get_config, get_tier
-from .model_router import select_model_for_spec, run_with_tier_fallback
+from .model_router import (
+    select_model_for_spec,
+    run_with_tier_fallback,
+    is_request_too_large,
+)
 from .runner import run_tests, file_size, check_regression
 from .git_ops import (
     branch_exists,
@@ -210,6 +214,7 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
     escalation_tier = get_tier("escalation")
     total_attempts = resume_point["total_attempts"] if resume_point else 0
     task_stats = {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0}
+    llm_fail_reasons: list = []  # LLM-level failure reasons (e.g. "request_too_large")
 
     # On resume, determine where to start: skip tiers/attempts already done
     skip_primary = False
@@ -256,6 +261,13 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
             _accumulate(stats)
             if model_used and model_used not in models_tried:
                 models_tried.append(model_used)
+            if not success and not model_used:
+                # All models in the tier failed without writing anything —
+                # record why so the Stage 3 log reflects the real cause.
+                primary_models = get_tier("primary")["models"]
+                if all(is_request_too_large(m) for m in primary_models):
+                    if "request_too_large" not in llm_fail_reasons:
+                        llm_fail_reasons.append("request_too_large")
 
             if check_regression(target_file, baseline_size, cwd=cwd):
                 record_attempt(state, task_name, attempt, "primary", model_used, success, tests_passed=False)
@@ -348,10 +360,14 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
     FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
     _ts = datetime.now().strftime("%Y%m%dT%H%M%S")
     fail_log = FORGE_LOGS_DIR / f"FAILED-{task_name}-{_ts}.log"
+    llm_context = (
+        f"LLM failure reason: {', '.join(llm_fail_reasons)}\n" if llm_fail_reasons else ""
+    )
     fail_log.write_text(
         f"Failed after primary tier ({primary_tier['retries']}x) "
         f"+ escalation ({escalation_tier['retries']}x).\n"
         f"Failure class: {failure_label}\n"
+        f"{llm_context}"
         f"Models tried: {', '.join(models_tried) or 'none'}\n"
         f"Tokens (sent/received): {task_stats['tokens_sent']} / {task_stats['tokens_received']}\n"
         f"Cost: ${task_stats['cost_usd']:.4f}\n\n"
