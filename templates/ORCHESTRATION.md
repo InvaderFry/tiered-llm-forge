@@ -128,8 +128,8 @@ The orchestrator processes each spec in dependency order:
    upstream interfaces instead of guessing from the spec alone.
 3. Tries all primary tier models with fallback (3 attempts).
 4. Escalates to the escalation tier if primary fails (2 attempts).
-5. Writes `specs/FAILED-task-NNN-name.log` (tagged with a failure class)
-   if all attempts fail.
+5. Writes `forgeLogs/FAILED-task-NNN-name-<timestamp>.log` (tagged with a
+   failure class) if all attempts fail.
 6. Records per-task model, duration, attempts, base SHA, and failure class
    in `pipeline-state.json`.
 7. Returns to default branch, moves to next task.
@@ -139,6 +139,47 @@ After every task passes, the orchestrator runs an **integration gate**
 
 **Re-running is safe.** Passing branches are skipped. Failing branches go
 straight to Claude review.
+
+### Parallel mode
+
+Run tasks concurrently within each dependency wave:
+
+```bash
+make parallel          # default: 4 workers
+python3 -m orchestrator --parallel 8   # override worker count
+```
+
+The orchestrator partitions the dependency graph into waves — groups of
+tasks with no mutual dependencies — and runs each wave's tasks
+simultaneously in isolated git worktrees via a thread pool.
+
+**Pros:**
+
+- **Faster wall-clock time.** Independent tasks run concurrently instead of
+  waiting in a serial queue. A pipeline with 3 independent tasks followed
+  by 1 dependent task finishes in roughly 2 rounds instead of 4.
+- **Better rate-limit utilisation.** The per-model rate-limit coordinator is
+  shared across threads, so while one task sleeps through a 429, another
+  task can hit a different model.
+- **No manual configuration.** The wave grouping is derived automatically
+  from the dependency graph in each spec's frontmatter.
+
+**Cons:**
+
+- **Disk usage.** Each concurrent task gets its own git worktree (a full
+  working-tree copy). For large repos this can be significant, though
+  worktrees share the object store.
+- **Interleaved log output.** Multiple tasks write to the console and
+  `forgeLogs/orchestrator-<timestamp>.log` simultaneously. Use `--verbose`
+  and grep by task name when debugging.
+- **Rate-limit amplification.** More concurrent requests can hit provider
+  rate limits faster. The coordinator mitigates this, but with many workers
+  you may see more 429 retries than in sequential mode.
+- **Not the default.** Sequential mode (`make run`) is simpler and easier to
+  debug. Prefer it for first runs or when diagnosing failures.
+
+Single-task waves skip worktree overhead and run directly, so `--parallel`
+is never slower than sequential for fully linear dependency chains.
 
 ### Model routing
 
@@ -154,7 +195,7 @@ Models are configured in `models.yaml`. Default tiers:
 ## Phase 6: Fix Failures with Claude
 
 ```bash
-ls specs/FAILED-*.log    # check for failures
+ls forgeLogs/FAILED-*.log    # check for failures
 claude
 ```
 
@@ -187,12 +228,12 @@ Outcomes:
 - **Clean:** the integration branch is left in place and ready for
   human merge review in Phase 8. `pipeline-state.json` records
   `integration.status = "passed"`.
-- **Merge conflict:** writes `specs/INTEGRATION-FAILED.log` with the
-  offending task branch and deletes the integration branch. Resolve
+- **Merge conflict:** writes `forgeLogs/INTEGRATION-FAILED-<timestamp>.log`
+  with the offending task branch and deletes the integration branch. Resolve
   by reworking the spec's dependency graph or the conflicting task,
   then re-run `make run`.
 - **Tests failed on the combined branch:** writes
-  `specs/INTEGRATION-FAILED.log` with the full pytest output and
+  `forgeLogs/INTEGRATION-FAILED-<timestamp>.log` with the full pytest output and
   **keeps** the integration branch so you can reproduce the failure
   with `git checkout integration/run-<timestamp>` and iterate.
 
@@ -239,7 +280,7 @@ resolves the default branch dynamically instead of assuming `main`.
 
 Steps 6 and 8 run the integration gate automatically once every task
 passes. A clean gate leaves an `integration/run-*` branch behind for
-Phase 8; a failed gate writes `specs/INTEGRATION-FAILED.log`.
+Phase 8; a failed gate writes `forgeLogs/INTEGRATION-FAILED-<timestamp>.log`.
 
 ---
 
@@ -255,12 +296,12 @@ Phase 8; a failed gate writes `specs/INTEGRATION-FAILED.log`.
 | Preview pipeline | `make dry-run` |
 | Run pipeline | `make run` |
 | Resume crashed run | `make resume` |
-| Group tasks into dependency waves | `make parallel` |
-| Check failures | `ls specs/FAILED-*.log` |
-| Check integration gate | `ls specs/INTEGRATION-FAILED.log 2>/dev/null; git branch --list "integration/*"` |
+| Run tasks concurrently in waves | `make parallel` |
+| Check failures | `ls forgeLogs/FAILED-*.log` |
+| Check integration gate | `ls forgeLogs/INTEGRATION-FAILED-*.log 2>/dev/null; git branch --list "integration/*"` |
 | See task branches | `git branch --list "task/*"` |
 | Pipeline state | `cat pipeline-state.json` |
-| Debug log (all runs) | `cat orchestrator.log` |
+| Debug log (latest run) | `ls -t forgeLogs/orchestrator-*.log \| head -1 \| xargs cat` |
 | See all commands | `make help` |
 
 ---
@@ -297,7 +338,7 @@ re-evaluating the whole branch. If you prefer a fresh start, `make run`
 still works — passing branches are skipped, failing branches go to review.
 
 **Integration gate failed with a merge conflict**
-→ Read `specs/INTEGRATION-FAILED.log` for the offending branch. Two tasks
+→ Read `forgeLogs/INTEGRATION-FAILED-<timestamp>.log` for the offending branch. Two tasks
 are touching overlapping code — either split the overlap into a new spec
 that both depend on, or add one of them as a dependency of the other so
 they no longer run in parallel. Then `make run`.

@@ -92,6 +92,12 @@ merge conflict or cross-task regression writes
 Re-running is safe — passing branches are skipped, failing branches go straight
 to Claude review. Pipeline state persists across crashes.
 
+Pass `--parallel` (or `make parallel`) to run independent tasks concurrently.
+The orchestrator partitions the dependency graph into waves and executes each
+wave's tasks simultaneously in isolated git worktrees. This trades disk space
+and log readability for faster wall-clock time — see `ORCHESTRATION.md` for
+the full trade-off discussion.
+
 Model configuration lives in a single `models.yaml` file. Add new providers
 (Google AI Studio, etc.) by adding model names to the appropriate tier.
 
@@ -132,7 +138,7 @@ tiered-llm-forge/
 │   │   ├── task_runner.py   # per-task orchestration + model escalation
 │   │   ├── integration.py   # integration gate (merge + full suite)
 │   │   ├── summary.py       # pipeline run summary + observability
-│   │   ├── parallel.py      # parallel task execution via thread pool
+│   │   ├── parallel.py      # concurrent task execution via worktrees + thread pool
 │   │   ├── log.py           # logging configuration (console + file)
 │   │   ├── failure_class.py # classifies pytest/aider output
 │   │   └── state.py         # pipeline-state.json persistence
@@ -144,7 +150,9 @@ tiered-llm-forge/
     ├── test_runner.py
     ├── test_git_ops.py
     ├── test_state.py
-    └── test_failure_class.py
+    ├── test_failure_class.py
+    ├── test_parallel.py     # wave grouping, worktrees, concurrent execution
+    └── test_cwd.py          # cwd parameter support across all modules
 ```
 
 To change what gets generated, edit files in `templates/` or add a new

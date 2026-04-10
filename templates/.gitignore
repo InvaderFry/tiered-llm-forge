@@ -4,5 +4,6 @@ __pycache__/
 .aider*
 pipeline-state.json
 orchestrator.log
+forgeLogs/
 .worktrees/
 .venv/

@@ -2,10 +2,10 @@
 
 This playbook covers two failure modes:
 
-1. **Per-task failure** — `specs/FAILED-task-NNN-name.log` exists. The
+1. **Per-task failure** — `forgeLogs/FAILED-task-NNN-name-<timestamp>.log` exists. The
    primary tier **and** the escalation tier both failed after their full
    retry budget on a single task.
-2. **Integration gate failure** — `specs/INTEGRATION-FAILED.log` exists.
+2. **Integration gate failure** — `forgeLogs/INTEGRATION-FAILED-<timestamp>.log` exists.
    All tasks individually passed, but combining them on
    `integration/run-<timestamp>` hit a merge conflict or a full-suite
    regression. Jump to *Integration gate failures* below.
@@ -27,7 +27,7 @@ Read `specs/task-NNN-name.md` — focus on the YAML frontmatter (target, test,
 dependencies) and the function signatures / constraints.
 
 ### 2. Understand what went wrong
-Read `specs/FAILED-task-NNN-name.log`. The header now contains:
+Read `forgeLogs/FAILED-task-NNN-name-<timestamp>.log`. The header now contains:
 - A **failure class** tag — one of `rate_limit`, `request_too_large`,
   `collection_error`, `missing_symbol`, `assertion`, `timeout`,
   `regression_guard`, `merge_conflict`, or `unknown`.
@@ -125,7 +125,7 @@ merge to the default branch until that gate reports success.
 
 ## Integration gate failures
 
-`specs/INTEGRATION-FAILED.log` is written when all individual tasks
+`forgeLogs/INTEGRATION-FAILED-<timestamp>.log` is written when all individual tasks
 pass but assembling them together fails. The log distinguishes two
 sub-cases; `pipeline-state.json` also records
 `integration.status` as `merge_conflict` or `tests_failed`.

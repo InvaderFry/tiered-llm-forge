@@ -3,9 +3,11 @@
 import shutil
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .log import get_logger
+from .git_ops import branch_exists, GIT_TIMEOUT
 
 log = get_logger("parallel")
 
@@ -65,11 +67,11 @@ class WorktreePool:
                 shutil.rmtree(wt_path)
 
             cmd = ["git", "worktree", "add", str(wt_path), "-b", branch_name, start_point]
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=GIT_TIMEOUT)
             if result.returncode != 0:
                 # Branch might already exist — try without -b
                 cmd = ["git", "worktree", "add", str(wt_path), branch_name]
-                result = subprocess.run(cmd, capture_output=True, text=True)
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=GIT_TIMEOUT)
                 if result.returncode != 0:
                     log.error("Failed to create worktree for %s: %s", branch_name, result.stderr)
                     return None
@@ -85,7 +87,7 @@ class WorktreePool:
             if wt_path.exists():
                 subprocess.run(
                     ["git", "worktree", "remove", str(wt_path), "--force"],
-                    capture_output=True, text=True,
+                    capture_output=True, text=True, timeout=GIT_TIMEOUT,
                 )
 
     def cleanup(self):
@@ -94,21 +96,78 @@ class WorktreePool:
             shutil.rmtree(self.base_dir, ignore_errors=True)
         subprocess.run(
             ["git", "worktree", "prune"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, timeout=GIT_TIMEOUT,
         )
 
 
-def run_parallel_group(group, default_branch, state, run_task_fn, specs_by_name=None,
-                       resume=False):
-    """Run a group of independent tasks, serialized within each wave.
+def _resolve_dependency_base(dependencies, default_branch):
+    """Determine start_point and extra merges for a task's worktree.
 
-    True concurrent execution requires git worktree isolation so that each
-    task gets its own working tree HEAD.  Until worktree support is wired
-    into ``run_task`` (accepting a ``cwd`` parameter), tasks within a wave
-    are executed sequentially.  The wave grouping still provides value: it
-    determines the *minimum* number of serial rounds needed, and the
-    ``WorktreePool`` infrastructure is ready for a future PR to enable
-    actual concurrency.
+    Mirrors the logic in task_runner._resolve_dependency_base but uses
+    branch_exists with no cwd (refs are repo-global).
+    """
+    dep_branches = []
+    for dep in dependencies:
+        dep_branch = f"task/{dep}"
+        if branch_exists(dep_branch):
+            dep_branches.append(dep_branch)
+        else:
+            log.warning("  [dependency '%s' has no branch -- falling back to default]", dep)
+
+    if not dep_branches:
+        return default_branch, []
+    if len(dep_branches) == 1:
+        return dep_branches[0], []
+    return default_branch, dep_branches
+
+
+def _run_task_in_worktree(spec, default_branch, state, run_task_fn, pool,
+                          specs_by_name, resume):
+    """Set up a worktree for a task, run it, and clean up.
+
+    The worktree is created on the correct start point (dependency tip or
+    default branch). Dependency merges are left to ``run_task`` which
+    already handles them with proper ``cwd`` and state recording.
+
+    Returns (task_name, outcome).
+    """
+    task_name = spec["task_name"]
+    branch_name = f"task/{task_name}"
+    dependencies = spec.get("dependencies", []) or []
+
+    start_point, _ = _resolve_dependency_base(dependencies, default_branch)
+
+    already_exists = branch_exists(branch_name)
+    if already_exists:
+        wt_path = pool.create(branch_name, branch_name)
+    else:
+        wt_path = pool.create(branch_name, start_point)
+
+    if wt_path is None:
+        log.error("[parallel] Failed to create worktree for %s", task_name)
+        return task_name, "failed"
+
+    try:
+        outcome = run_task_fn(
+            spec, default_branch, state,
+            specs_by_name=specs_by_name, resume=resume,
+            cwd=str(wt_path), branch_preexisted=already_exists,
+        )
+        return task_name, outcome
+    except Exception as exc:
+        log.error("[parallel] Task %s raised: %s", task_name, exc)
+        return task_name, "failed"
+    finally:
+        pool.remove(branch_name)
+
+
+def run_parallel_group(group, default_branch, state, run_task_fn, specs_by_name=None,
+                       resume=False, max_workers=None):
+    """Run a group of independent tasks concurrently using git worktrees.
+
+    Each task gets its own worktree so it has an isolated working tree HEAD.
+    A ``ThreadPoolExecutor`` runs the tasks in parallel, bounded by
+    ``max_workers`` (defaults to ``min(len(group), 4)``).
 
     Args:
         group: List of spec dicts (tasks with no mutual dependencies).
@@ -117,20 +176,16 @@ def run_parallel_group(group, default_branch, state, run_task_fn, specs_by_name=
         run_task_fn: The run_task callable from task_runner.
         specs_by_name: Map of task_name -> spec dict for dependency context.
         resume: Whether to use --resume mode.
+        max_workers: Maximum concurrent tasks. Defaults to min(len(group), 4).
 
     Returns:
         Dict mapping task_name -> outcome ("passed", "failed", "skipped").
     """
     results = {}
 
-    if len(group) > 1:
-        log.info(
-            "\n[parallel] Wave has %d independent tasks (running sequentially -- "
-            "concurrent execution requires git worktree support, not yet wired in)",
-            len(group),
-        )
-
-    for spec in group:
+    if len(group) == 1:
+        # Single task — no need for worktree overhead, run directly
+        spec = group[0]
         task_name = spec["task_name"]
         try:
             outcome = run_task_fn(
@@ -141,5 +196,35 @@ def run_parallel_group(group, default_branch, state, run_task_fn, specs_by_name=
         except Exception as exc:
             log.error("[parallel] Task %s raised: %s", task_name, exc)
             results[task_name] = "failed"
+        return results
+
+    workers = max_workers or min(len(group), 4)
+    log.info(
+        "\n[parallel] Wave has %d independent tasks, running with %d workers",
+        len(group), workers,
+    )
+
+    pool = WorktreePool()
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    _run_task_in_worktree,
+                    spec, default_branch, state, run_task_fn, pool,
+                    specs_by_name, resume,
+                ): spec["task_name"]
+                for spec in group
+            }
+
+            for future in as_completed(futures):
+                task_name = futures[future]
+                try:
+                    _, outcome = future.result()
+                    results[task_name] = outcome
+                except Exception as exc:
+                    log.error("[parallel] Task %s raised: %s", task_name, exc)
+                    results[task_name] = "failed"
+    finally:
+        pool.cleanup()
 
     return results

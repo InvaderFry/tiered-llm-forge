@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 
-from . import SPECS_DIR
+from . import FORGE_LOGS_DIR
 from .git_ops import branch_exists, checkout, merge_branch, delete_branch
 from .log import get_logger
 from .runner import run_full_suite
@@ -20,7 +20,7 @@ def integration_gate(passed_task_names, default_branch, state):
     - Creates ``integration/run-<timestamp>`` from the default branch.
     - Merges each passing task branch (in the order provided) with --no-ff.
     - On merge conflict or full-suite failure, writes
-      ``specs/INTEGRATION-FAILED.log``, deletes the integration branch,
+      ``forgeLogs/INTEGRATION-FAILED-<timestamp>.log``, deletes the integration branch,
       and returns False so the caller can block merge.
     - On success, leaves the integration branch in place for human review
       and returns True.
@@ -53,9 +53,9 @@ def integration_gate(passed_task_names, default_branch, state):
             failed_merges.append(task_name)
             break
 
-    log_path = SPECS_DIR / "INTEGRATION-FAILED.log"
-
     if failed_merges:
+        FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = FORGE_LOGS_DIR / f"INTEGRATION-FAILED-{timestamp}.log"
         msg = (
             f"Integration gate failed: merge conflict on {failed_merges[0]}.\n"
             "The per-task branches individually pass their own tests, but "
@@ -79,6 +79,8 @@ def integration_gate(passed_task_names, default_branch, state):
     log.info("  running full test suite on integration branch...")
     passed, output = run_full_suite("tests")
     if not passed:
+        FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = FORGE_LOGS_DIR / f"INTEGRATION-FAILED-{timestamp}.log"
         log_path.write_text(
             f"Integration gate failed: full test suite failed on {integration_branch}.\n\n"
             f"{output}\n"

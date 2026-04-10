@@ -35,7 +35,7 @@ run: ## Run the orchestrator pipeline
 resume: ## Resume a crashed/failed run from where it left off
 	set -o pipefail && $(PYTHON) -m orchestrator --resume 2>&1 | tee run.log
 
-parallel: ## Group tasks into dependency waves (sequential within waves for now)
+parallel: ## Run independent tasks concurrently in dependency waves (default 4 workers)
 	set -o pipefail && $(PYTHON) -m orchestrator --parallel 2>&1 | tee run.log
 
 fix: ## Open Claude Code to fix failures
@@ -51,14 +51,14 @@ status: ## Show task branch status and failure logs
 	@git branch --list "task/*" 2>/dev/null || echo "  (none)"
 	@echo ""
 	@echo "=== Failure logs ==="
-	@ls specs/FAILED-*.log 2>/dev/null || echo "  (none)"
+	@ls forgeLogs/FAILED-*.log 2>/dev/null || echo "  (none)"
 	@echo ""
 	@echo "=== Pipeline state ==="
 	@cat pipeline-state.json 2>/dev/null || echo "  (no state file — pipeline hasn't run yet)"
 
-clean: ## Remove failure logs, pipeline state, and debug log (branches are preserved)
-	rm -f specs/FAILED-*.log pipeline-state.json orchestrator.log
-	@echo "Cleaned failure logs, pipeline state, and debug log."
+clean: ## Remove forgeLogs directory, pipeline state, and legacy debug log (branches are preserved)
+	rm -rf forgeLogs pipeline-state.json orchestrator.log
+	@echo "Cleaned forgeLogs, pipeline state, and debug log."
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \

@@ -6,6 +6,12 @@ import sys
 from pathlib import Path
 
 
+def _resolve(path, cwd=None):
+    """Resolve a relative path against an optional working directory."""
+    p = Path(path)
+    return Path(cwd) / p if cwd and not p.is_absolute() else p
+
+
 def _pytest_cmd():
     """Return the command prefix for invoking pytest.
 
@@ -24,20 +30,20 @@ TEST_TIMEOUT = 120
 SUITE_TIMEOUT = 300
 
 
-def run_tests(test_file):
+def run_tests(test_file, cwd=None):
     """
     Run a specific test file with pytest.
 
     Returns (passed, output). Fails if the test file doesn't exist
     or if pytest collects 0 items (vacuous pass guard).
     """
-    test_path = Path(test_file)
+    test_path = _resolve(test_file, cwd)
     if not test_path.exists():
         return False, f"Test file {test_file} does not exist."
 
     cmd = [*_pytest_cmd(), test_file, "-x", "--tb=short"]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=TEST_TIMEOUT)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=TEST_TIMEOUT, cwd=cwd)
     except subprocess.TimeoutExpired:
         return False, f"Timeout: pytest exceeded {TEST_TIMEOUT}s on {test_file}."
 
@@ -50,20 +56,20 @@ def run_tests(test_file):
     return result.returncode == 0, output
 
 
-def run_full_suite(tests_dir="tests"):
+def run_full_suite(tests_dir="tests", cwd=None):
     """
     Run the full pytest suite under ``tests_dir``.
 
     Returns (passed, output). Used by the integration gate after all
     per-task tests pass to catch cross-task regressions before merge.
     """
-    tests_path = Path(tests_dir)
+    tests_path = _resolve(tests_dir, cwd)
     if not tests_path.exists():
         return False, f"Tests directory {tests_dir} does not exist."
 
-    cmd = [*_pytest_cmd(), str(tests_path), "--tb=short", "-q"]
+    cmd = [*_pytest_cmd(), str(tests_dir), "--tb=short", "-q"]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=SUITE_TIMEOUT)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=SUITE_TIMEOUT, cwd=cwd)
     except subprocess.TimeoutExpired:
         return False, f"Timeout: full test suite exceeded {SUITE_TIMEOUT}s."
 
@@ -75,13 +81,13 @@ def run_full_suite(tests_dir="tests"):
     return result.returncode == 0, output
 
 
-def file_size(path):
+def file_size(path, cwd=None):
     """Return file size in bytes, or 0 if the file doesn't exist."""
-    p = Path(path)
+    p = _resolve(path, cwd)
     return p.stat().st_size if p.exists() else 0
 
 
-def check_regression(target_file, baseline_size):
+def check_regression(target_file, baseline_size, cwd=None):
     """
     Return True if the target file looks corrupted after a model edit.
 
@@ -90,11 +96,11 @@ def check_regression(target_file, baseline_size):
     2. Content sanity — file no longer contains expected language markers.
     """
     if baseline_size >= 50:
-        current = file_size(target_file)
+        current = file_size(target_file, cwd=cwd)
         if current < baseline_size * 0.2:
             return True
 
-    if not _content_looks_valid(target_file):
+    if not _content_looks_valid(target_file, cwd=cwd):
         return True
 
     return False
@@ -125,7 +131,7 @@ _CONTENT_MARKERS = {
 }
 
 
-def _content_looks_valid(target_file):
+def _content_looks_valid(target_file, cwd=None):
     """
     Quick sanity check: does the file still look like source code?
 
@@ -137,7 +143,7 @@ def _content_looks_valid(target_file):
     if not markers:
         return True
 
-    p = Path(target_file)
+    p = _resolve(target_file, cwd)
     if not p.exists() or p.stat().st_size == 0:
         return False
 

@@ -1,6 +1,6 @@
 """Pipeline run summary and observability roll-up."""
 
-from . import SPECS_DIR
+from . import FORGE_LOGS_DIR
 from .log import get_logger
 
 log = get_logger("summary")
@@ -76,7 +76,8 @@ def print_summary(results, default_branch, state=None):
         log.info("\n%s", "=" * 50)
         log.info("Claude review needed for these failures:")
         for f in failed:
-            fail_log = SPECS_DIR / f"FAILED-{f}.log"
+            logs = sorted(FORGE_LOGS_DIR.glob(f"FAILED-{f}-*.log")) if FORGE_LOGS_DIR.exists() else []
+            fail_log = logs[-1] if logs else FORGE_LOGS_DIR / f"FAILED-{f}-[timestamp].log"
             log.info("\n  Task:   %s", f)
             log.info("  Branch: task/%s", f)
             log.info("  Log:    %s", fail_log)

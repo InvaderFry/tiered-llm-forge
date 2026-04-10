@@ -8,7 +8,7 @@ default branch.
 
 ```bash
 python3 -c 'import json; s=json.load(open("pipeline-state.json")); print(s.get("integration", {}))'
-ls specs/INTEGRATION-FAILED.log 2>/dev/null && echo "BLOCKED: integration gate failed"
+ls forgeLogs/INTEGRATION-FAILED-*.log 2>/dev/null && echo "BLOCKED: integration gate failed"
 git branch --list "integration/*"
 ```
 

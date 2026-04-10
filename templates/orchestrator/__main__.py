@@ -118,8 +118,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Preview pipeline without running models")
     parser.add_argument("--config", default="models.yaml", help="Path to models.yaml config")
     parser.add_argument("--resume", action="store_true", help="Resume failed tasks from last attempt instead of flagging for review")
-    parser.add_argument("--parallel", action="store_true",
-                        help="Group independent tasks into dependency waves")
+    parser.add_argument("--parallel", nargs="?", type=int, const=4, default=None,
+                        metavar="N",
+                        help="Run independent tasks concurrently in waves (N = max workers, default 4)")
     parser.add_argument("--verbose", action="store_true", help="Enable debug-level output with timestamps")
     args = parser.parse_args()
 
@@ -162,15 +163,18 @@ def main():
 
     ordered_specs = [load_spec(sf) for sf in ordered]
 
-    if args.parallel:
-        # Wave mode: group independent tasks and run each wave
+    if args.parallel is not None:
+        # Wave mode: group independent tasks and run each wave concurrently
+        max_workers = args.parallel
         groups = find_parallel_groups(ordered_specs)
-        log.info("Wave mode: %d wave(s) across %d tasks", len(groups), len(ordered_specs))
+        log.info("Wave mode: %d wave(s) across %d tasks (max workers: %d)",
+                 len(groups), len(ordered_specs), max_workers)
         for wave_i, group in enumerate(groups, 1):
             log.info("\n--- Wave %d: %d task(s) ---", wave_i, len(group))
             wave_results = run_parallel_group(
                 group, default_branch, state, run_task,
                 specs_by_name=specs_by_name, resume=args.resume,
+                max_workers=max_workers,
             )
             for task_name, outcome in wave_results.items():
                 results[outcome].append(task_name)

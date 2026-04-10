@@ -171,13 +171,16 @@ def _add_stats(a, b):
     }
 
 
-def run_aider(model, message, target_file, read_files=None):
+def run_aider(model, message, target_file, read_files=None, cwd=None):
     """
     Run aider with a specific model, handling rate limit retries.
 
     ``read_files`` is an optional iterable of paths to attach as read-only
     context (spec, test, dependency target files, etc.). Missing paths are
     silently skipped so a single stale reference doesn't kill the run.
+
+    When ``cwd`` is set, aider runs inside that directory (e.g. a git
+    worktree) and all relative paths resolve there.
 
     Returns ``(success, stats)`` where ``stats`` is the dict produced by
     ``_parse_usage`` summed across every internal retry. Failed runs
@@ -207,7 +210,8 @@ def run_aider(model, message, target_file, read_files=None):
             if not rf or rf == target_file or rf in seen:
                 continue
             seen.add(rf)
-            if _Path(rf).exists():
+            resolved = _Path(cwd) / rf if cwd and not _Path(rf).is_absolute() else _Path(rf)
+            if resolved.exists():
                 cmd.extend(["--read", rf])
 
     # Disable LiteLLM's internal retry loop — we handle retries with correct wait times
@@ -224,7 +228,7 @@ def run_aider(model, message, target_file, read_files=None):
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, check=False,
-                env=aider_env, timeout=AIDER_TIMEOUT,
+                env=aider_env, timeout=AIDER_TIMEOUT, cwd=cwd,
             )
         except subprocess.TimeoutExpired:
             log.warning("  [aider timed out after %ds on model %s]", AIDER_TIMEOUT, model)
@@ -269,7 +273,8 @@ def run_aider(model, message, target_file, read_files=None):
     return False, invocation_stats
 
 
-def run_with_tier_fallback(tier_name, message, target_file, start_model=None, read_files=None):
+def run_with_tier_fallback(tier_name, message, target_file, start_model=None, read_files=None,
+                           cwd=None):
     """
     Try all models in a tier with fallback.
 
@@ -289,7 +294,7 @@ def run_with_tier_fallback(tier_name, message, target_file, start_model=None, re
     aggregate = _empty_stats()
     for model in models:
         log.info("  Trying %s...", model)
-        success, stats = run_aider(model, message, target_file, read_files=read_files)
+        success, stats = run_aider(model, message, target_file, read_files=read_files, cwd=cwd)
         aggregate = _add_stats(aggregate, stats)
         if success:
             return True, model, aggregate

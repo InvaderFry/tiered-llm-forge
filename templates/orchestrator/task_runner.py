@@ -2,8 +2,9 @@
 
 import re
 import time
+from datetime import datetime
 
-from . import SPECS_DIR
+from . import FORGE_LOGS_DIR
 from .log import get_logger
 
 log = get_logger("task_runner")
@@ -56,7 +57,8 @@ def _resolve_dependency_base(dependencies, default_branch):
     return default_branch, dep_branches
 
 
-def run_task(spec, default_branch, state, specs_by_name=None, resume=False):
+def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
+             cwd=None, branch_preexisted=None):
     """
     Run a task through the full model escalation ladder.
 
@@ -70,6 +72,14 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False):
     The task branch is created from the tip of its dependency branch(es) so
     task N actually runs against task N-1's code. With multiple dependencies
     they are merged together onto a fresh branch rooted at ``default_branch``.
+
+    When ``cwd`` is set (worktree mode), branch creation and checkout are
+    skipped — the caller is responsible for setting up the worktree on the
+    correct branch. All subprocess calls run inside ``cwd``.
+
+    ``branch_preexisted`` tells worktree mode whether the branch existed
+    before the worktree was created (since worktree creation itself creates
+    the branch). When None, falls back to ``branch_exists()``.
     """
     task_name = spec["task_name"]
     target_file = spec["target"]
@@ -78,6 +88,7 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False):
     dependencies = spec.get("dependencies", []) or []
     task_started = time.time()
     models_tried = []
+    worktree = cwd is not None
 
     def _elapsed():
         return time.time() - task_started
@@ -92,13 +103,18 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False):
     )
 
     # --- Handle re-run: branch already exists ---
-    if branch_exists(branch_name):
+    # In worktree mode the caller tells us whether the branch pre-existed
+    # (worktree creation itself creates the branch as a side effect).
+    branch_was_preexisting = branch_preexisted if worktree else branch_exists(branch_name, cwd=cwd)
+    if branch_was_preexisting:
         log.info("  Branch '%s' already exists -- checking previous result...", branch_name)
-        checkout(branch_name)
-        passed, output = run_tests(test_file)
+        if not worktree:
+            checkout(branch_name)
+        passed, output = run_tests(test_file, cwd=cwd)
         if passed:
             log.info("  Already passing -- skipping.")
-            checkout(default_branch)
+            if not worktree:
+                checkout(default_branch)
             record_task(state, task_name, "skipped", duration_seconds=_elapsed())
             save_state(state)
             return "skipped"
@@ -114,9 +130,12 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False):
             # Stay on the branch — fall through to the retry loop below
         else:
             log.info("  Previously failed -- escalating to Claude review.")
-            fail_log = SPECS_DIR / f"FAILED-{task_name}.log"
+            FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            _ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+            fail_log = FORGE_LOGS_DIR / f"FAILED-{task_name}-{_ts}.log"
             fail_log.write_text(f"Previously attempted -- still failing on re-run.\n\n{output}")
-            checkout(default_branch)
+            if not worktree:
+                checkout(default_branch)
             record_task(
                 state,
                 task_name,
@@ -139,22 +158,26 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False):
         extra_merges = []
 
     if not resume_point:
-        base_sha = branch_tip(start_point)
-        if start_point != default_branch or extra_merges:
-            log.info("  Branching from '%s' (deps: %s)", start_point, ", ".join(dependencies) or "none")
-        checkout(branch_name, create=True, start_point=start_point)
+        base_sha = branch_tip(start_point, cwd=cwd)
+        if not worktree:
+            if start_point != default_branch or extra_merges:
+                log.info("  Branching from '%s' (deps: %s)", start_point, ", ".join(dependencies) or "none")
+            checkout(branch_name, create=True, start_point=start_point)
 
         for dep_branch in extra_merges:
             log.info("  Merging dependency branch %s into %s", dep_branch, branch_name)
-            if not merge_branch(dep_branch, message=f"merge: {dep_branch} into {branch_name}"):
-                fail_log = SPECS_DIR / f"FAILED-{task_name}.log"
+            if not merge_branch(dep_branch, message=f"merge: {dep_branch} into {branch_name}", cwd=cwd):
+                FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+                _ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+                fail_log = FORGE_LOGS_DIR / f"FAILED-{task_name}-{_ts}.log"
                 fail_log.write_text(
                     f"Merge conflict while assembling dependencies for {task_name}.\n"
                     f"Conflicting branch: {dep_branch}\n"
                     "Resolve by running the tasks with fewer simultaneous dependencies, "
                     "or fix the conflict manually and re-run the orchestrator.\n"
                 )
-                checkout(default_branch)
+                if not worktree:
+                    checkout(default_branch)
                 record_task(
                     state,
                     task_name,
@@ -168,9 +191,9 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False):
                 save_state(state)
                 return "failed"
     else:
-        base_sha = branch_tip(branch_name)
+        base_sha = branch_tip(branch_name, cwd=cwd)
 
-    baseline_size = file_size(target_file)
+    baseline_size = file_size(target_file, cwd=cwd)
 
     # Assemble read-only context for the implementer model:
     # the full spec file, the test file, and the target files of every
@@ -217,36 +240,39 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False):
 
             if attempt == 1 and not resume_point:
                 success, model_used, stats = run_with_tier_fallback(
-                    "primary", implement_message, target_file, first_model, read_files=read_files,
+                    "primary", implement_message, target_file, first_model,
+                    read_files=read_files, cwd=cwd,
                 )
             else:
-                _, test_output = run_tests(test_file)
+                _, test_output = run_tests(test_file, cwd=cwd)
                 success, model_used, stats = run_with_tier_fallback(
                     "primary",
                     f"Tests failed. Output:\n{_strip_urls(test_output)}\nFix the code to pass all tests.",
                     target_file,
                     first_model,
                     read_files=read_files,
+                    cwd=cwd,
                 )
             _accumulate(stats)
             if model_used and model_used not in models_tried:
                 models_tried.append(model_used)
 
-            if check_regression(target_file, baseline_size):
+            if check_regression(target_file, baseline_size, cwd=cwd):
                 record_attempt(state, task_name, attempt, "primary", model_used, success, tests_passed=False)
                 save_state(state)
-                revert_last_commit(target_file, baseline_size)
+                revert_last_commit(target_file, baseline_size, cwd=cwd)
                 continue
 
-            baseline_size = max(baseline_size, file_size(target_file))
-            passed, _ = run_tests(test_file)
+            baseline_size = max(baseline_size, file_size(target_file, cwd=cwd))
+            passed, _ = run_tests(test_file, cwd=cwd)
 
             record_attempt(state, task_name, attempt, "primary", model_used, success, tests_passed=passed)
             save_state(state)
 
             if passed:
                 log.info("PASSED (Stage 1, attempt %d): %s", attempt, task_name)
-                checkout(default_branch)
+                if not worktree:
+                    checkout(default_branch)
                 record_task(
                     state,
                     task_name,
@@ -271,32 +297,34 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False):
         total_attempts += 1
         log.info("  Attempt %d/%d...", attempt, escalation_tier["retries"])
 
-        _, test_output = run_tests(test_file)
+        _, test_output = run_tests(test_file, cwd=cwd)
         success, model_used, stats = run_with_tier_fallback(
             "escalation",
             f"Previous model failed. Tests output:\n{_strip_urls(test_output)}\nAnalyze carefully and fix.",
             target_file,
             read_files=read_files,
+            cwd=cwd,
         )
         _accumulate(stats)
         if model_used and model_used not in models_tried:
             models_tried.append(model_used)
 
-        if check_regression(target_file, baseline_size):
+        if check_regression(target_file, baseline_size, cwd=cwd):
             record_attempt(state, task_name, attempt, "escalation", model_used, success, tests_passed=False)
             save_state(state)
-            revert_last_commit(target_file, baseline_size)
+            revert_last_commit(target_file, baseline_size, cwd=cwd)
             continue
 
-        baseline_size = max(baseline_size, file_size(target_file))
-        passed, test_output = run_tests(test_file)
+        baseline_size = max(baseline_size, file_size(target_file, cwd=cwd))
+        passed, test_output = run_tests(test_file, cwd=cwd)
 
         record_attempt(state, task_name, attempt, "escalation", model_used, success, tests_passed=passed)
         save_state(state)
 
         if passed:
             log.info("PASSED (Escalation, attempt %d): %s", attempt, task_name)
-            checkout(default_branch)
+            if not worktree:
+                checkout(default_branch)
             record_task(
                 state,
                 task_name,
@@ -315,9 +343,11 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False):
             return "passed"
 
     # --- Stage 3: Flag for Claude review ---
-    _, test_output = run_tests(test_file)
+    _, test_output = run_tests(test_file, cwd=cwd)
     failure_label = classify_failure(test_output)
-    fail_log = SPECS_DIR / f"FAILED-{task_name}.log"
+    FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    _ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+    fail_log = FORGE_LOGS_DIR / f"FAILED-{task_name}-{_ts}.log"
     fail_log.write_text(
         f"Failed after primary tier ({primary_tier['retries']}x) "
         f"+ escalation ({escalation_tier['retries']}x).\n"
@@ -328,7 +358,8 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False):
         f"{test_output}"
     )
     log.warning("ESCALATE TO CLAUDE: %s (failure_class=%s)", task_name, failure_label)
-    checkout(default_branch)
+    if not worktree:
+        checkout(default_branch)
     record_task(
         state,
         task_name,

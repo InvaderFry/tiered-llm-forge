@@ -116,7 +116,7 @@ task-004  API layer (depends on task-002 + task-003)
 **Playbook:** See `docs/FAILURE_PLAYBOOK.md` for the full procedure.
 
 Quick version:
-1. Read `specs/task-NNN-name.md` + `specs/FAILED-task-NNN-name.log`.
+1. Read `specs/task-NNN-name.md` + `forgeLogs/FAILED-task-NNN-name-<timestamp>.log`.
    The log header now includes a **failure class**
    (`rate_limit`, `request_too_large`, `collection_error`,
    `missing_symbol`, `assertion`, `timeout`, `regression_guard`,
@@ -130,7 +130,7 @@ Quick version:
 
 ## Reviewing Integration Gate Failures
 
-**Trigger:** `specs/INTEGRATION-FAILED.log` exists, or
+**Trigger:** `forgeLogs/INTEGRATION-FAILED-<timestamp>.log` exists, or
 `pipeline-state.json` shows `integration.status != "passed"`.
 
 Each task's own test file passes in isolation but combining them on
@@ -166,7 +166,7 @@ integration safety + code quality, then MERGE / FIX THEN MERGE / FLAG.
 | `make dry-run` | Preview pipeline without calling models |
 | `make run` | Run the full pipeline |
 | `make resume` | Resume failed tasks from last attempt instead of flagging for review |
-| `make parallel` | Group independent tasks into waves (sequential within each wave for now) |
+| `make parallel` | Run independent tasks concurrently in dependency waves (default 4 workers) |
 | `make status` | Show branches, failures, and pipeline state |
 
 ### CLI flags (can also be passed directly)
@@ -174,10 +174,30 @@ integration safety + code quality, then MERGE / FIX THEN MERGE / FLAG.
 | Flag | Effect |
 |------|--------|
 | `--resume` | Resume from the exact attempt that crashed/failed |
-| `--parallel [N]` | Group tasks into dependency waves (concurrent execution pending worktree support) |
+| `--parallel [N]` | Run tasks concurrently in dependency waves using git worktrees (N = max workers, default 4) |
 | `--verbose` | Enable debug-level output with timestamps |
 
-All runs write debug-level output to `orchestrator.log` for post-mortem analysis.
+All runs write debug-level output to `forgeLogs/orchestrator-<timestamp>.log` for post-mortem analysis. Each run gets its own timestamped file so reruns never overwrite previous logs.
+
+### When to use `--parallel`
+
+`--parallel` partitions the dependency graph into waves and runs each
+wave's tasks simultaneously in isolated git worktrees via a thread pool.
+
+**Pros:**
+- Faster wall-clock time — independent tasks run concurrently
+- Better rate-limit utilisation — idle threads yield to active ones
+- Automatic wave grouping from the dependency graph
+
+**Cons:**
+- Higher disk usage — each concurrent task gets a full worktree copy
+- Interleaved log output — harder to read; use `--verbose` and grep by task name
+- Rate-limit amplification — more concurrent requests can trigger more 429s
+- Not the default — sequential (`make run`) is simpler to debug
+
+**Rule of thumb:** use `make run` for first runs and debugging. Use
+`make parallel` once the specs are validated and you want throughput.
+Linear dependency chains see no benefit since each wave has only one task.
 
 ---
 
@@ -190,7 +210,7 @@ All runs write debug-level output to `orchestrator.log` for post-mortem analysis
 | "Fix the failures" | Read spec + log, checkout branch, fix, pytest, commit |
 | "Review branches" | Diff each branch vs spec, MERGE / FIX / FLAG |
 | "Add task for Y" | Write new spec + test, update SpecsReadMe.md |
-| "What's the status?" | `git branch --list "task/*" "integration/*"` + `ls specs/FAILED-*.log specs/INTEGRATION-FAILED.log 2>/dev/null` |
+| "What's the status?" | `git branch --list "task/*" "integration/*"` + `ls forgeLogs/FAILED-*.log forgeLogs/INTEGRATION-FAILED-*.log 2>/dev/null` |
 
 ---
 
@@ -214,8 +234,8 @@ project-root/
 │   ├── task_runner.py      ← per-task orchestration + model escalation
 │   ├── integration.py      ← integration gate (merge + full suite)
 │   ├── summary.py          ← pipeline run summary + observability
-│   ├── parallel.py         ← parallel task execution via thread pool
-│   ├── log.py              ← logging config (console + orchestrator.log)
+│   ├── parallel.py         ← concurrent task execution via worktrees + thread pool
+│   ├── log.py              ← logging config (console + forgeLogs/orchestrator-<timestamp>.log)
 │   ├── failure_class.py    ← classifies pytest/aider output
 │   └── state.py            ← pipeline-state.json persistence
 ├── models.yaml             ← model config (single source of truth)
@@ -223,8 +243,11 @@ project-root/
 ├── .env                    ← API keys (never committed)
 ├── specs/
 │   ├── SpecsReadMe.md      ← human summary (you generate)
-│   ├── task-001-name.md    ← spec files (you generate)
-│   └── FAILED-task-*.log   ← written by orchestrator on failure
+│   └── task-001-name.md    ← spec files (you generate)
+├── forgeLogs/
+│   ├── orchestrator-<timestamp>.log  ← full debug log per run
+│   ├── FAILED-task-*-<timestamp>.log ← written by orchestrator on failure
+│   └── INTEGRATION-FAILED-<timestamp>.log ← written on integration failure
 ├── tests/
 │   ├── conftest.py         ← sys.path setup
 │   └── test_001_name.py    ← test files (you generate)
