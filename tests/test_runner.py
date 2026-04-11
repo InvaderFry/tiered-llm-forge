@@ -142,16 +142,27 @@ class TestCheckRegression:
     def test_regression_when_content_invalid(self, tmp_path):
         f = tmp_path / "module.py"
         f.write_text("x = 1\n")  # no markers for .py
+        # baseline=0 but file has some bytes -> content sanity still applies
         assert check_regression(str(f), 0) is True
 
-    def test_regression_when_file_deleted(self, tmp_path):
+    def test_no_regression_when_file_never_existed(self, tmp_path):
+        # baseline=0 AND file still missing: aider produced no output, which
+        # is "no progress" -- the task_runner handles that via a HEAD-move
+        # check. Flagging it as a regression here caused git reset --hard
+        # HEAD~1 to chew through dependency history (see FIX-SUMMARY).
         f = tmp_path / "module.py"
-        assert check_regression(str(f), 0) is True
+        assert check_regression(str(f), 0) is False
 
-    def test_regression_when_file_emptied(self, tmp_path):
+    def test_no_regression_when_file_empty_and_baseline_zero(self, tmp_path):
         f = tmp_path / "module.py"
         f.write_text("")
-        assert check_regression(str(f), 0) is True
+        assert check_regression(str(f), 0) is False
+
+    def test_regression_when_file_emptied_from_real_baseline(self, tmp_path):
+        # baseline > 0 but file now empty: this IS a real regression.
+        f = tmp_path / "module.py"
+        f.write_text("")
+        assert check_regression(str(f), 500) is True
 
 
 class TestRunTests:

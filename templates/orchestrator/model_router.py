@@ -5,6 +5,7 @@ import re
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 from .config import get_config, get_tier
 from .log import get_logger
@@ -32,8 +33,32 @@ AIDER_TIMEOUT = 300
 # seconds, shorter than typical between-run gaps.
 # ---------------------------------------------------------------------------
 _next_available_at: dict = {}
-_request_too_large: set = set()   # models whose context exceeds TPM cap this session
+# Request-too-large is per-task and per-thread, not session-wide. A long spec
+# that blows past qwen3's 6k TPM cap must not cause the NEXT task's tiny spec
+# to also skip qwen3. We store the flag on a threading.local so worktree-mode
+# parallel tasks don't poison each other either. Access still goes through
+# _rate_limit_lock for consistency with the other coordinator state.
+_request_too_large_tls = threading.local()
 _rate_limit_lock = threading.Lock()
+
+
+def _request_too_large_set():
+    """Return (creating if needed) the per-thread request-too-large set."""
+    s = getattr(_request_too_large_tls, "models", None)
+    if s is None:
+        s = set()
+        _request_too_large_tls.models = s
+    return s
+
+
+def clear_request_too_large():
+    """Forget every request-too-large flag for the current task.
+
+    Called at the top of ``run_task`` so the next task starts with a fresh
+    model roster regardless of what the previous task learned.
+    """
+    with _rate_limit_lock:
+        _request_too_large_set().clear()
 
 # Indirected so tests can freeze time without monkeypatching stdlib
 _clock = time.time
@@ -58,22 +83,21 @@ def _wait_for_model(model):
 def _mark_request_too_large(model):
     """Record that this model cannot handle the current request size.
 
-    Unlike time-based rate limits, "Request too large" is permanent for
-    the session: no amount of waiting fixes a TPM-cap exceeded error.
-    We track this so retry attempts within the same task (and subsequent
-    tasks of similar context size) can skip the model immediately rather
-    than burning another 60+ second aider invocation on a request that
-    will never succeed.
+    "Request too large" is permanent for *this task*: no amount of waiting
+    fixes a TPM-cap exceeded error, so subsequent retry attempts within
+    the same task skip the model. The flag clears at the start of the
+    next task (see ``clear_request_too_large``) since a different task's
+    spec may fit under the cap.
     Thread-safe.
     """
     with _rate_limit_lock:
-        _request_too_large.add(model)
+        _request_too_large_set().add(model)
 
 
 def is_request_too_large(model):
     """Return True if this model is flagged as too-large for the current task."""
     with _rate_limit_lock:
-        return model in _request_too_large
+        return model in _request_too_large_set()
 
 
 def _mark_rate_limited(model, retry_after, buffer=5.0):
@@ -212,11 +236,24 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
     cfg = get_config()
     weak_model = cfg.get("weak_model", "groq/llama-3.1-8b-instant")
 
+    # Resolve the target file to an absolute path and ensure its parent
+    # directory exists. If aider is handed a relative path to a file whose
+    # parent directory does not exist yet, it prints "Git repo: none" and
+    # silently falls back to cwd-relative path creation, which has been
+    # observed to produce spurious nested `src/` directories and duplicate
+    # class errors. Creating the parent up-front and passing an absolute
+    # path keeps aider anchored to the real worktree.
+    target_path = Path(target_file)
+    if cwd and not target_path.is_absolute():
+        target_path = Path(cwd) / target_path
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_file_abs = str(target_path)
+
     cmd = [
         "aider",
         "--model", model,
         "--message", message,
-        "--file", target_file,
+        "--file", target_file_abs,
         "--weak-model", weak_model,
         "--yes-always",
         "--auto-commits",
@@ -226,15 +263,14 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
     ]
 
     if read_files:
-        from pathlib import Path as _Path
         seen = set()
         for rf in read_files:
             if not rf or rf == target_file or rf in seen:
                 continue
             seen.add(rf)
-            resolved = _Path(cwd) / rf if cwd and not _Path(rf).is_absolute() else _Path(rf)
+            resolved = Path(cwd) / rf if cwd and not Path(rf).is_absolute() else Path(rf)
             if resolved.exists():
-                cmd.extend(["--read", rf])
+                cmd.extend(["--read", str(resolved)])
 
     # Disable LiteLLM's internal retry loop — we handle retries with correct wait times
     aider_env = os.environ.copy()
@@ -330,7 +366,7 @@ def run_with_tier_fallback(tier_name, message, target_file, start_model=None, re
     aggregate = _empty_stats()
     for model in models:
         if is_request_too_large(model):
-            log.info("  Skipping %s -- request too large (already seen this session)", model)
+            log.info("  Skipping %s -- request too large (already seen this task)", model)
             continue
         log.info("  Trying %s...", model)
         success, stats = run_aider(model, message, target_file, read_files=read_files, cwd=cwd)

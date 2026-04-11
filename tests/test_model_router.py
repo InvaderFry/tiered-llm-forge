@@ -15,6 +15,9 @@ from orchestrator.model_router import (
     _parse_usage,
     _wait_for_model,
     _mark_rate_limited,
+    _mark_request_too_large,
+    is_request_too_large,
+    clear_request_too_large,
 )
 import orchestrator.model_router as _mr
 from orchestrator import config as config_mod
@@ -88,7 +91,7 @@ class TestRateLimitCoordinator:
 
     def setup_method(self):
         _mr._next_available_at.clear()
-        _mr._request_too_large.clear()
+        clear_request_too_large()
         self._fake_now = [1000.0]
         self._slept = []
         _mr._clock = lambda: self._fake_now[0]
@@ -99,7 +102,7 @@ class TestRateLimitCoordinator:
         _mr._clock = _t.time
         _mr._sleep = _t.sleep
         _mr._next_available_at.clear()
-        _mr._request_too_large.clear()
+        clear_request_too_large()
 
     def test_wait_sleeps_remaining_window(self):
         _mark_rate_limited("groq/qwen3-32b", 12.0, buffer=5.0)  # earliest = 1017
@@ -134,6 +137,46 @@ class TestRateLimitCoordinator:
         _wait_for_model("groq/qwen3-32b")
         assert len(self._slept) == 1
         assert abs(self._slept[0] - 10.0) < 0.01
+
+
+class TestRequestTooLargePerTask:
+    """The request-too-large flag must be per-task, not session-wide.
+
+    A huge spec that blows past qwen3's TPM cap should not cause the next
+    (possibly tiny) task to skip qwen3. Clearing is the caller's job and
+    happens at the top of run_task.
+    """
+
+    def teardown_method(self):
+        clear_request_too_large()
+
+    def test_mark_and_query(self):
+        assert is_request_too_large("groq/qwen/qwen3-32b") is False
+        _mark_request_too_large("groq/qwen/qwen3-32b")
+        assert is_request_too_large("groq/qwen/qwen3-32b") is True
+
+    def test_clear_resets_flag(self):
+        _mark_request_too_large("groq/qwen/qwen3-32b")
+        clear_request_too_large()
+        assert is_request_too_large("groq/qwen/qwen3-32b") is False
+
+    def test_per_thread_isolation(self):
+        import threading
+        _mark_request_too_large("groq/qwen/qwen3-32b")
+
+        other_thread_saw = []
+
+        def in_other_thread():
+            other_thread_saw.append(is_request_too_large("groq/qwen/qwen3-32b"))
+
+        t = threading.Thread(target=in_other_thread)
+        t.start()
+        t.join()
+
+        # Other thread has its own set -- should not see main thread's flag
+        assert other_thread_saw == [False]
+        # Main thread still sees its own flag
+        assert is_request_too_large("groq/qwen/qwen3-32b") is True
 
 
 class TestParseRetryAfter:

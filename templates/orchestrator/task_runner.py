@@ -13,6 +13,7 @@ from .model_router import (
     select_model_for_spec,
     run_with_tier_fallback,
     is_request_too_large,
+    clear_request_too_large,
 )
 from .runner import run_tests, file_size, check_regression
 from .git_ops import (
@@ -93,6 +94,10 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
     task_started = time.time()
     models_tried = []
     worktree = cwd is not None
+
+    # Request-too-large is a per-task property, not session-wide: a task with
+    # a tiny spec should not inherit "skip qwen3" from an earlier huge task.
+    clear_request_too_large()
 
     def _elapsed():
         return time.time() - task_started
@@ -243,6 +248,7 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
             total_attempts += 1
             log.info("  Attempt %d/%d...", attempt, primary_tier["retries"])
 
+            head_before = branch_tip("HEAD", cwd=cwd)
             if attempt == 1 and not resume_point:
                 success, model_used, stats = run_with_tier_fallback(
                     "primary", implement_message, target_file, first_model,
@@ -269,10 +275,20 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
                     if "request_too_large" not in llm_fail_reasons:
                         llm_fail_reasons.append("request_too_large")
 
-            if check_regression(target_file, baseline_size, cwd=cwd):
+            head_after = branch_tip("HEAD", cwd=cwd)
+            head_moved = bool(head_after) and head_after != head_before
+            if head_moved and check_regression(target_file, baseline_size, cwd=cwd):
                 record_attempt(state, task_name, attempt, "primary", model_used, success, tests_passed=False)
                 save_state(state)
                 revert_last_commit(target_file, baseline_size, cwd=cwd)
+                continue
+            if not head_moved and not success:
+                # Aider never committed — nothing to revert, but also nothing
+                # to test against. Move to the next attempt without nuking
+                # dependency history with git reset --hard HEAD~1.
+                log.info("  [no commit produced by aider -- nothing to revert]")
+                record_attempt(state, task_name, attempt, "primary", model_used, success, tests_passed=False)
+                save_state(state)
                 continue
 
             baseline_size = max(baseline_size, file_size(target_file, cwd=cwd))
@@ -310,6 +326,7 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
         log.info("  Attempt %d/%d...", attempt, escalation_tier["retries"])
 
         _, test_output = run_tests(test_file, cwd=cwd)
+        head_before = branch_tip("HEAD", cwd=cwd)
         success, model_used, stats = run_with_tier_fallback(
             "escalation",
             f"Previous model failed. Tests output:\n{_strip_urls(test_output)}\nAnalyze carefully and fix.",
@@ -321,10 +338,17 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
         if model_used and model_used not in models_tried:
             models_tried.append(model_used)
 
-        if check_regression(target_file, baseline_size, cwd=cwd):
+        head_after = branch_tip("HEAD", cwd=cwd)
+        head_moved = bool(head_after) and head_after != head_before
+        if head_moved and check_regression(target_file, baseline_size, cwd=cwd):
             record_attempt(state, task_name, attempt, "escalation", model_used, success, tests_passed=False)
             save_state(state)
             revert_last_commit(target_file, baseline_size, cwd=cwd)
+            continue
+        if not head_moved and not success:
+            log.info("  [no commit produced by aider -- nothing to revert]")
+            record_attempt(state, task_name, attempt, "escalation", model_used, success, tests_passed=False)
+            save_state(state)
             continue
 
         baseline_size = max(baseline_size, file_size(target_file, cwd=cwd))

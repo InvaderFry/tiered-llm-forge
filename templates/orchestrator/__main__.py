@@ -184,7 +184,17 @@ def main():
                 log.info("  [cooldown: sleeping %ds between waves]", cooldown)
                 time.sleep(cooldown)
     else:
-        # Sequential mode (default)
+        # Sequential mode (default). If the dependency graph has any wave
+        # wider than one task, suggest --parallel once up-front so the user
+        # knows the throughput win exists.
+        seq_groups = find_parallel_groups(ordered_specs)
+        max_wave = max((len(g) for g in seq_groups), default=0)
+        if max_wave > 1:
+            log.info(
+                "Hint: dependency graph has a wave of %d independent tasks — "
+                "use 'make parallel' or --parallel to run them concurrently.",
+                max_wave,
+            )
         for i, spec in enumerate(ordered_specs):
             outcome = run_task(spec, default_branch, state, specs_by_name=specs_by_name, resume=args.resume)
             results[outcome].append(spec["task_name"])
