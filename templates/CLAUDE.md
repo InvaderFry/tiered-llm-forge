@@ -1,7 +1,9 @@
 # CLAUDE.md — Tiered LLM Coding Workflow Instructions
 
 This project uses an automated pipeline (`python3 -m orchestrator`) that feeds
-spec files to cheap models (Qwen3 32B → Kimi K2 → Llama 4 Scout → GPT-OSS 120B).
+spec files through escalating model tiers:
+**Qwen3 32B → Kimi K2 → Llama 4 Scout → GPT-OSS 120B → Gemini 3 Flash → Gemini 2.5 Flash**
+
 Your job during planning is to produce **files on disk** that the pipeline can
 execute without further human input.
 
@@ -117,11 +119,14 @@ task-004  API layer (depends on task-002 + task-003)
 
 Quick version:
 1. Read `specs/task-NNN-name.md` + `forgeLogs/FAILED-task-NNN-name-<timestamp>.log`.
-   The log header now includes a **failure class**
-   (`rate_limit`, `request_too_large`, `collection_error`,
-   `missing_symbol`, `assertion`, `timeout`, `regression_guard`,
-   `merge_conflict`, `unknown`) and the list of models tried —
-   use these to pick the right fix before reading the full output.
+   The log header includes a **failure class**
+   (`rate_limit`, `gemini_quota_exhausted`, `request_too_large`,
+   `collection_error`, `missing_symbol`, `assertion`, `timeout`,
+   `regression_guard`, `merge_conflict`, `unknown`) and the list of
+   models tried — use these to pick the right fix before reading the
+   full output. If you see `gemini_quota_exhausted`, the Gemini tier
+   was already attempted but had no daily quota remaining; this is not
+   a code bug — the implementation just needs a human fix.
 2. `git checkout task/task-NNN-name` (the branch is already stacked
    on its dependencies, so upstream code is present).
 3. Diagnose: bad spec or bad implementation?
@@ -140,10 +145,12 @@ the integration branch revealed a cross-task problem. Two classes:
   reshaping the dependency graph (stack the conflicting tasks instead
   of fanning them into a merge) or by editing the conflicting task's
   spec so it does not collide.
-- **Test failure:** the `integration/run-*` branch is kept on disk.
-  Check it out, reproduce with `pytest tests/`, then fix the
-  regression on the **task branch** (not the integration branch). The
-  orchestrator rebuilds a fresh integration branch on the next run.
+- **Test failure:** the orchestrator automatically tried Gemini to fix
+  the failure before writing the log. If you see this log, Gemini also
+  failed or had its quota exhausted. The `integration/run-*` branch is
+  kept on disk. Check it out, reproduce with `pytest tests/`, then fix
+  the regression on the **task branch** (not the integration branch).
+  The orchestrator rebuilds a fresh integration branch on the next run.
 
 ---
 

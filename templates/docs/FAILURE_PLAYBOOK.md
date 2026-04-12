@@ -2,13 +2,14 @@
 
 This playbook covers two failure modes:
 
-1. **Per-task failure** — `forgeLogs/FAILED-task-NNN-name-<timestamp>.log` exists. The
-   primary tier **and** the escalation tier both failed after their full
-   retry budget on a single task.
+1. **Per-task failure** — `forgeLogs/FAILED-task-NNN-name-<timestamp>.log` exists.
+   The primary tier, the escalation tier, **and** the Gemini tier all failed
+   (or had their daily quota exhausted) after their full retry budget on a
+   single task.
 2. **Integration gate failure** — `forgeLogs/INTEGRATION-FAILED-<timestamp>.log` exists.
    All tasks individually passed, but combining them on
    `integration/run-<timestamp>` hit a merge conflict or a full-suite
-   regression. Jump to *Integration gate failures* below.
+   regression that Gemini could not fix. Jump to *Integration gate failures* below.
 
 ---
 
@@ -39,6 +40,7 @@ Use the failure class to pick a strategy before reading the body:
 | Class | What it usually means | First move |
 |---|---|---|
 | `rate_limit` | Groq throttled every tier | Wait, re-run — not a code bug |
+| `gemini_quota_exhausted` | Gemini daily quota hit before it could fix | Wait until midnight UTC, or fix with Claude now |
 | `request_too_large` | Spec exceeds the model's TPM cap | Split the spec into smaller tasks |
 | `collection_error` | pytest could not even import the test file | Fix imports or missing module in target file |
 | `missing_symbol` | `ImportError` / `AttributeError` / `NameError` | Add the symbol the test expects, or fix the spec signature |
@@ -49,13 +51,13 @@ Use the failure class to pick a strategy before reading the body:
 | `unknown` | No rule matched | Read the full log |
 
 You can also run `cat pipeline-state.json` and look at the task entry
-for its recorded `model`, `models_tried`, `duration_seconds`,
-`tokens_sent`, `tokens_received`, `cost_usd`, `base_branch`, and
-`base_sha`. `base_branch` tells you which branch the task was stacked
-on — useful when diagnosing dependency ordering bugs. The token /
-cost fields tell you whether a failed task was cheap or expensive,
-and the FAILED log header now repeats the same totals for each
-escalation.
+for its recorded `model`, `models_tried`, `llm_fail_reasons`,
+`duration_seconds`, `tokens_sent`, `tokens_received`, `cost_usd`,
+`base_branch`, and `base_sha`. `llm_fail_reasons` lists any
+automated-tier-level signals (e.g. `gemini_quota_exhausted`) that
+explain why the pipeline stopped before reaching Claude. `base_branch`
+tells you which branch the task was stacked on — useful when diagnosing
+dependency ordering bugs.
 
 ### 3. Get on the branch
 ```bash
@@ -152,6 +154,11 @@ Do **not** try to fix the merge conflict by hand on an ad-hoc branch —
 the orchestrator will throw it away on the next run.
 
 ### Case B — Tests failed on the combined branch
+
+The orchestrator automatically attempted a Gemini fix before writing the
+failure log. If Gemini succeeded, the gate passed and this log does not
+exist. If you are reading this, Gemini either failed or had its daily quota
+exhausted (the log will say which).
 
 The full pytest output is in the log and the `integration/run-*`
 branch is left on disk so you can reproduce.

@@ -15,6 +15,19 @@ tiers:
       - groq/openai/gpt-oss-120b
     retries: 2
 
+  # Gemini tier: tried after escalation, before flagging for Claude review.
+  # Requires GEMINI_API_KEY=<your-key> in .env (never committed).
+  # Aider/LiteLLM picks the key up automatically via the gemini/ provider prefix.
+  # Daily quota exhaustion causes immediate model-skip (no sleep), then falls
+  # through to Claude review if both models are exhausted for the day.
+  # NOTE: gemini/gemini-3.0-flash is a placeholder — verify the LiteLLM model ID
+  # once Gemini 3 Flash is confirmed available.
+  - name: gemini
+    models:
+      - gemini/gemini-3.0-flash       # Gemini 3 Flash (primary)
+      - gemini/gemini-2.5-flash       # Gemini 2.5 Flash fallback
+    retries: 1                         # One attempt per model; daily quota errors skip, not retry
+
 # Weak model for commit messages and safe operations (low token cost)
 weak_model: groq/llama-3.1-8b-instant
 

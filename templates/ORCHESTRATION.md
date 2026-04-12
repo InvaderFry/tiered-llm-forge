@@ -28,12 +28,12 @@ nano .env
 
 ```env
 GROQ_API_KEY=your-groq-key-here
-# GOOGLE_API_KEY=your-google-ai-studio-key-here   # optional
+GEMINI_API_KEY=your-gemini-key-here
 ```
 
 Get keys from:
 - **Groq:** https://console.groq.com → API Keys
-- **Google AI Studio (optional):** https://aistudio.google.com → Get API Key
+- **Google AI Studio (Gemini):** https://aistudio.google.com → Get API Key
 
 > `.env` is in `.gitignore` — it will never be committed.
 
@@ -128,8 +128,10 @@ The orchestrator processes each spec in dependency order:
    upstream interfaces instead of guessing from the spec alone.
 3. Tries all primary tier models with fallback (3 attempts).
 4. Escalates to the escalation tier if primary fails (2 attempts).
-5. Writes `forgeLogs/FAILED-task-NNN-name-<timestamp>.log` (tagged with a
-   failure class) if all attempts fail.
+5. If both tiers exhaust, tries the **Gemini tier** (Gemini 3 Flash → 2.5 Flash,
+   1 attempt each). Skips gracefully when the daily API quota is exhausted.
+6. Writes `forgeLogs/FAILED-task-NNN-name-<timestamp>.log` (tagged with a
+   failure class) if all automated tiers fail.
 6. Records per-task model, duration, attempts, base SHA, and failure class
    in `pipeline-state.json`.
 7. Returns to default branch, moves to next task.
@@ -183,16 +185,26 @@ is never slower than sequential for fully linear dependency chains.
 
 ### Model routing
 
-Models are configured in `models.yaml`. Default tiers:
+Models are configured in `models.yaml`. Default tiers, tried in order:
 
-| Tier | Models | When used |
-|------|--------|-----------|
-| Primary | Qwen3 32B → Kimi K2 → Llama 4 Scout | Normal tasks, fallback on rate limit |
-| Escalation | GPT-OSS 120B | After primary tier exhausted |
+| Tier | Models | Trigger | API key |
+|------|--------|---------|---------|
+| Primary | Qwen3 32B → Kimi K2 → Llama 4 Scout | Every task, 3 attempts | `GROQ_API_KEY` |
+| Escalation | GPT-OSS 120B | Primary exhausted, 2 attempts | `GROQ_API_KEY` |
+| Gemini | Gemini 3 Flash → 2.5 Flash | Escalation exhausted, 1 attempt each | `GEMINI_API_KEY` |
+
+The Gemini tier uses **daily quota** semantics: if a model's free-tier quota is
+exhausted for the day, it is skipped immediately (no sleep) and the next model
+is tried. When both Gemini models are exhausted, the task is flagged for Claude
+review and a note is printed at the end of the run.
 
 ---
 
 ## Phase 6: Fix Failures with Claude
+
+The pipeline automatically tries every automated tier (primary → escalation →
+Gemini) before flagging a task for human review. If you see failures, they have
+already exhausted all automated options.
 
 ```bash
 ls forgeLogs/FAILED-*.log    # check for failures
@@ -202,6 +214,10 @@ claude
 ```
 Fix the failures.
 ```
+
+If the summary noted `Gemini daily quota was exhausted`, the Gemini tier was
+attempted but had no quota remaining. Retry tomorrow for a free automated
+retry, or fix with Claude now — both paths work.
 
 Claude reads the failure logs, diagnoses root cause, fixes on the task branch,
 and confirms tests pass. Then re-run:
@@ -232,9 +248,11 @@ Outcomes:
   with the offending task branch and deletes the integration branch. Resolve
   by reworking the spec's dependency graph or the conflicting task,
   then re-run `make run`.
-- **Tests failed on the combined branch:** writes
-  `forgeLogs/INTEGRATION-FAILED-<timestamp>.log` with the full pytest output and
-  **keeps** the integration branch so you can reproduce the failure
+- **Tests failed on the combined branch:** the Gemini tier automatically
+  attempts to fix the failure. If Gemini fixes it, the integration gate
+  proceeds as successful. If Gemini cannot fix it (or quota is exhausted),
+  writes `forgeLogs/INTEGRATION-FAILED-<timestamp>.log` with the full pytest
+  output and **keeps** the integration branch so you can reproduce the failure
   with `git checkout integration/run-<timestamp>` and iterate.
 
 The integration gate is skipped if any task in the current run failed.
@@ -311,6 +329,18 @@ Phase 8; a failed gate writes `forgeLogs/INTEGRATION-FAILED-<timestamp>.log`.
 **Aider can't find Groq models**
 → Run `export $(cat .env | grep -v '#' | xargs)` first.
 
+**Gemini tier skipped / not attempted**
+→ Check that `GEMINI_API_KEY` is set in `.env` and exported. The Gemini tier
+requires this key; if it is missing, Aider returns an auth error and the tier
+is marked as failed (not quota-exhausted), which still triggers Claude review.
+
+**"Gemini daily quota was exhausted" in the summary**
+→ The free Gemini API tier has a daily request cap that resets at midnight UTC.
+The orchestrator already skipped the exhausted models cleanly. Options:
+- **Wait and retry:** re-run tomorrow once the quota resets.
+- **Fix with Claude now:** the failure logs contain everything Claude needs.
+- **Upgrade:** use a paid Gemini API plan to remove the daily cap.
+
 **pytest can't import src modules**
 → Make sure `src/__init__.py` exists and you're running pytest from the project root.
 
@@ -344,10 +374,12 @@ that both depend on, or add one of them as a dependency of the other so
 they no longer run in parallel. Then `make run`.
 
 **Integration gate failed the test suite**
-→ The `integration/run-*` branch is kept on disk. `git checkout` it, run
-`pytest tests/` to reproduce, fix the cross-task regression on the
-offending task branch (not the integration branch), and `make run`.
-The orchestrator will rebuild a fresh integration branch on the next pass.
+→ The Gemini tier was already attempted automatically. If it also failed (or
+quota was exhausted), the `integration/run-*` branch is kept on disk.
+`git checkout` it, run `pytest tests/` to reproduce, fix the cross-task
+regression on the offending task branch (not the integration branch), and
+`make run`. The orchestrator will rebuild a fresh integration branch on the
+next pass.
 
 **I want to see per-model stats, costs, and failure classes**
 → `cat pipeline-state.json` — each task records `model`, `models_tried`,

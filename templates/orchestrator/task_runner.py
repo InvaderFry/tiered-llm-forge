@@ -21,6 +21,7 @@ from .model_router import (
     run_with_tier_fallback,
     is_request_too_large,
     clear_request_too_large,
+    all_gemini_quota_exhausted,
 )
 from .runner import run_tests, file_size, check_regression
 from .state import save_state, record_task, record_attempt, get_resume_point
@@ -155,21 +156,26 @@ def _run_tier_attempts(
 
 
 def _compute_resume_starts(resume_point):
-    """Return (skip_primary, primary_start, escalation_start) from a resume point.
+    """Return (skip_primary, primary_start, escalation_start, skip_gemini) from a resume point.
 
     Given the last recorded attempt, compute which tier and attempt index to
-    start from. Returns defaults (False, 1, 1) for a fresh run (no resume_point).
+    start from. Returns defaults (False, 1, 1, False) for a fresh run.
 
     Examples:
-      - resume_point=None           -> (False, 1, 1)   fresh run
-      - last attempt=primary#2      -> (False, 3, 1)   continue primary from #3
-      - last attempt=escalation#1   -> (True,  1, 2)   skip primary, escalation from #2
+      - resume_point=None           -> (False, 1, 1, False)  fresh run
+      - last attempt=primary#2      -> (False, 3, 1, False)  continue primary from #3
+      - last attempt=escalation#1   -> (True,  1, 2, False)  skip primary, escalation from #2
+      - last attempt=gemini#1       -> (True,  1, 1, True)   all tiers done; fall to Stage 3
     """
     if not resume_point:
-        return False, 1, 1
+        return False, 1, 1, False
+    if resume_point["tier"] == "gemini":
+        # All prior tiers were exhausted in the previous run; skip them all
+        # so --resume falls straight to Stage 3 (Claude review).
+        return True, 1, 1, True
     if resume_point["tier"] == "escalation":
-        return True, 1, resume_point["attempt"] + 1
-    return False, resume_point["attempt"] + 1, 1
+        return True, 1, resume_point["attempt"] + 1, False
+    return False, resume_point["attempt"] + 1, 1, False
 
 
 def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
@@ -365,7 +371,7 @@ def _run_task_body(
     }
 
     # On resume, determine where to start: skip tiers/attempts already done
-    skip_primary, primary_start, escalation_start = _compute_resume_starts(resume_point)
+    skip_primary, primary_start, escalation_start, skip_gemini = _compute_resume_starts(resume_point)
 
     first_model = primary_tier["models"][0]
 
@@ -404,6 +410,39 @@ def _run_task_body(
     if result == "passed":
         return "passed"
 
+    # --- Stage 2.5: Gemini tier ---
+    # Tried after escalation, before flagging for Claude review.
+    # Each model gets retries=1 attempt. Daily quota exhaustion skips that
+    # model immediately; if all Gemini models are exhausted, we fall through
+    # to Stage 3 and notify the user that Gemini was also unavailable.
+    try:
+        gemini_tier = get_tier("gemini")
+    except ValueError:
+        gemini_tier = None
+
+    if gemini_tier and not skip_gemini:
+        log.info("Stage 2.5: Gemini tier (%d attempt(s) per model)", gemini_tier["retries"])
+
+        def gemini_message(_attempt):
+            _, test_output = run_tests(test_file, cwd=cwd)
+            return (
+                f"Previous models failed. Tests output:\n{_strip_urls(test_output)}\n"
+                f"Analyze carefully and fix."
+            )
+
+        result = _run_tier_attempts(
+            "gemini", 1, gemini_message,
+            target_file, test_file, read_files, cwd,
+            task_name, state, worktree, default_branch,
+            None, ctx, _elapsed, start_point, base_sha,
+        )
+        if result == "passed":
+            return "passed"
+
+        if all_gemini_quota_exhausted():
+            ctx["llm_fail_reasons"].append("gemini_quota_exhausted")
+            log.warning("  [Gemini tier: all models daily-quota-exhausted]")
+
     # --- Stage 3: Flag for Claude review ---
     _, test_output = run_tests(test_file, cwd=cwd)
     failure_label = classify_failure(test_output)
@@ -414,9 +453,11 @@ def _run_task_body(
         f"LLM failure reason: {', '.join(ctx['llm_fail_reasons'])}\n"
         if ctx["llm_fail_reasons"] else ""
     )
+    gemini_note = f"+ gemini ({gemini_tier['retries']}x) " if gemini_tier else ""
     fail_log.write_text(
-        f"Failed after primary tier ({primary_tier['retries']}x) "
-        f"+ escalation ({escalation_tier['retries']}x).\n"
+        f"Failed after primary ({primary_tier['retries']}x) "
+        f"+ escalation ({escalation_tier['retries']}x) "
+        f"{gemini_note}all exhausted.\n"
         f"Failure class: {failure_label}\n"
         f"{llm_context}"
         f"Models tried: {', '.join(ctx['models_tried']) or 'none'}\n"
@@ -435,6 +476,7 @@ def _run_task_body(
         duration_seconds=_elapsed(),
         models_tried=ctx["models_tried"],
         failure_class=failure_label,
+        llm_fail_reasons=ctx["llm_fail_reasons"],
         base_branch=start_point,
         base_sha=base_sha,
         tokens_sent=ctx["task_stats"]["tokens_sent"],

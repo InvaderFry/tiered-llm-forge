@@ -17,6 +17,7 @@ and copy of all the workflow files.
 
 - [Aider](https://aider.chat) installed and on your PATH
 - A [Groq API key](https://console.groq.com)
+- A [Google AI Studio / Gemini API key](https://aistudio.google.com) (free tier; used for the Gemini fix tier)
 - Python 3.10+ with `python3-venv` (`sudo apt install python3-venv` on Debian/Ubuntu)
 
 ---
@@ -42,7 +43,7 @@ From here, follow the workflow in that project's `ORCHESTRATION.md`.
 ## Daily workflow (inside the generated project)
 
 ```
-1.  Edit .env — add your GROQ_API_KEY (first time only)
+1.  Edit .env — add GROQ_API_KEY and GEMINI_API_KEY (first time only)
 2.  export $(cat .env | grep -v '#' | xargs)
 3.  claude
     > "I want to build [feature]. Generate the specs and tests."
@@ -56,9 +57,9 @@ From here, follow the workflow in that project's `ORCHESTRATION.md`.
     > "Review the task branches and merge them."
 ```
 
-The pipeline (step 6) uses zero Claude tokens — it runs on free Groq models
-via Aider. Claude is only used for planning (step 3) and fixing hard failures
-(step 7).
+The pipeline (step 6) uses zero Claude tokens — it runs on Groq models and
+Gemini via Aider. Claude is only used for planning (step 3) and fixing failures
+that exhaust all automated tiers (step 7).
 
 ---
 
@@ -76,18 +77,22 @@ dependency order:
    upstream types and signatures, not just the isolated target file.
 3. Tries primary tier models with automatic fallback (3 attempts).
 4. Escalates to the escalation tier if primary fails (2 attempts).
-5. Writes `specs/FAILED-task-NNN-name.log` tagged with a failure class
-   (`rate_limit`, `assertion`, `missing_symbol`, etc.) if all attempts fail.
+5. If both tiers exhaust, tries the **Gemini tier** (Gemini 3 Flash → 2.5 Flash)
+   as a last automated attempt. If Gemini's daily API quota is exhausted for
+   all models, skips gracefully.
+6. Writes `forgeLogs/FAILED-task-NNN-name-<timestamp>.log` tagged with a failure
+   class (`rate_limit`, `assertion`, `gemini_quota_exhausted`, etc.) if all
+   automated tiers fail.
 6. Records per-task model, duration, attempts, and failure class in
    `pipeline-state.json` for crash recovery and observability.
 7. Returns to the default branch, moves to next task.
 
 After every task passes, an **integration gate** assembles
 `integration/run-<timestamp>` by merging each task branch in dependency
-order and runs the full pytest suite against the combined result. Only a
-clean integration branch is considered ready for human merge review; any
-merge conflict or cross-task regression writes
-`specs/INTEGRATION-FAILED.log` and blocks the merge step.
+order and runs the full pytest suite against the combined result. On test
+failure, the Gemini tier automatically attempts a fix before writing a
+failure log. Only a clean integration branch is considered ready for human
+merge review.
 
 Re-running is safe — passing branches are skipped, failing branches go straight
 to Claude review. Pipeline state persists across crashes.
@@ -98,8 +103,15 @@ wave's tasks simultaneously in isolated git worktrees. This trades disk space
 and log readability for faster wall-clock time — see `ORCHESTRATION.md` for
 the full trade-off discussion.
 
-Model configuration lives in a single `models.yaml` file. Add new providers
-(Google AI Studio, etc.) by adding model names to the appropriate tier.
+Model configuration lives in a single `models.yaml` file. Three tiers run in
+sequence; adding models to a tier or changing their order is the only config
+needed to change routing behaviour.
+
+| Tier | Models | Trigger |
+|------|--------|---------|
+| Primary | Qwen3 32B → Kimi K2 → Llama 4 Scout | Every task, first |
+| Escalation | GPT-OSS 120B | Primary exhausted |
+| Gemini | Gemini 3 Flash → Gemini 2.5 Flash | Escalation exhausted; requires `GEMINI_API_KEY` |
 
 ---
 

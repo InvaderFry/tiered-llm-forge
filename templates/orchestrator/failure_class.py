@@ -14,6 +14,9 @@ A small set of keyword rules is enough to distinguish the common buckets:
 """
 
 _RULES = [
+    # gemini_quota_exhausted must precede rate_limit — RESOURCE_EXHAUSTED messages
+    # can also match the generic rate-limit needles.
+    ("gemini_quota_exhausted", ("RESOURCE_EXHAUSTED", "daily quota", "Quota exceeded")),
     ("rate_limit", ("rate_limit_exceeded", "Rate limit reached", "429")),
     ("request_too_large", ("Request too large",)),
     ("regression_guard", ("REGRESSION GUARD",)),

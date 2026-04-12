@@ -1,14 +1,90 @@
 """Integration gate: assemble passing branches and run the full test suite."""
 
+import re as _re
 from datetime import datetime, timezone
 
 from . import FORGE_LOGS_DIR
+from .config import get_tier
 from .git_ops import branch_exists, checkout, merge_branch, delete_branch
 from .log import get_logger
+from .model_router import run_with_tier_fallback, all_gemini_quota_exhausted
 from .runner import run_full_suite
 from .state import save_state
 
 log = get_logger("integration")
+
+# ---------------------------------------------------------------------------
+# Gemini fix helpers
+# ---------------------------------------------------------------------------
+
+_TRACEBACK_SRC_RE = _re.compile(r"(src/[^\s:]+\.py)")
+
+
+def _extract_failing_src_files(test_output: str, fallback=None) -> list:
+    """Extract up to 5 unique src/ paths from a pytest traceback.
+
+    pytest --tb=short prints lines like ``src/models/user.py:42: in fn``.
+    We collect paths in first-seen order (correlates with the deepest call
+    site). Falls back to ``fallback`` list when nothing is found, then to
+    ``src/__init__.py`` as a stub so aider always gets a valid --file arg.
+    """
+    seen, seen_set = [], set()
+    for m in _TRACEBACK_SRC_RE.finditer(test_output):
+        p = m.group(1)
+        if p not in seen_set:
+            seen_set.add(p)
+            seen.append(p)
+            if len(seen) >= 5:
+                break
+    if not seen and fallback:
+        seen = list(fallback)[:1]
+    return seen or ["src/__init__.py"]
+
+
+def _attempt_gemini_integration_fix(test_output: str, passed_task_names: list) -> bool:
+    """Attempt to fix integration test failures using the Gemini tier.
+
+    Runs on the currently checked-out branch (the integration branch).
+    Returns True if the full test suite passes after Gemini's fix attempt,
+    False otherwise (including when daily quota is exhausted for all models).
+    """
+    try:
+        get_tier("gemini")
+    except ValueError:
+        log.info("  [integration Gemini fix: gemini tier not configured -- skipping]")
+        return False
+
+    if all_gemini_quota_exhausted():
+        log.warning("  [integration Gemini fix: all models daily-quota-exhausted]")
+        return False
+
+    target_files = _extract_failing_src_files(test_output)
+    primary_target = target_files[0]
+    read_files = target_files[1:]
+
+    message = (
+        f"Integration test suite failed. pytest output:\n{test_output}\n\n"
+        f"Fix the source files to make all tests pass. "
+        f"Focus on {primary_target}. Do not modify test files."
+    )
+    log.info("  [integration] trying Gemini fix (target: %s)...", primary_target)
+    success, model_used, _ = run_with_tier_fallback(
+        "gemini", message, primary_target, read_files=read_files,
+    )
+    if not success:
+        if all_gemini_quota_exhausted():
+            log.warning("  [integration Gemini fix: all models daily-quota-exhausted after attempt]")
+        else:
+            log.warning("  [integration Gemini fix: model returned failure]")
+        return False
+
+    log.info("  [integration] Gemini fix committed by %s -- re-running full suite...", model_used)
+    passed, _ = run_full_suite("tests")
+    if passed:
+        log.info("  INTEGRATION PASSED after Gemini fix by %s.", model_used)
+    else:
+        log.warning("  [integration Gemini fix: suite still failing after fix by %s]", model_used)
+    return passed
 
 
 def integration_gate(passed_task_names, default_branch, state):
@@ -79,22 +155,32 @@ def integration_gate(passed_task_names, default_branch, state):
     log.info("  running full test suite on integration branch...")
     passed, output = run_full_suite("tests")
     if not passed:
-        FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = FORGE_LOGS_DIR / f"INTEGRATION-FAILED-{timestamp}.log"
-        log_path.write_text(
-            f"Integration gate failed: full test suite failed on {integration_branch}.\n\n"
-            f"{output}\n"
-        )
-        log.error("  INTEGRATION FAILED (test suite). See %s", log_path)
-        state["integration"] = {
-            "branch": integration_branch,
-            "status": "tests_failed",
-            "timestamp": timestamp,
-        }
-        save_state(state)
-        checkout(default_branch)
-        # Keep the branch around so the human can reproduce the failure
-        return False
+        log.info("  full suite failed -- attempting Gemini fix...")
+        if _attempt_gemini_integration_fix(output, passed_task_names):
+            passed = True  # fall through to the success path below
+        else:
+            gemini_exhausted = all_gemini_quota_exhausted()
+            FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            log_path = FORGE_LOGS_DIR / f"INTEGRATION-FAILED-{timestamp}.log"
+            quota_note = (
+                "\nGemini tier also attempted but daily quota exhausted.\n"
+                if gemini_exhausted else ""
+            )
+            log_path.write_text(
+                f"Integration gate failed: full test suite failed on {integration_branch}.\n"
+                f"{quota_note}\n{output}\n"
+            )
+            log.error("  INTEGRATION FAILED (test suite). See %s", log_path)
+            state["integration"] = {
+                "branch": integration_branch,
+                "status": "tests_failed",
+                "timestamp": timestamp,
+                "gemini_quota_exhausted": gemini_exhausted,
+            }
+            save_state(state)
+            checkout(default_branch)
+            # Keep the branch around so the human can reproduce the failure
+            return False
 
     log.info("  INTEGRATION PASSED: %s is ready to merge.", integration_branch)
     state["integration"] = {

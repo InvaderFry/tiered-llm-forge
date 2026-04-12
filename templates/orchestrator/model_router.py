@@ -34,6 +34,14 @@ _AIDER_TIMEOUT_DEFAULT = 300
 # seconds, shorter than typical between-run gaps.
 # ---------------------------------------------------------------------------
 _next_available_at: dict = {}
+# Daily-quota-exhausted models: process-level, never clears within a run.
+# Keyed by full model name. Different from _next_available_at (which expires
+# after a timed window) and _request_too_large_tls (which is per-task/thread).
+# When a Gemini RESOURCE_EXHAUSTED quota error is seen, the model is added here
+# and all callers skip it immediately without sleeping. Not per-task because
+# "daily quota" means the API key has no budget left regardless of which task
+# is asking. Protected by the same _rate_limit_lock.
+_daily_quota_exhausted: set = set()
 # Request-too-large is per-task and per-thread, not session-wide. A long spec
 # that blows past qwen3's 6k TPM cap must not cause the NEXT task's tiny spec
 # to also skip qwen3. We store the flag on a threading.local so worktree-mode
@@ -101,6 +109,35 @@ def is_request_too_large(model):
         return model in _request_too_large_set()
 
 
+def mark_daily_quota_exhausted(model: str) -> None:
+    """Record that ``model`` has exhausted its daily API quota for this process lifetime.
+
+    Unlike per-minute rate limits, daily quota exhaustion cannot be resolved by
+    sleeping. Callers skip the model immediately without waiting. Thread-safe.
+    """
+    with _rate_limit_lock:
+        _daily_quota_exhausted.add(model)
+
+
+def is_daily_quota_exhausted(model: str) -> bool:
+    """Return True if this model's daily quota is known to be exhausted."""
+    with _rate_limit_lock:
+        return model in _daily_quota_exhausted
+
+
+def all_gemini_quota_exhausted() -> bool:
+    """Return True if every model in the gemini tier has exhausted its daily quota.
+
+    Returns False when the gemini tier is not configured, so callers can
+    unconditionally call this without guarding against missing config.
+    """
+    try:
+        tier = get_tier("gemini")
+    except ValueError:
+        return False
+    return all(is_daily_quota_exhausted(m) for m in tier["models"])
+
+
 def _mark_rate_limited(model, retry_after, buffer=5.0):
     """Record that ``model`` should not be called for ``retry_after`` seconds.
 
@@ -140,6 +177,32 @@ def _parse_retry_after(stderr_text):
     if matches:
         return float(matches[-1])
     return None
+
+
+# Strings that indicate Gemini daily quota exhaustion (not a per-minute window).
+# LiteLLM surfaces the raw gRPC RESOURCE_EXHAUSTED message from the Gemini API.
+_GEMINI_DAILY_QUOTA_STRINGS = (
+    "RESOURCE_EXHAUSTED",
+    "quota exceeded",
+    "daily quota",
+    "Quota exceeded",
+)
+
+
+def _is_daily_quota_error(combined_output: str, retry_after) -> bool:
+    """Return True if output signals a Gemini daily quota exhaustion.
+
+    Distinguishes daily quota from per-minute rate limits: both use the
+    RESOURCE_EXHAUSTED gRPC code, but per-minute 429s always include a
+    "try again in Ns" retry-after field while daily quota errors do not.
+
+    ``retry_after`` is the pre-computed result of ``_parse_retry_after(combined_output)``
+    — the caller computes it once to avoid scanning the string twice.
+    """
+    return (
+        any(s in combined_output for s in _GEMINI_DAILY_QUOTA_STRINGS)
+        and retry_after is None
+    )
 
 
 # Aider stdout reports usage on lines like:
@@ -296,6 +359,18 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
         # Aider exits 0 when it exhausts its own retries on "Request too large"
         # (it creates/touches the file but writes nothing). If we blindly trust
         # returncode == 0 here, run_with_tier_fallback never tries the next model.
+        #
+        # Compute retry_after once — reused by both the daily-quota check and
+        # the per-minute rate-limit handler to avoid scanning combined twice.
+        retry_after = _parse_retry_after(combined)
+
+        # Daily quota exhaustion: quota string present AND no retry-after hint.
+        # No amount of sleeping fixes this — skip the model immediately.
+        if _is_daily_quota_error(combined, retry_after):
+            log.warning("  [Gemini daily quota exhausted for %s -- skipping model]", model)
+            mark_daily_quota_exhausted(model)
+            return False, invocation_stats
+
         if "rate_limit_exceeded" in combined or "Rate limit reached" in combined:
             # "Request too large" means the request itself exceeds the TPM cap —
             # no amount of waiting will help, and it is not a time-based window
@@ -305,7 +380,7 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
                 _mark_request_too_large(model)
                 return False, invocation_stats
 
-            wait = _parse_retry_after(combined)
+            wait = retry_after
             if wait:
                 _mark_rate_limited(model, wait)  # inform future tasks/attempts
                 wait += 5  # buffer for sliding window reset
@@ -352,6 +427,9 @@ def run_with_tier_fallback(tier_name, message, target_file, start_model=None, re
     for model in models:
         if is_request_too_large(model):
             log.info("  Skipping %s -- request too large (already seen this task)", model)
+            continue
+        if is_daily_quota_exhausted(model):
+            log.info("  Skipping %s -- daily quota exhausted", model)
             continue
         log.info("  Trying %s...", model)
         success, stats = run_aider(model, message, target_file, read_files=read_files, cwd=cwd)

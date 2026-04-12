@@ -75,6 +75,23 @@ def print_summary(results, default_branch, state=None):
     if failed:
         log.info("\n%s", "=" * 50)
         log.info("Claude review needed for these failures:")
+
+        # Warn if Gemini daily quota was exhausted for any failed tasks so the
+        # user knows that Gemini was already tried and isn't just unconfigured.
+        if state and state.get("tasks"):
+            gemini_exhausted_count = sum(
+                1 for name in failed
+                if "gemini_quota_exhausted" in (
+                    state["tasks"].get(name, {}).get("llm_fail_reasons") or []
+                )
+            )
+            if gemini_exhausted_count:
+                log.info(
+                    "  Note: Gemini daily quota was exhausted for %d task(s). "
+                    "Retry tomorrow once quota resets, or fix with Claude now.",
+                    gemini_exhausted_count,
+                )
+
         for f in failed:
             logs = sorted(FORGE_LOGS_DIR.glob(f"FAILED-{f}-*.log")) if FORGE_LOGS_DIR.exists() else []
             fail_log = logs[-1] if logs else FORGE_LOGS_DIR / f"FAILED-{f}-[timestamp].log"

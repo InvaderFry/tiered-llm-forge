@@ -65,6 +65,7 @@ def record_task(
     duration_seconds=None,
     models_tried=None,
     failure_class=None,
+    llm_fail_reasons=None,
     base_branch=None,
     base_sha=None,
     tokens_sent=None,
@@ -90,6 +91,8 @@ def record_task(
         entry["models_tried"] = list(models_tried)
     if failure_class is not None:
         entry["failure_class"] = failure_class
+    if llm_fail_reasons is not None:
+        entry["llm_fail_reasons"] = list(llm_fail_reasons)
     if base_branch is not None:
         entry["base_branch"] = base_branch
     if base_sha is not None:
