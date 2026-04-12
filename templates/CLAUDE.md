@@ -230,15 +230,15 @@ project-root/
 │   ├── spec_parser.py      ← frontmatter + validation + topo sort
 │   ├── model_router.py     ← model selection + rate limit handling
 │   ├── runner.py           ← per-task + full-suite test execution
-│   ├── git_ops.py          ← branch management, stacking, merging
-│   ├── task_runner.py      ← per-task orchestration + model escalation
+│   ├── git_ops.py          ← pure-git: branch management, stacking, merging
+│   ├── task_runner.py      ← per-task orchestration, model escalation, regression revert
 │   ├── integration.py      ← integration gate (merge + full suite)
 │   ├── summary.py          ← pipeline run summary + observability
 │   ├── parallel.py         ← concurrent task execution via worktrees + thread pool
 │   ├── log.py              ← logging config (console + forgeLogs/orchestrator-<timestamp>.log)
 │   ├── failure_class.py    ← classifies pytest/aider output
 │   └── state.py            ← pipeline-state.json persistence
-├── models.yaml             ← model config (single source of truth)
+├── models.yaml             ← model config (tiers, timeouts, cooldown — single source of truth)
 ├── .aider.conf.yml         ← Aider defaults
 ├── .env                    ← API keys (never committed)
 ├── specs/

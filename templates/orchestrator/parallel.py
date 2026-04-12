@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .log import get_logger
-from .git_ops import branch_exists, GIT_TIMEOUT
+from .git_ops import branch_exists, GIT_TIMEOUT, resolve_dependency_base
 
 log = get_logger("parallel")
 
@@ -15,38 +15,28 @@ log = get_logger("parallel")
 def find_parallel_groups(ordered_specs):
     """Partition topologically-sorted specs into groups that can run concurrently.
 
-    Two tasks can run in parallel if neither depends on the other. We walk the
-    dependency order and group tasks into "waves": each wave contains tasks
-    whose dependencies are all in previous waves.
+    Two tasks can run in parallel if neither depends on the other. Each task is
+    placed in the *earliest* wave where all its dependencies are in prior waves.
+    This is a single-pass O(n) algorithm: for each task, its wave index is one
+    greater than the maximum wave index of its dependencies (or wave 0 if it has
+    none).
 
     Returns a list of lists, where each inner list is a group of spec dicts
     that can execute concurrently.
     """
-    completed = set()
-    groups = []
-
+    wave_of: dict = {}
     for spec in ordered_specs:
-        task_name = spec["task_name"]
-        deps = set(spec.get("dependencies", []) or [])
+        deps = spec.get("dependencies", []) or []
+        w = max((wave_of[d] for d in deps if d in wave_of), default=-1) + 1
+        wave_of[spec["task_name"]] = w
 
-        # Can this task go into the current group?
-        # Only if all its deps are in already-completed waves.
-        if groups and deps <= completed:
-            # Check if it can join the latest group (deps were all in
-            # prior groups, not the current one being built)
-            current_group_names = {s["task_name"] for s in groups[-1]}
-            if deps & current_group_names:
-                # Dependency is in the current group — needs a new wave
-                completed |= current_group_names
-                groups.append([spec])
-            else:
-                groups[-1].append(spec)
-        else:
-            if groups:
-                completed |= {s["task_name"] for s in groups[-1]}
-            groups.append([spec])
+    # Group specs by wave index, preserving topo order within each wave.
+    max_wave = max(wave_of.values(), default=-1)
+    groups: list = [[] for _ in range(max_wave + 1)]
+    for spec in ordered_specs:
+        groups[wave_of[spec["task_name"]]].append(spec)
 
-    return groups
+    return [g for g in groups if g]
 
 
 class WorktreePool:
@@ -100,27 +90,6 @@ class WorktreePool:
         )
 
 
-def _resolve_dependency_base(dependencies, default_branch):
-    """Determine start_point and extra merges for a task's worktree.
-
-    Mirrors the logic in task_runner._resolve_dependency_base but uses
-    branch_exists with no cwd (refs are repo-global).
-    """
-    dep_branches = []
-    for dep in dependencies:
-        dep_branch = f"task/{dep}"
-        if branch_exists(dep_branch):
-            dep_branches.append(dep_branch)
-        else:
-            log.warning("  [dependency '%s' has no branch -- falling back to default]", dep)
-
-    if not dep_branches:
-        return default_branch, []
-    if len(dep_branches) == 1:
-        return dep_branches[0], []
-    return default_branch, dep_branches
-
-
 def _run_task_in_worktree(spec, default_branch, state, run_task_fn, pool,
                           specs_by_name, resume):
     """Set up a worktree for a task, run it, and clean up.
@@ -135,7 +104,7 @@ def _run_task_in_worktree(spec, default_branch, state, run_task_fn, pool,
     branch_name = f"task/{task_name}"
     dependencies = spec.get("dependencies", []) or []
 
-    start_point, _ = _resolve_dependency_base(dependencies, default_branch)
+    start_point, _ = resolve_dependency_base(dependencies, default_branch)
 
     already_exists = branch_exists(branch_name)
     if already_exists:

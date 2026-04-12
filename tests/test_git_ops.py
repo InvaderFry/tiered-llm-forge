@@ -17,8 +17,8 @@ from orchestrator.git_ops import (
     merge_branch,
     delete_branch,
     branch_tip,
-    revert_last_commit,
 )
+from orchestrator.task_runner import revert_last_commit
 
 
 @pytest.fixture

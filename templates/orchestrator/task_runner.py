@@ -1,30 +1,31 @@
 """Per-task orchestration: model escalation, dependency resolution, regression guard."""
 
 import re
+import subprocess
 import time
 from datetime import datetime
 
 from . import FORGE_LOGS_DIR
-from .log import get_logger
-
-log = get_logger("task_runner")
-from .config import get_config, get_tier
-from .model_router import (
-    select_model_for_spec,
-    run_with_tier_fallback,
-    is_request_too_large,
-    clear_request_too_large,
-)
-from .runner import run_tests, file_size, check_regression
+from .config import get_tier
+from .failure_class import classify as classify_failure
 from .git_ops import (
     branch_exists,
     branch_tip,
     checkout,
     merge_branch,
-    revert_last_commit,
+    resolve_dependency_base,
+    GIT_TIMEOUT,
 )
+from .log import get_logger
+from .model_router import (
+    run_with_tier_fallback,
+    is_request_too_large,
+    clear_request_too_large,
+)
+from .runner import run_tests, file_size, check_regression
 from .state import save_state, record_task, record_attempt, get_resume_point
-from .failure_class import classify as classify_failure
+
+log = get_logger("task_runner")
 
 _URL_RE = re.compile(r"https?://\S+")
 
@@ -34,32 +35,141 @@ def _strip_urls(text):
     return _URL_RE.sub("[URL]", text)
 
 
-def _resolve_dependency_base(dependencies, default_branch):
+def revert_last_commit(target_file, baseline_size, cwd=None):
+    """Undo the last commit and log a warning about the regression.
+
+    Lives here (rather than git_ops.py) because it needs ``file_size`` from
+    runner.py; keeping it in git_ops.py would create a runner↔git_ops cycle.
     """
-    Determine the start point for a new task branch based on its dependencies.
+    current = file_size(target_file, cwd=cwd)
+    if baseline_size > 0:
+        pct = int((1 - current / baseline_size) * 100)
+        log.warning(
+            "  [REGRESSION GUARD] %s shrank from %dB to %dB (>%d%% reduction) -- reverting commit.",
+            target_file, baseline_size, current, pct,
+        )
+    else:
+        log.warning(
+            "  [REGRESSION GUARD] %s content failed sanity check -- reverting commit.",
+            target_file,
+        )
+    subprocess.run(["git", "reset", "--hard", "HEAD~1"], check=True, timeout=GIT_TIMEOUT, cwd=cwd)
 
-    - 0 deps   -> default branch
-    - 1 dep    -> that dep's task branch (stacked)
-    - N deps   -> default branch (caller will merge deps in afterwards)
 
-    Returns (start_point, extra_merges) where ``extra_merges`` is the list
-    of dependency branches the caller still needs to merge in after checkout.
-    Any dependency whose branch does not exist is skipped with a warning.
+def _run_tier_attempts(
+    tier_name, start_attempt, message_factory,
+    target_file, test_file, read_files, cwd,
+    task_name, state, worktree, default_branch,
+    start_model, ctx, _elapsed, start_point, base_sha,
+):
+    """Run all attempts for one tier, updating *ctx* in-place.
+
+    Args:
+        tier_name:        "primary" or "escalation".
+        start_attempt:    First attempt number (1-based; may be > retries when resuming a
+                          fully-exhausted tier, in which case the loop body never runs).
+        message_factory:  ``(attempt: int) -> str`` — returns the prompt for each attempt.
+                          The factory is responsible for running tests and building the
+                          "fix the failures" text when needed.
+        ctx:              Mutable dict with keys:
+                          ``baseline_size``, ``total_attempts``, ``models_tried``,
+                          ``task_stats``, ``llm_fail_reasons``.  Updated in-place.
+
+    Returns:
+        ``"passed"`` if any attempt passed tests, ``None`` if the tier was exhausted
+        without a pass (caller should proceed to the next tier or Stage 3).
     """
-    dep_branches = []
-    for dep in dependencies:
-        dep_branch = f"task/{dep}"
-        if branch_exists(dep_branch):
-            dep_branches.append(dep_branch)
-        else:
-            log.warning("  [dependency '%s' has no branch -- falling back to default for that dep]", dep)
+    tier = get_tier(tier_name)
 
-    if not dep_branches:
-        return default_branch, []
-    if len(dep_branches) == 1:
-        return dep_branches[0], []
-    # Multiple deps: start from default and merge each one in
-    return default_branch, dep_branches
+    def _accumulate(stats):
+        if not stats:
+            return
+        ctx["task_stats"]["tokens_sent"] += stats.get("tokens_sent", 0)
+        ctx["task_stats"]["tokens_received"] += stats.get("tokens_received", 0)
+        ctx["task_stats"]["cost_usd"] += stats.get("cost_usd", 0.0)
+
+    for attempt in range(start_attempt, tier["retries"] + 1):
+        ctx["total_attempts"] += 1
+        log.info("  Attempt %d/%d...", attempt, tier["retries"])
+
+        message = message_factory(attempt)
+        head_before = branch_tip("HEAD", cwd=cwd)
+        success, model_used, stats = run_with_tier_fallback(
+            tier_name, message, target_file, start_model,
+            read_files=read_files, cwd=cwd,
+        )
+        _accumulate(stats)
+        if model_used and model_used not in ctx["models_tried"]:
+            ctx["models_tried"].append(model_used)
+        if not success and not model_used and tier_name == "primary":
+            # All models in the tier failed without writing anything —
+            # record why so the Stage 3 log reflects the real cause.
+            primary_models = get_tier("primary")["models"]
+            if all(is_request_too_large(m) for m in primary_models):
+                if "request_too_large" not in ctx["llm_fail_reasons"]:
+                    ctx["llm_fail_reasons"].append("request_too_large")
+
+        head_after = branch_tip("HEAD", cwd=cwd)
+        head_moved = bool(head_after) and head_after != head_before
+        if head_moved and check_regression(target_file, ctx["baseline_size"], cwd=cwd):
+            record_attempt(state, task_name, attempt, tier_name, model_used, success, tests_passed=False)
+            save_state(state)
+            revert_last_commit(target_file, ctx["baseline_size"], cwd=cwd)
+            continue
+        if not head_moved and not success:
+            # Aider never committed — nothing to revert, but also nothing to test.
+            # Move to the next attempt without nuking dependency history.
+            log.info("  [no commit produced by aider -- nothing to revert]")
+            record_attempt(state, task_name, attempt, tier_name, model_used, success, tests_passed=False)
+            save_state(state)
+            continue
+
+        ctx["baseline_size"] = max(ctx["baseline_size"], file_size(target_file, cwd=cwd))
+        passed, _ = run_tests(test_file, cwd=cwd)
+
+        record_attempt(state, task_name, attempt, tier_name, model_used, success, tests_passed=passed)
+        save_state(state)
+
+        if passed:
+            log.info("PASSED (%s, attempt %d): %s", tier_name, attempt, task_name)
+            if not worktree:
+                checkout(default_branch)
+            record_task(
+                state,
+                task_name,
+                "passed",
+                model=model_used,
+                attempts=ctx["total_attempts"],
+                duration_seconds=_elapsed(),
+                models_tried=ctx["models_tried"],
+                base_branch=start_point,
+                base_sha=base_sha,
+                tokens_sent=ctx["task_stats"]["tokens_sent"],
+                tokens_received=ctx["task_stats"]["tokens_received"],
+                cost_usd=ctx["task_stats"]["cost_usd"],
+            )
+            save_state(state)
+            return "passed"
+
+    return None  # tier exhausted without passing
+
+
+def _compute_resume_starts(resume_point):
+    """Return (skip_primary, primary_start, escalation_start) from a resume point.
+
+    Given the last recorded attempt, compute which tier and attempt index to
+    start from. Returns defaults (False, 1, 1) for a fresh run (no resume_point).
+
+    Examples:
+      - resume_point=None           -> (False, 1, 1)   fresh run
+      - last attempt=primary#2      -> (False, 3, 1)   continue primary from #3
+      - last attempt=escalation#1   -> (True,  1, 2)   skip primary, escalation from #2
+    """
+    if not resume_point:
+        return False, 1, 1
+    if resume_point["tier"] == "escalation":
+        return True, 1, resume_point["attempt"] + 1
+    return False, resume_point["attempt"] + 1, 1
 
 
 def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
@@ -111,6 +221,34 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
         f"Do not modify the test file."
     )
 
+    # Safety net: always return to the default branch in sequential mode, even
+    # if an unexpected exception escapes the attempt loops or setup code.
+    # In worktree mode each task has its own isolated working tree so there is
+    # no shared HEAD to restore.
+    try:
+        return _run_task_body(
+            spec, default_branch, state, branch_name, task_name,
+            target_file, test_file, dependencies, implement_message,
+            resume, worktree, branch_preexisted, cwd, models_tried,
+            _elapsed, specs_by_name,
+        )
+    finally:
+        if not worktree:
+            try:
+                checkout(default_branch)
+            except Exception:
+                pass  # best-effort; don't shadow the original exception
+
+
+def _run_task_body(
+    spec, default_branch, state, branch_name, task_name,
+    target_file, test_file, dependencies, implement_message,
+    resume, worktree, branch_preexisted, cwd, models_tried,
+    _elapsed, specs_by_name,
+):
+    """Inner implementation of run_task, separated so run_task can wrap it in
+    a try/finally that guarantees HEAD is restored to default_branch."""
+
     # --- Handle re-run: branch already exists ---
     # In worktree mode the caller tells us whether the branch pre-existed
     # (worktree creation itself creates the branch as a side effect).
@@ -160,7 +298,7 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
 
     # --- Normal first run (or resume): branch from dependency tip(s) ---
     if not resume_point:
-        start_point, extra_merges = _resolve_dependency_base(dependencies, default_branch)
+        start_point, extra_merges = resolve_dependency_base(dependencies, default_branch, cwd=cwd)
     else:
         # Resuming — branch already exists, no need to re-create
         start_point = default_branch
@@ -214,169 +352,57 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
             if dep_spec and dep_spec.get("target"):
                 read_files.append(dep_spec["target"])
 
-    cfg = get_config()
     primary_tier = get_tier("primary")
     escalation_tier = get_tier("escalation")
-    total_attempts = resume_point["total_attempts"] if resume_point else 0
-    task_stats = {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0}
-    llm_fail_reasons: list = []  # LLM-level failure reasons (e.g. "request_too_large")
+
+    # Mutable context shared across both tier loops.
+    ctx = {
+        "baseline_size": baseline_size,
+        "total_attempts": resume_point["total_attempts"] if resume_point else 0,
+        "models_tried": models_tried,
+        "task_stats": {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0},
+        "llm_fail_reasons": [],
+    }
 
     # On resume, determine where to start: skip tiers/attempts already done
-    skip_primary = False
-    primary_start = 1
-    escalation_start = 1
-    if resume_point:
-        if resume_point["tier"] == "escalation":
-            skip_primary = True
-            escalation_start = resume_point["attempt"] + 1
-        else:
-            primary_start = resume_point["attempt"] + 1
+    skip_primary, primary_start, escalation_start = _compute_resume_starts(resume_point)
 
-    def _accumulate(stats):
-        if not stats:
-            return
-        task_stats["tokens_sent"] += stats.get("tokens_sent", 0)
-        task_stats["tokens_received"] += stats.get("tokens_received", 0)
-        task_stats["cost_usd"] += stats.get("cost_usd", 0.0)
+    first_model = primary_tier["models"][0]
 
     # --- Stage 1: Primary tier ---
-    first_model = select_model_for_spec(spec["body"])
     if not skip_primary:
         log.info("Stage 1: Primary tier (%d attempts, starting at %d)", primary_tier["retries"], primary_start)
 
-        for attempt in range(primary_start, primary_tier["retries"] + 1):
-            total_attempts += 1
-            log.info("  Attempt %d/%d...", attempt, primary_tier["retries"])
+        def primary_message(attempt):
+            if attempt == primary_start and not resume_point:
+                return implement_message
+            _, test_output = run_tests(test_file, cwd=cwd)
+            return f"Tests failed. Output:\n{_strip_urls(test_output)}\nFix the code to pass all tests."
 
-            head_before = branch_tip("HEAD", cwd=cwd)
-            if attempt == 1 and not resume_point:
-                success, model_used, stats = run_with_tier_fallback(
-                    "primary", implement_message, target_file, first_model,
-                    read_files=read_files, cwd=cwd,
-                )
-            else:
-                _, test_output = run_tests(test_file, cwd=cwd)
-                success, model_used, stats = run_with_tier_fallback(
-                    "primary",
-                    f"Tests failed. Output:\n{_strip_urls(test_output)}\nFix the code to pass all tests.",
-                    target_file,
-                    first_model,
-                    read_files=read_files,
-                    cwd=cwd,
-                )
-            _accumulate(stats)
-            if model_used and model_used not in models_tried:
-                models_tried.append(model_used)
-            if not success and not model_used:
-                # All models in the tier failed without writing anything —
-                # record why so the Stage 3 log reflects the real cause.
-                primary_models = get_tier("primary")["models"]
-                if all(is_request_too_large(m) for m in primary_models):
-                    if "request_too_large" not in llm_fail_reasons:
-                        llm_fail_reasons.append("request_too_large")
-
-            head_after = branch_tip("HEAD", cwd=cwd)
-            head_moved = bool(head_after) and head_after != head_before
-            if head_moved and check_regression(target_file, baseline_size, cwd=cwd):
-                record_attempt(state, task_name, attempt, "primary", model_used, success, tests_passed=False)
-                save_state(state)
-                revert_last_commit(target_file, baseline_size, cwd=cwd)
-                continue
-            if not head_moved and not success:
-                # Aider never committed — nothing to revert, but also nothing
-                # to test against. Move to the next attempt without nuking
-                # dependency history with git reset --hard HEAD~1.
-                log.info("  [no commit produced by aider -- nothing to revert]")
-                record_attempt(state, task_name, attempt, "primary", model_used, success, tests_passed=False)
-                save_state(state)
-                continue
-
-            baseline_size = max(baseline_size, file_size(target_file, cwd=cwd))
-            passed, _ = run_tests(test_file, cwd=cwd)
-
-            record_attempt(state, task_name, attempt, "primary", model_used, success, tests_passed=passed)
-            save_state(state)
-
-            if passed:
-                log.info("PASSED (Stage 1, attempt %d): %s", attempt, task_name)
-                if not worktree:
-                    checkout(default_branch)
-                record_task(
-                    state,
-                    task_name,
-                    "passed",
-                    model=model_used,
-                    attempts=total_attempts,
-                    duration_seconds=_elapsed(),
-                    models_tried=models_tried,
-                    base_branch=start_point,
-                    base_sha=base_sha,
-                    tokens_sent=task_stats["tokens_sent"],
-                    tokens_received=task_stats["tokens_received"],
-                    cost_usd=task_stats["cost_usd"],
-                )
-                save_state(state)
-                return "passed"
+        result = _run_tier_attempts(
+            "primary", primary_start, primary_message,
+            target_file, test_file, read_files, cwd,
+            task_name, state, worktree, default_branch,
+            first_model, ctx, _elapsed, start_point, base_sha,
+        )
+        if result == "passed":
+            return "passed"
 
     # --- Stage 2: Escalation tier ---
     log.info("Stage 2: Escalation (%d attempts, starting at %d)", escalation_tier["retries"], escalation_start)
 
-    for attempt in range(escalation_start, escalation_tier["retries"] + 1):
-        total_attempts += 1
-        log.info("  Attempt %d/%d...", attempt, escalation_tier["retries"])
-
+    def escalation_message(_attempt):
         _, test_output = run_tests(test_file, cwd=cwd)
-        head_before = branch_tip("HEAD", cwd=cwd)
-        success, model_used, stats = run_with_tier_fallback(
-            "escalation",
-            f"Previous model failed. Tests output:\n{_strip_urls(test_output)}\nAnalyze carefully and fix.",
-            target_file,
-            read_files=read_files,
-            cwd=cwd,
-        )
-        _accumulate(stats)
-        if model_used and model_used not in models_tried:
-            models_tried.append(model_used)
+        return f"Previous model failed. Tests output:\n{_strip_urls(test_output)}\nAnalyze carefully and fix."
 
-        head_after = branch_tip("HEAD", cwd=cwd)
-        head_moved = bool(head_after) and head_after != head_before
-        if head_moved and check_regression(target_file, baseline_size, cwd=cwd):
-            record_attempt(state, task_name, attempt, "escalation", model_used, success, tests_passed=False)
-            save_state(state)
-            revert_last_commit(target_file, baseline_size, cwd=cwd)
-            continue
-        if not head_moved and not success:
-            log.info("  [no commit produced by aider -- nothing to revert]")
-            record_attempt(state, task_name, attempt, "escalation", model_used, success, tests_passed=False)
-            save_state(state)
-            continue
-
-        baseline_size = max(baseline_size, file_size(target_file, cwd=cwd))
-        passed, test_output = run_tests(test_file, cwd=cwd)
-
-        record_attempt(state, task_name, attempt, "escalation", model_used, success, tests_passed=passed)
-        save_state(state)
-
-        if passed:
-            log.info("PASSED (Escalation, attempt %d): %s", attempt, task_name)
-            if not worktree:
-                checkout(default_branch)
-            record_task(
-                state,
-                task_name,
-                "passed",
-                model=model_used,
-                attempts=total_attempts,
-                duration_seconds=_elapsed(),
-                models_tried=models_tried,
-                base_branch=start_point,
-                base_sha=base_sha,
-                tokens_sent=task_stats["tokens_sent"],
-                tokens_received=task_stats["tokens_received"],
-                cost_usd=task_stats["cost_usd"],
-            )
-            save_state(state)
-            return "passed"
+    result = _run_tier_attempts(
+        "escalation", escalation_start, escalation_message,
+        target_file, test_file, read_files, cwd,
+        task_name, state, worktree, default_branch,
+        None, ctx, _elapsed, start_point, base_sha,
+    )
+    if result == "passed":
+        return "passed"
 
     # --- Stage 3: Flag for Claude review ---
     _, test_output = run_tests(test_file, cwd=cwd)
@@ -385,16 +411,17 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
     _ts = datetime.now().strftime("%Y%m%dT%H%M%S")
     fail_log = FORGE_LOGS_DIR / f"FAILED-{task_name}-{_ts}.log"
     llm_context = (
-        f"LLM failure reason: {', '.join(llm_fail_reasons)}\n" if llm_fail_reasons else ""
+        f"LLM failure reason: {', '.join(ctx['llm_fail_reasons'])}\n"
+        if ctx["llm_fail_reasons"] else ""
     )
     fail_log.write_text(
         f"Failed after primary tier ({primary_tier['retries']}x) "
         f"+ escalation ({escalation_tier['retries']}x).\n"
         f"Failure class: {failure_label}\n"
         f"{llm_context}"
-        f"Models tried: {', '.join(models_tried) or 'none'}\n"
-        f"Tokens (sent/received): {task_stats['tokens_sent']} / {task_stats['tokens_received']}\n"
-        f"Cost: ${task_stats['cost_usd']:.4f}\n\n"
+        f"Models tried: {', '.join(ctx['models_tried']) or 'none'}\n"
+        f"Tokens (sent/received): {ctx['task_stats']['tokens_sent']} / {ctx['task_stats']['tokens_received']}\n"
+        f"Cost: ${ctx['task_stats']['cost_usd']:.4f}\n\n"
         f"{test_output}"
     )
     log.warning("ESCALATE TO CLAUDE: %s (failure_class=%s)", task_name, failure_label)
@@ -404,15 +431,15 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
         state,
         task_name,
         "failed",
-        attempts=total_attempts,
+        attempts=ctx["total_attempts"],
         duration_seconds=_elapsed(),
-        models_tried=models_tried,
+        models_tried=ctx["models_tried"],
         failure_class=failure_label,
         base_branch=start_point,
         base_sha=base_sha,
-        tokens_sent=task_stats["tokens_sent"],
-        tokens_received=task_stats["tokens_received"],
-        cost_usd=task_stats["cost_usd"],
+        tokens_sent=ctx["task_stats"]["tokens_sent"],
+        tokens_received=ctx["task_stats"]["tokens_received"],
+        cost_usd=ctx["task_stats"]["cost_usd"],
     )
     save_state(state)
     return "failed"

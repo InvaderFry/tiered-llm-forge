@@ -1,9 +1,8 @@
-"""Git operations for branch management and regression reverting."""
+"""Git operations for branch management."""
 
 import subprocess
 from pathlib import Path
 
-from .runner import file_size
 from .log import get_logger
 
 log = get_logger("git_ops")
@@ -146,18 +145,31 @@ def branch_tip(branch_name, cwd=None):
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def revert_last_commit(target_file, baseline_size, cwd=None):
-    """Undo the last commit and print a warning about the regression."""
-    current = file_size(target_file, cwd=cwd)
-    if baseline_size > 0:
-        pct = int((1 - current / baseline_size) * 100)
-        log.warning(
-            "  [REGRESSION GUARD] %s shrank from %dB to %dB (>%d%% reduction) -- reverting commit.",
-            target_file, baseline_size, current, pct,
-        )
-    else:
-        log.warning(
-            "  [REGRESSION GUARD] %s content failed sanity check -- reverting commit.",
-            target_file,
-        )
-    subprocess.run(["git", "reset", "--hard", "HEAD~1"], check=True, timeout=GIT_TIMEOUT, cwd=cwd)
+def resolve_dependency_base(dependencies, default_branch, cwd=None):
+    """Determine the start point for a new task branch based on its dependencies.
+
+    - 0 deps   -> default branch
+    - 1 dep    -> that dep's task branch (stacked)
+    - N deps   -> default branch (caller will merge deps in afterwards)
+
+    Returns ``(start_point, extra_merges)`` where ``extra_merges`` is the list
+    of dependency branches the caller still needs to merge in after checkout.
+    Any dependency whose branch does not exist is skipped with a warning.
+    ``cwd`` is forwarded to ``branch_exists`` (needed for worktree callers).
+    """
+    dep_branches = []
+    for dep in dependencies:
+        dep_branch = f"task/{dep}"
+        if branch_exists(dep_branch, cwd=cwd):
+            dep_branches.append(dep_branch)
+        else:
+            log.warning("  [dependency '%s' has no branch -- falling back to default for that dep]", dep)
+
+    if not dep_branches:
+        return default_branch, []
+    if len(dep_branches) == 1:
+        return dep_branches[0], []
+    # Multiple deps: start from default and merge each one in
+    return default_branch, dep_branches
+
+

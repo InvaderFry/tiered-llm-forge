@@ -29,6 +29,25 @@ def save_state(state, path=None):
             json.dump(state, f, indent=2)
 
 
+def append_run_summary(state, results):
+    """Append a lightweight run-summary entry to ``state["runs"]``.
+
+    ``results`` is the ``{"passed": [...], "failed": [...], "skipped": [...]}``
+    dict built by the CLI main loop. Appending here (rather than overwriting
+    on load) lets you answer "how many runs has task-003 failed this week?"
+    from state alone without scraping log files.
+    """
+    entry = {
+        "run_id": state.get("run_id", ""),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "passed": list(results.get("passed", [])),
+        "failed": list(results.get("failed", [])),
+        "skipped": list(results.get("skipped", [])),
+    }
+    with _state_lock:
+        state.setdefault("runs", []).append(entry)
+
+
 def _empty_state():
     return {
         "run_id": datetime.now(timezone.utc).isoformat(),

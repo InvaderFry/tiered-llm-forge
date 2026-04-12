@@ -14,9 +14,8 @@ from . import SPECS_DIR
 from .config import load_config, get_config, get_tier
 from .log import setup_logging, get_logger
 from .spec_parser import load_spec, validate_specs, topological_sort
-from .model_router import select_model_for_spec
 from .git_ops import get_default_branch, ensure_default_branch_exists, branch_exists
-from .state import load_state, save_state
+from .state import load_state, save_state, append_run_summary
 from .task_runner import run_task
 from .integration import integration_gate
 from .parallel import find_parallel_groups, run_parallel_group
@@ -96,7 +95,7 @@ def cmd_dry_run():
         spec = load_spec(sf)
         branch = f"task/{spec['task_name']}"
         status = "EXISTS" if branch_exists(branch) else "NEW"
-        model = select_model_for_spec(spec["body"])
+        model = primary["models"][0]
 
         log.info("  %d. [%s] %s", i, status, spec["task_name"])
         log.info("     Target: %s", spec["target"])
@@ -156,12 +155,8 @@ def main():
     state = load_state()
     results = {"passed": [], "failed": [], "skipped": []}
 
-    specs_by_name = {}
-    for sf in ordered:
-        _spec = load_spec(sf)
-        specs_by_name[_spec["task_name"]] = _spec
-
     ordered_specs = [load_spec(sf) for sf in ordered]
+    specs_by_name = {s["task_name"]: s for s in ordered_specs}
 
     if args.parallel is not None:
         # Wave mode: group independent tasks and run each wave concurrently
@@ -205,6 +200,10 @@ def main():
                 time.sleep(cooldown)
 
     print_summary(results, default_branch, state)
+
+    # Append a lightweight run summary before the integration gate so the
+    # history is recorded even if the gate fails or is skipped.
+    append_run_summary(state, results)
 
     # Integration gate: only run if every task succeeded (passed or skipped).
     # Failed tasks must be resolved before we try to assemble a merge.

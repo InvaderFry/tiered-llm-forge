@@ -93,16 +93,20 @@ def check_regression(target_file, baseline_size, cwd=None):
 
     Checks:
     1. Size regression — file shrank by >80% vs baseline.
-    2. Content sanity — file no longer contains expected language markers.
+    2. Content sanity — file no longer contains expected language markers,
+       but *only* when the file also shrank by >50% vs baseline. Running the
+       content check unconditionally produced false positives on legitimate
+       small files (e.g. ``src/constants.py`` with only assignments, or a
+       pure-data ``__init__.py``) that contain none of the marker strings. By
+       tying the content check to a size regression we make it a *confirmation*
+       of shrinkage rather than an independent tripwire.
 
     Special case: when ``baseline_size == 0`` (the file did not exist before
     the model ran), an empty-or-still-missing file is **not** a regression —
     it's a no-progress attempt. Returning True here would trigger the
     task_runner's revert, which historically called ``git reset --hard
     HEAD~1`` and ate the dependency branch's history. The caller handles
-    no-progress separately via a HEAD-move check. Content-sanity failure
-    is still flagged whenever the file contains *something* (nonzero size
-    or nonzero baseline) so a corrupted half-write still reverts cleanly.
+    no-progress separately via a HEAD-move check.
     """
     current = file_size(target_file, cwd=cwd)
 
@@ -112,8 +116,12 @@ def check_regression(target_file, baseline_size, cwd=None):
     if baseline_size == 0 and current == 0:
         return False
 
-    if not _content_looks_valid(target_file, cwd=cwd):
-        return True
+    # Only run the content check when the file has shrunk by more than half —
+    # that's the signal that something went wrong, and the content markers
+    # then serve as confirmation.
+    if baseline_size >= 50 and current < baseline_size * 0.5:
+        if not _content_looks_valid(target_file, cwd=cwd):
+            return True
 
     return False
 

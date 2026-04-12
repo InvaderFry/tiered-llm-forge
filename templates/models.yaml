@@ -39,3 +39,9 @@ spec_limits:
 # catching most rate limits; raise it if you are still seeing 429s at the
 # start of each task.
 cooldown_seconds: 30
+
+# Maximum seconds to wait for a single aider invocation before timing out.
+# Increase for large escalation models on long specs (they can easily take
+# >5 min). Setting this too low causes silent task failures that look like
+# aider producing no output.
+aider_timeout_seconds: 300

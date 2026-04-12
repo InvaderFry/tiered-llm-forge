@@ -139,11 +139,35 @@ class TestCheckRegression:
         # baseline < 50 bytes: size check skipped
         assert check_regression(str(f), 10) is False
 
-    def test_regression_when_content_invalid(self, tmp_path):
+    def test_no_regression_new_file_with_no_markers(self, tmp_path):
+        # A pure-data file (e.g. constants.py with only assignments) created
+        # from scratch (baseline=0) should NOT trigger a false positive.
+        # Content-marker check only runs when the file also shrank vs baseline.
         f = tmp_path / "module.py"
-        f.write_text("x = 1\n")  # no markers for .py
-        # baseline=0 but file has some bytes -> content sanity still applies
-        assert check_regression(str(f), 0) is True
+        f.write_text("x = 1\n")  # no def/class/import markers — was wrongly flagged
+        assert check_regression(str(f), 0) is False
+
+    def test_regression_when_size_shrinks_over_80_pct(self, tmp_path):
+        # >80% size reduction triggers the first (size-only) check regardless
+        # of content — this is the fast path.
+        f = tmp_path / "module.py"
+        f.write_text("x = 1\n")  # 6 bytes; baseline=500 → 6/500 < 0.2
+        assert check_regression(str(f), 500) is True
+
+    def test_regression_when_content_invalid_and_shrank_50_to_80_pct(self, tmp_path):
+        # Shrank >50% but <=80% (misses the >80% size check) AND no content markers.
+        # This exercises the content-marker gate specifically.
+        # baseline=100, current=30 bytes → 30% of baseline → in (20%, 50%) range.
+        f = tmp_path / "module.py"
+        f.write_text("x = 1\ny = 2\nz = 3\na = 4\nb = 5\n")  # 30 bytes, no markers
+        assert check_regression(str(f), 100) is True
+
+    def test_no_regression_when_content_valid_despite_moderate_shrinkage(self, tmp_path):
+        # Shrank >50% but <=80% AND file still has valid Python markers → not a regression.
+        # baseline=100, current=30 bytes, but the content has "import" marker.
+        f = tmp_path / "module.py"
+        f.write_text("import os\nfoo = 1\nbar = 2\n")  # ~24 bytes, has "import" marker
+        assert check_regression(str(f), 100) is False
 
     def test_no_regression_when_file_never_existed(self, tmp_path):
         # baseline=0 AND file still missing: aider produced no output, which

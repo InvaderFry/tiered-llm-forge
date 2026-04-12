@@ -151,8 +151,9 @@ tiered-llm-forge/
     ├── test_git_ops.py
     ├── test_state.py
     ├── test_failure_class.py
-    ├── test_parallel.py     # wave grouping, worktrees, concurrent execution
-    └── test_cwd.py          # cwd parameter support across all modules
+    ├── test_task_runner.py  # resume-point helpers and regression guard
+    ├── test_parallel.py     # wave grouping and earliest-wave correctness
+    └── test_cwd.py          # cwd parameter support across runner modules
 ```
 
 To change what gets generated, edit files in `templates/` or add a new

@@ -9,7 +9,6 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "templates"))
 
 from orchestrator.model_router import (
-    select_model_for_spec,
     get_fallback_models,
     _parse_retry_after,
     _parse_usage,
@@ -48,19 +47,6 @@ def mock_config(tmp_path):
     config_mod.load_config(config_yaml)
     yield
     config_mod._config = None
-
-
-class TestSelectModel:
-    def test_small_spec_uses_first_primary(self):
-        model = select_model_for_spec("small spec")
-        assert model == "groq/qwen/qwen3-32b"
-
-    def test_large_spec_still_uses_first_primary(self):
-        # The historical "large context" branch was dead code: spec text is
-        # now attached as a read-only file, not embedded in the prompt, so
-        # length no longer routes to a different model.
-        model = select_model_for_spec("x" * 20_000)
-        assert model == "groq/qwen/qwen3-32b"
 
 
 class TestGetFallbackModels:

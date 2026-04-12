@@ -14,8 +14,9 @@ log = get_logger("model_router")
 
 # Max retries within a single aider invocation for rate limit errors
 AIDER_MAX_RATE_RETRIES = 4
-# Timeout for a single aider invocation (seconds)
-AIDER_TIMEOUT = 300
+# Default timeout for a single aider invocation (seconds).
+# Overridden by ``aider_timeout_seconds`` in models.yaml.
+_AIDER_TIMEOUT_DEFAULT = 300
 
 # ---------------------------------------------------------------------------
 # Per-model rate-limit coordinator
@@ -109,23 +110,6 @@ def _mark_rate_limited(model, retry_after, buffer=5.0):
     """
     with _rate_limit_lock:
         _next_available_at[model] = _clock() + retry_after + buffer
-
-
-def select_model_for_spec(spec_text):
-    """
-    Choose the starting model for a task.
-
-    Always returns the first model in the primary tier — the tier
-    fallback machinery handles model rotation from there. The previous
-    "large context" branch was unreachable (compress_spec hard-capped
-    at the same threshold) and the spec is now attached as a read-only
-    file rather than embedded in the prompt, so spec length no longer
-    drives model choice. ``spec_text`` is kept on the signature so
-    future heuristics (e.g. routing by language or function count)
-    can be layered in without changing call sites.
-    """
-    primary = get_tier("primary")
-    return primary["models"][0]
 
 
 def get_fallback_models(current_model, tier_name):
@@ -235,6 +219,7 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
     """
     cfg = get_config()
     weak_model = cfg.get("weak_model", "groq/llama-3.1-8b-instant")
+    aider_timeout = int(cfg.get("aider_timeout_seconds", _AIDER_TIMEOUT_DEFAULT))
 
     # Resolve the target file to an absolute path and ensure its parent
     # directory exists. If aider is handed a relative path to a file whose
@@ -286,10 +271,10 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, check=False,
-                env=aider_env, timeout=AIDER_TIMEOUT, cwd=cwd,
+                env=aider_env, timeout=aider_timeout, cwd=cwd,
             )
         except subprocess.TimeoutExpired:
-            log.warning("  [aider timed out after %ds on model %s]", AIDER_TIMEOUT, model)
+            log.warning("  [aider timed out after %ds on model %s]", aider_timeout, model)
             return False, invocation_stats
         if result.stdout:
             log.info("%s", result.stdout.rstrip())
