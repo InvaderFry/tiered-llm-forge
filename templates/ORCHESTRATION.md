@@ -28,7 +28,8 @@ nano .env
 
 ```env
 GROQ_API_KEY=your-groq-key-here
-GEMINI_API_KEY=your-gemini-key-here
+GOOGLE_API_KEY=your-google-ai-studio-key-here
+# GEMINI_API_KEY=your-google-ai-studio-key-here   # legacy alias; GOOGLE_API_KEY is preferred
 ```
 
 Get keys from:
@@ -88,6 +89,17 @@ This checks:
 
 Fix any errors before proceeding.
 
+Validate config and provider env before spending model tokens:
+
+```bash
+make preflight
+```
+
+This catches:
+- Missing provider API keys
+- Invalid or placeholder model IDs in `models.yaml`
+- Runtime/config mismatches before the task loop starts
+
 ---
 
 ## Phase 4: Review Specs (Manual Checkpoint)
@@ -136,17 +148,18 @@ The orchestrator processes each spec in dependency order:
    not from the default branch. A task with one dependency is stacked on
    that dependency; a task with several dependencies starts from the
    default branch and merges each dep branch in before running Aider.
-2. Attaches the spec file, test file, and every dependency's target file
-   as read-only context for Aider, so the implementer model sees the
-   upstream interfaces instead of guessing from the spec alone.
+2. Attaches the spec file, test file, and dependency target files
+   as read-only context for Aider, but trims that context to a
+   configurable file/size budget so large fan-in tasks do not overflow
+   provider TPM caps.
 3. Tries all primary tier models with fallback (3 attempts).
 4. Escalates to the escalation tier if primary fails (2 attempts).
-5. If both tiers exhaust, tries the **Gemini tier** (Gemini 3 Flash → 2.5 Flash,
-   1 attempt each). Skips gracefully when the daily API quota is exhausted.
+5. If both tiers exhaust, tries the **Gemini tier** (1 attempt per model).
+   Skips gracefully when the daily API quota is exhausted.
 6. Writes `forgeLogs/FAILED-task-NNN-name-<timestamp>.log` (tagged with a
    failure class) if all automated tiers fail.
-6. Records per-task model, duration, attempts, base SHA, and failure class
-   in `pipeline-state.json`.
+6. Records per-task attempts, attempted models, base SHA, and both terminal
+   and test failure classes in `pipeline-state.json`.
 7. Returns to default branch, moves to next task.
 
 After every task passes, the orchestrator runs an **integration gate**
@@ -188,8 +201,9 @@ simultaneously in isolated git worktrees via a thread pool.
   `forgeLogs/orchestrator-<timestamp>.log` simultaneously. Use `--verbose`
   and grep by task name when debugging.
 - **Rate-limit amplification.** More concurrent requests can hit provider
-  rate limits faster. The coordinator mitigates this, but with many workers
-  you may see more 429 retries than in sequential mode.
+  rate limits faster. The coordinator mitigates this, and fixed cooldowns are
+  only applied after real work or pending retry windows, but wide waves can
+  still create more provider pressure than sequential runs.
 - **Not the default.** Sequential mode (`make run`) is simpler and easier to
   debug. Prefer it for first runs or when diagnosing failures.
 
@@ -204,7 +218,7 @@ Models are configured in `models.yaml`. Default tiers, tried in order:
 |------|--------|---------|---------|
 | Primary | Qwen3 32B → Kimi K2 → Llama 4 Scout | Every task, 3 attempts | `GROQ_API_KEY` |
 | Escalation | GPT-OSS 120B | Primary exhausted, 2 attempts | `GROQ_API_KEY` |
-| Gemini | Gemini 3 Flash → 2.5 Flash | Escalation exhausted, 1 attempt each | `GEMINI_API_KEY` |
+| Gemini | Gemini 2.5 Flash | Escalation exhausted, 1 attempt each | `GOOGLE_API_KEY` |
 
 The Gemini tier uses **daily quota** semantics: if a model's free-tier quota is
 exhausted for the day, it is skipped immediately (no sleep) and the next model
@@ -343,9 +357,11 @@ Phase 8; a failed gate writes `forgeLogs/INTEGRATION-FAILED-<timestamp>.log`.
 → Run `export $(cat .env | grep -v '#' | xargs)` first.
 
 **Gemini tier skipped / not attempted**
-→ Check that `GEMINI_API_KEY` is set in `.env` and exported. The Gemini tier
-requires this key; if it is missing, Aider returns an auth error and the tier
-is marked as failed (not quota-exhausted), which still triggers Claude review.
+→ Check that `GOOGLE_API_KEY` is set in `.env` and exported. The legacy
+`GEMINI_API_KEY` alias is also accepted and mirrored automatically, but
+`GOOGLE_API_KEY` is the canonical setting. If the key is missing, Aider
+returns an auth error and the tier is marked as failed (not quota-exhausted),
+which still triggers Claude review.
 
 **"Gemini daily quota was exhausted" in the summary**
 → The free Gemini API tier has a daily request cap that resets at midnight UTC.
@@ -362,8 +378,9 @@ The orchestrator already skipped the exhausted models cleanly. Options:
 records the "try again in Ns" hint from each 429 and sleeps exactly that
 long before the next request to that model — across tasks, not just within
 one retry loop. Second, `cooldown_seconds` in `models.yaml` provides a
-defensive baseline between tasks for signals the parser misses. If you are
-still seeing 429s at the start of each task, raise `cooldown_seconds`. If
+defensive baseline between tasks for signals the parser misses, but it only
+fires after real work or pending retry windows. If you are still seeing 429s
+at the start of each task, raise `cooldown_seconds`. If
 all models exhaust their retries, wait a few minutes — Groq limits reset
 hourly.
 

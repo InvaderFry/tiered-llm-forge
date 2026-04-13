@@ -43,18 +43,19 @@ From here, follow the workflow in that project's `ORCHESTRATION.md`.
 ## Daily workflow (inside the generated project)
 
 ```
-1.  Edit .env — add GROQ_API_KEY and GEMINI_API_KEY (first time only)
+1.  Edit `.env` — add `GROQ_API_KEY` and `GOOGLE_API_KEY` (or legacy `GEMINI_API_KEY`) the first time only
 2.  export $(cat .env | grep -v '#' | xargs)
 3.  claude
     > "I want to build [feature]. Generate the specs and tests."
 4.  make validate                    # check specs for errors
-5.  Review specs/ manually
-6.  git add specs tests && git commit -m "chore: add task specs and tests"
-7.  make run                         # run the pipeline
-8.  For failures: back to claude
+5.  make preflight                  # validate config + provider env
+6.  Review specs/ manually
+7.  git add specs tests && git commit -m "chore: add task specs and tests"
+8.  make run                         # run the pipeline
+9.  For failures: back to claude
     > "Fix the failures."
-9.  Repeat 7-8 until all tasks pass
-10. Back to claude for the final quality gate
+10. Repeat 8-9 until all tasks pass
+11. Back to claude for the final quality gate
     > "Review the task branches and merge them."
 ```
 
@@ -73,19 +74,20 @@ dependency order:
 1. Creates a `task/task-NNN-name` git branch **from its dependency branch(es)**
    — stacked on a single dep, or assembled via merge when there are several —
    so the task actually runs against its upstream code.
-2. Attaches the spec file, test file, and every dependency's target file to
-   Aider as read-only context so the implementer model sees the real
-   upstream types and signatures, not just the isolated target file.
+2. Attaches the spec file, test file, and dependency target files to
+   Aider as read-only context, but trims that context to a configurable
+   file/size budget so large fan-in tasks do not blow past provider TPM caps.
 3. Tries primary tier models with automatic fallback (3 attempts).
 4. Escalates to the escalation tier if primary fails (2 attempts).
-5. If both tiers exhaust, tries the **Gemini tier** (Gemini 3 Flash → 2.5 Flash)
-   as a last automated attempt. If Gemini's daily API quota is exhausted for
-   all models, skips gracefully.
+5. If both tiers exhaust, tries the **Gemini tier** as a last automated attempt.
+   If Gemini's daily API quota is exhausted for all configured models, skips
+   gracefully.
 6. Writes `forgeLogs/FAILED-task-NNN-name-<timestamp>.log` tagged with a failure
-   class (`rate_limit`, `assertion`, `gemini_quota_exhausted`, etc.) if all
-   automated tiers fail.
-6. Records per-task model, duration, attempts, and failure class in
-   `pipeline-state.json` for crash recovery and observability.
+   class (`dependency_cache_missing`, `invalid_model_config`,
+   `request_too_large`, `gemini_quota_exhausted`, etc.) if all automated
+   tiers fail.
+6. Records per-task attempts, attempted models, duration, and terminal/test
+   failure classes in `pipeline-state.json` for crash recovery and observability.
 7. Returns to the default branch, moves to next task.
 
 After every task passes, an **integration gate** assembles
@@ -116,7 +118,7 @@ needed to change routing behaviour.
 |------|--------|---------|
 | Primary | Qwen3 32B → Kimi K2 → Llama 4 Scout | Every task, first |
 | Escalation | GPT-OSS 120B | Primary exhausted |
-| Gemini | Gemini 3 Flash → Gemini 2.5 Flash | Escalation exhausted; requires `GEMINI_API_KEY` |
+| Gemini | Gemini 2.5 Flash | Escalation exhausted; requires `GOOGLE_API_KEY` |
 
 ---
 
@@ -150,6 +152,7 @@ tiered-llm-forge/
 │   │   ├── config.py        # reads models.yaml
 │   │   ├── spec_parser.py   # frontmatter, validation, topo sort
 │   │   ├── model_router.py  # model selection, fallback, rate limits
+│   │   ├── preflight.py     # config/env validation + runtime warmups
 │   │   ├── runner.py        # per-task + full-suite test execution
 │   │   ├── git_ops.py       # branch management, stacking, merging
 │   │   ├── task_runner.py   # per-task orchestration + model escalation
@@ -164,6 +167,7 @@ tiered-llm-forge/
 └── tests/                   # tests for the forge's own orchestrator code
     ├── test_spec_parser.py
     ├── test_model_router.py
+    ├── test_preflight.py
     ├── test_runner.py
     ├── test_git_ops.py
     ├── test_state.py

@@ -9,10 +9,13 @@ Usage:
 import argparse
 import sys
 import time
+from pathlib import Path
 
 from . import SPECS_DIR
 from .config import load_config, get_config, get_tier
 from .log import setup_logging, get_logger
+from .model_router import has_pending_rate_limits
+from .preflight import run_startup_preflight
 from .spec_parser import load_spec, validate_specs, topological_sort
 from .git_ops import (
     get_default_branch,
@@ -40,6 +43,14 @@ def _blocked_dependencies(spec, outcomes):
 def _spec_test_input_paths(ordered_specs):
     """Return repo-relative spec and test paths for git preflight checks."""
     return [str(s["path"]) for s in ordered_specs] + [s["test"] for s in ordered_specs]
+
+
+def _log_preflight_messages(errors, warnings):
+    """Log startup preflight output in a consistent format."""
+    for warning in warnings:
+        log.warning("Preflight warning: %s", warning)
+    for error in errors:
+        log.error("Preflight error: %s", error)
 
 
 def _log_tracked_clean_errors(action, errors):
@@ -114,6 +125,12 @@ def cmd_dry_run():
         _log_tracked_clean_errors("dry-run", preflight_errors)
         return 1
 
+    startup_errors, startup_warnings = run_startup_preflight(repo_root=Path.cwd())
+    _log_preflight_messages(startup_errors, startup_warnings)
+    if startup_errors:
+        log.error("Cannot dry-run until preflight errors are fixed.")
+        return 1
+
     ensure_default_branch_exists()
     default_branch = get_default_branch()
     cfg = get_config()
@@ -145,12 +162,30 @@ def cmd_dry_run():
     return 0
 
 
+def cmd_preflight():
+    """Validate config and runtime prerequisites without running the pipeline."""
+    errors, warnings = run_startup_preflight(repo_root=Path.cwd())
+    _log_preflight_messages(errors, warnings)
+    if errors:
+        log.error("Preflight failed. Fix the errors above before running the pipeline.")
+        return 1
+
+    log.info("Preflight passed. Config and provider env look ready.")
+    return 0
+
+
+def _should_cooldown(outcomes):
+    """Return True if we should sleep before the next task or wave."""
+    return any(o not in {"skipped", "blocked"} for o in outcomes) or has_pending_rate_limits()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Tiered LLM orchestrator — run cheap models against spec files."
     )
     parser.add_argument("--validate", action="store_true", help="Validate specs without running")
     parser.add_argument("--dry-run", action="store_true", help="Preview pipeline without running models")
+    parser.add_argument("--preflight", action="store_true", help="Validate config and runtime prerequisites")
     parser.add_argument("--config", default="models.yaml", help="Path to models.yaml config")
     parser.add_argument("--resume", action="store_true", help="Resume failed tasks from last attempt instead of flagging for review")
     parser.add_argument("--parallel", nargs="?", type=int, const=4, default=None,
@@ -167,6 +202,9 @@ def main():
 
     if args.dry_run:
         sys.exit(cmd_dry_run())
+
+    if args.preflight:
+        sys.exit(cmd_preflight())
 
     # --- Full pipeline run ---
     ensure_default_branch_exists()
@@ -187,6 +225,12 @@ def main():
 
     cfg = get_config()
     cooldown = cfg.get("cooldown_seconds", 30)
+
+    preflight_errors, preflight_warnings = run_startup_preflight(repo_root=Path.cwd())
+    _log_preflight_messages(preflight_errors, preflight_warnings)
+    if preflight_errors:
+        log.error("Cannot run the pipeline until preflight errors are fixed.")
+        sys.exit(1)
 
     state = load_state()
     results = {"passed": [], "failed": [], "skipped": [], "blocked": []}
@@ -244,7 +288,7 @@ def main():
                 outcomes[task_name] = outcome
 
             # Cooldown between waves
-            if wave_i < len(groups) and cooldown > 0:
+            if wave_i < len(groups) and cooldown > 0 and _should_cooldown(wave_results.values()):
                 log.info("  [cooldown: sleeping %ds between waves]", cooldown)
                 time.sleep(cooldown)
     else:
@@ -282,7 +326,7 @@ def main():
             outcomes[spec["task_name"]] = outcome
 
             # Cooldown between tasks
-            if i < len(ordered_specs) - 1 and outcome != "skipped" and cooldown > 0:
+            if i < len(ordered_specs) - 1 and cooldown > 0 and _should_cooldown([outcome]):
                 log.info("  [cooldown: sleeping %ds between tasks]", cooldown)
                 time.sleep(cooldown)
 

@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "templates"))
 
-from orchestrator.failure_class import classify
+from orchestrator.failure_class import classify, classify_terminal
 
 
 class TestFailureClass:
@@ -39,3 +39,14 @@ class TestFailureClass:
         # output is classified by the more actionable signal.
         mixed = "rate_limit_exceeded ... later an AssertionError somewhere"
         assert classify(mixed) == "rate_limit"
+
+    def test_dependency_cache_missing(self):
+        msg = "offline mode and the artifact x has not been downloaded from it before"
+        assert classify(msg) == "dependency_cache_missing"
+
+    def test_invalid_model_config(self):
+        msg = '"status": "NOT_FOUND" model is not found for API version'
+        assert classify(msg) == "invalid_model_config"
+
+    def test_terminal_class_uses_llm_reason_when_test_output_is_generic(self):
+        assert classify_terminal("AssertionError: assert 1 == 2", ["invalid_model_config"]) == "invalid_model_config"

@@ -60,3 +60,37 @@ class TestState:
         with open(path) as f:
             data = json.load(f)
         assert isinstance(data, dict)
+
+    def test_skip_preserves_previous_attempt_metadata(self, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        record_task(
+            state,
+            "task-001",
+            "failed",
+            model="groq/qwen/qwen3-32b",
+            attempts=3,
+            models_tried=["groq/qwen/qwen3-32b"],
+        )
+        record_task(state, "task-001", "skipped", duration_seconds=0.2)
+
+        assert state["tasks"]["task-001"]["status"] == "skipped"
+        assert state["tasks"]["task-001"]["model"] == "groq/qwen/qwen3-32b"
+        assert state["tasks"]["task-001"]["attempts"] == 3
+
+    def test_recovered_task_clears_stale_failure_metadata(self, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        record_task(
+            state,
+            "task-001",
+            "failed",
+            failure_class="request_too_large",
+            test_failure_class="assertion",
+            llm_fail_reasons=["request_too_large"],
+        )
+        record_task(state, "task-001", "passed", attempts=4)
+
+        entry = state["tasks"]["task-001"]
+        assert entry["status"] == "passed"
+        assert "failure_class" not in entry
+        assert "test_failure_class" not in entry
+        assert "llm_fail_reasons" not in entry

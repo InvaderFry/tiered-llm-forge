@@ -62,10 +62,11 @@ def record_task(
     task_name,
     status,
     model=None,
-    attempts=0,
+    attempts=None,
     duration_seconds=None,
     models_tried=None,
     failure_class=None,
+    test_failure_class=None,
     llm_fail_reasons=None,
     blocked_by=None,
     base_branch=None,
@@ -81,18 +82,37 @@ def record_task(
     does each task take?", and "is the escalation tier worth its cost?"
     without scraping log files.
     """
-    entry = {
-        "status": status,
-        "model": model,
-        "attempts": attempts,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    with _state_lock:
+        previous = state["tasks"].get(task_name, {}).copy()
+
+    entry = previous
+    entry["status"] = status
+    entry["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+    if status in {"passed", "skipped"}:
+        entry.pop("failure_class", None)
+        entry.pop("test_failure_class", None)
+        entry.pop("llm_fail_reasons", None)
+        entry.pop("blocked_by", None)
+    elif status == "blocked":
+        entry.pop("failure_class", None)
+        entry.pop("test_failure_class", None)
+        entry.pop("llm_fail_reasons", None)
+    elif status == "failed":
+        entry.pop("blocked_by", None)
+
+    if model is not None:
+        entry["model"] = model
+    if attempts is not None:
+        entry["attempts"] = attempts
     if duration_seconds is not None:
         entry["duration_seconds"] = round(float(duration_seconds), 2)
     if models_tried is not None:
         entry["models_tried"] = list(models_tried)
     if failure_class is not None:
         entry["failure_class"] = failure_class
+    if test_failure_class is not None:
+        entry["test_failure_class"] = test_failure_class
     if llm_fail_reasons is not None:
         entry["llm_fail_reasons"] = list(llm_fail_reasons)
     if blocked_by is not None:
@@ -113,7 +133,8 @@ def record_task(
     return state
 
 
-def record_attempt(state, task_name, attempt_num, tier, model, aider_success, tests_passed=None):
+def record_attempt(state, task_name, attempt_num, tier, model, aider_success, tests_passed=None,
+                   model_attempts=None):
     """Record a single attempt within a task for granular crash recovery.
 
     Stored under ``state["tasks"][task_name]["attempts_log"]`` as a list,
@@ -123,14 +144,17 @@ def record_attempt(state, task_name, attempt_num, tier, model, aider_success, te
     with _state_lock:
         entry = state["tasks"].setdefault(task_name, {"status": "in_progress"})
         log = entry.setdefault("attempts_log", [])
-        log.append({
+        item = {
             "attempt": attempt_num,
             "tier": tier,
             "model": model,
             "aider_success": aider_success,
             "tests_passed": tests_passed,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
+        }
+        if model_attempts is not None:
+            item["model_attempts"] = list(model_attempts)
+        log.append(item)
 
 
 def get_resume_point(state, task_name):

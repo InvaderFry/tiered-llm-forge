@@ -22,27 +22,43 @@ def print_summary(results, default_branch, state=None):
     # Observability roll-up: per-model success/failure counts, task
     # timings, and token / cost totals scraped from aider's stdout.
     if state and state.get("tasks"):
-        by_model = {}
+        attempted_by_model = {}
         total_time = 0.0
         total_tokens_sent = 0
         total_tokens_received = 0
         total_cost = 0.0
-        for name, entry in state["tasks"].items():
+        for entry in state["tasks"].values():
             dur = entry.get("duration_seconds") or 0.0
             total_time += dur
             total_tokens_sent += entry.get("tokens_sent", 0) or 0
             total_tokens_received += entry.get("tokens_received", 0) or 0
             total_cost += entry.get("cost_usd", 0.0) or 0.0
-            model = entry.get("model") or "(none)"
-            bucket = by_model.setdefault(
-                model,
-                {"passed": 0, "failed": 0, "skipped": 0,
-                 "tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0},
-            )
-            bucket[entry["status"]] = bucket.get(entry["status"], 0) + 1
-            bucket["tokens_sent"] += entry.get("tokens_sent", 0) or 0
-            bucket["tokens_received"] += entry.get("tokens_received", 0) or 0
-            bucket["cost_usd"] += entry.get("cost_usd", 0.0) or 0.0
+            for attempt in entry.get("attempts_log", []):
+                model_attempts = attempt.get("model_attempts")
+                if model_attempts:
+                    for model_attempt in model_attempts:
+                        model = model_attempt.get("model") or "(none)"
+                        bucket = attempted_by_model.setdefault(
+                            model,
+                            {"attempts": 0, "aider_successes": 0, "test_passes": 0},
+                        )
+                        bucket["attempts"] += 1
+                        if model_attempt.get("success"):
+                            bucket["aider_successes"] += 1
+                            if attempt.get("tests_passed"):
+                                bucket["test_passes"] += 1
+                    continue
+
+                model = attempt.get("model") or "(none)"
+                bucket = attempted_by_model.setdefault(
+                    model,
+                    {"attempts": 0, "aider_successes": 0, "test_passes": 0},
+                )
+                bucket["attempts"] += 1
+                if attempt.get("aider_success"):
+                    bucket["aider_successes"] += 1
+                    if attempt.get("tests_passed"):
+                        bucket["test_passes"] += 1
 
         log.info("\nTotal task time: %.1fs", total_time)
         if total_tokens_sent or total_tokens_received or total_cost:
@@ -50,20 +66,16 @@ def print_summary(results, default_branch, state=None):
                 "Total tokens: %s sent / %s received    Total cost: $%.4f",
                 f"{total_tokens_sent:,}", f"{total_tokens_received:,}", total_cost,
             )
-        log.info("By model:")
-        for model, counts in sorted(by_model.items()):
-            line = (
-                f"  {model}: {counts.get('passed', 0)} passed, "
-                f"{counts.get('failed', 0)} failed, "
-                f"{counts.get('skipped', 0)} skipped, "
-                f"{counts.get('blocked', 0)} blocked"
-            )
-            if counts["tokens_sent"] or counts["cost_usd"]:
-                line += (
-                    f"  ({counts['tokens_sent']:,}+{counts['tokens_received']:,} tok, "
-                    f"${counts['cost_usd']:.4f})"
+        if attempted_by_model:
+            log.info("Attempted models:")
+            for model, counts in sorted(attempted_by_model.items()):
+                log.info(
+                    "  %s: %d attempt(s), %d aider success(es), %d test-passing attempt(s)",
+                    model,
+                    counts["attempts"],
+                    counts["aider_successes"],
+                    counts["test_passes"],
                 )
-            log.info("%s", line)
 
         fail_classes = {}
         for entry in state["tasks"].values():

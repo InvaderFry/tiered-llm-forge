@@ -1,6 +1,7 @@
 """Load models.yaml and expose config as a module-level dict."""
 
 from pathlib import Path
+
 import yaml
 
 CONFIG_FILE = Path(__file__).parent.parent / "models.yaml"

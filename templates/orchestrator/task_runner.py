@@ -7,8 +7,8 @@ from datetime import datetime
 from pathlib import Path
 
 from . import FORGE_LOGS_DIR
-from .config import get_tier
-from .failure_class import classify as classify_failure
+from .config import get_config, get_tier
+from .failure_class import classify as classify_failure, classify_terminal
 from .git_ops import (
     branch_exists,
     branch_tip,
@@ -22,6 +22,7 @@ from .log import get_logger
 from .model_router import (
     run_with_tier_fallback,
     is_request_too_large,
+    is_invalid_model,
     clear_request_too_large,
     all_gemini_quota_exhausted,
 )
@@ -74,6 +75,79 @@ def _forbidden_changed_files(changed_files, allowed_write_files):
     return sorted(f for f in changed_files if f not in allowed_write_files)
 
 
+def _path_size(path, cwd=None):
+    """Return a candidate context file size in bytes, or 0 when unavailable."""
+    p = Path(cwd) / path if cwd and not Path(path).is_absolute() else Path(path)
+    try:
+        return p.stat().st_size
+    except OSError:
+        return 0
+
+
+def _build_read_context(spec, test_file, dependencies, specs_by_name, cwd=None):
+    """Assemble read-only context files under a configurable budget.
+
+    Always includes the spec file and task test. Dependency target files are
+    included in declared order until one of the configured limits is reached.
+
+    Returns ``(read_files, omitted_dependency_targets)``.
+    """
+    cfg = get_config()
+    limits = cfg.get("context_limits", {})
+    max_read_files = int(limits.get("max_read_files", 4))
+    max_dependency_files = int(limits.get("max_dependency_files", 2))
+    max_total_bytes = int(limits.get("max_total_bytes", 24_000))
+
+    read_files = [str(spec["path"]), test_file]
+    total_bytes = sum(_path_size(path, cwd=cwd) for path in read_files)
+
+    omitted = []
+    included_deps = 0
+    for dep_name in dependencies:
+        dep_spec = specs_by_name.get(dep_name) if specs_by_name else None
+        dep_target = dep_spec.get("target") if dep_spec else None
+        if not dep_target:
+            continue
+
+        dep_size = _path_size(dep_target, cwd=cwd)
+        projected_files = len(read_files) + 1
+        projected_bytes = total_bytes + dep_size
+        if (
+            included_deps >= max_dependency_files
+            or projected_files > max_read_files
+            or projected_bytes > max_total_bytes
+        ):
+            omitted.append(dep_target)
+            continue
+
+        read_files.append(dep_target)
+        total_bytes = projected_bytes
+        included_deps += 1
+
+    if omitted:
+        log.info(
+            "  [context budget] attached %d read file(s), omitted %d dependency target(s): %s",
+            len(read_files),
+            len(omitted),
+            ", ".join(omitted),
+        )
+
+    return read_files, omitted
+
+
+def _final_failure_label(test_output, llm_fail_reasons, had_successful_model_attempt):
+    """Choose the terminal task failure label.
+
+    If any model produced a usable edit during the task, the final failing test
+    output is the most authoritative signal. LLM-side reasons are only used to
+    refine classification when no model ever produced a successful edit.
+    """
+    test_failure_label = classify_failure(test_output)
+    if had_successful_model_attempt:
+        return test_failure_label, test_failure_label
+    return classify_terminal(test_output, llm_fail_reasons), test_failure_label
+
+
 def _run_tier_attempts(
     tier_name, start_attempt, message_factory,
     target_file, test_file, read_files, cwd,
@@ -112,20 +186,30 @@ def _run_tier_attempts(
 
         message = message_factory(attempt)
         head_before = branch_tip("HEAD", cwd=cwd)
-        success, model_used, stats = run_with_tier_fallback(
+        success, model_used, stats, model_attempts = run_with_tier_fallback(
             tier_name, message, target_file, start_model,
             read_files=read_files, cwd=cwd,
         )
         _accumulate(stats)
-        if model_used and model_used not in ctx["models_tried"]:
-            ctx["models_tried"].append(model_used)
-        if not success and not model_used and tier_name == "primary":
-            # All models in the tier failed without writing anything —
-            # record why so the Stage 3 log reflects the real cause.
-            primary_models = get_tier("primary")["models"]
-            if all(is_request_too_large(m) for m in primary_models):
+        for attempt_meta in model_attempts:
+            attempted_model = attempt_meta.get("model")
+            if attempted_model and attempted_model not in ctx["models_tried"]:
+                ctx["models_tried"].append(attempted_model)
+
+            reason = attempt_meta.get("reason")
+            if reason in {"invalid_model_config", "forbidden_file_edit"} and reason not in ctx["llm_fail_reasons"]:
+                ctx["llm_fail_reasons"].append(reason)
+            if attempt_meta.get("success"):
+                ctx["had_successful_model_attempt"] = True
+
+        if not success and not model_used:
+            tier_models = get_tier(tier_name)["models"]
+            if all(is_request_too_large(m) for m in tier_models):
                 if "request_too_large" not in ctx["llm_fail_reasons"]:
                     ctx["llm_fail_reasons"].append("request_too_large")
+            if all(is_invalid_model(m) for m in tier_models):
+                if "invalid_model_config" not in ctx["llm_fail_reasons"]:
+                    ctx["llm_fail_reasons"].append("invalid_model_config")
 
         head_after = branch_tip("HEAD", cwd=cwd)
         head_moved = bool(head_after) and head_after != head_before
@@ -135,7 +219,10 @@ def _run_tier_attempts(
             if forbidden:
                 if "forbidden_file_edit" not in ctx["llm_fail_reasons"]:
                     ctx["llm_fail_reasons"].append("forbidden_file_edit")
-                record_attempt(state, task_name, attempt, tier_name, model_used, success, tests_passed=False)
+                record_attempt(
+                    state, task_name, attempt, tier_name, model_used, success,
+                    tests_passed=False, model_attempts=model_attempts,
+                )
                 save_state(state)
                 revert_last_commit(
                     target_file,
@@ -148,7 +235,10 @@ def _run_tier_attempts(
                 )
                 continue
         if head_moved and check_regression(target_file, ctx["baseline_size"], cwd=cwd):
-            record_attempt(state, task_name, attempt, tier_name, model_used, success, tests_passed=False)
+            record_attempt(
+                state, task_name, attempt, tier_name, model_used, success,
+                tests_passed=False, model_attempts=model_attempts,
+            )
             save_state(state)
             revert_last_commit(target_file, ctx["baseline_size"], cwd=cwd)
             continue
@@ -156,14 +246,20 @@ def _run_tier_attempts(
             # Aider never committed — nothing to revert, but also nothing to test.
             # Move to the next attempt without nuking dependency history.
             log.info("  [no commit produced by aider -- nothing to revert]")
-            record_attempt(state, task_name, attempt, tier_name, model_used, success, tests_passed=False)
+            record_attempt(
+                state, task_name, attempt, tier_name, model_used, success,
+                tests_passed=False, model_attempts=model_attempts,
+            )
             save_state(state)
             continue
 
         ctx["baseline_size"] = max(ctx["baseline_size"], file_size(target_file, cwd=cwd))
         passed, _ = run_tests(test_file, cwd=cwd)
 
-        record_attempt(state, task_name, attempt, tier_name, model_used, success, tests_passed=passed)
+        record_attempt(
+            state, task_name, attempt, tier_name, model_used, success,
+            tests_passed=passed, model_attempts=model_attempts,
+        )
         save_state(state)
 
         if passed:
@@ -384,15 +480,18 @@ def _run_task_body(
     baseline_size = file_size(target_file, cwd=cwd)
     allowed_write_files = {_normalize_relpath(target_file)}
 
-    # Assemble read-only context for the implementer model:
-    # the full spec file, the test file, and the target files of every
-    # declared dependency. Missing paths are dropped inside run_aider.
-    read_files = [str(spec["path"]), test_file]
-    if specs_by_name:
-        for dep_name in dependencies:
-            dep_spec = specs_by_name.get(dep_name)
-            if dep_spec and dep_spec.get("target"):
-                read_files.append(dep_spec["target"])
+    # Assemble read-only context under a configurable file/size budget.
+    read_files, omitted_dep_targets = _build_read_context(
+        spec, test_file, dependencies, specs_by_name, cwd=cwd,
+    )
+    context_note = ""
+    if omitted_dep_targets:
+        context_note = (
+            "\nRead-only dependency context was trimmed for token budget. "
+            "Omitted upstream target files: "
+            + ", ".join(omitted_dep_targets)
+            + ". Rely on the spec contracts and attached tests for those dependencies."
+        )
 
     primary_tier = get_tier("primary")
     escalation_tier = get_tier("escalation")
@@ -404,6 +503,7 @@ def _run_task_body(
         "models_tried": models_tried,
         "task_stats": {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0},
         "llm_fail_reasons": [],
+        "had_successful_model_attempt": False,
     }
 
     # On resume, determine where to start: skip tiers/attempts already done
@@ -417,9 +517,12 @@ def _run_task_body(
 
         def primary_message(attempt):
             if attempt == primary_start and not resume_point:
-                return implement_message
+                return implement_message + context_note
             _, test_output = run_tests(test_file, cwd=cwd)
-            return f"Tests failed. Output:\n{_strip_urls(test_output)}\nFix the code to pass all tests."
+            return (
+                f"Tests failed. Output:\n{_strip_urls(test_output)}\n"
+                f"Fix the code to pass all tests.{context_note}"
+            )
 
         result = _run_tier_attempts(
             "primary", primary_start, primary_message,
@@ -435,7 +538,10 @@ def _run_task_body(
 
     def escalation_message(_attempt):
         _, test_output = run_tests(test_file, cwd=cwd)
-        return f"Previous model failed. Tests output:\n{_strip_urls(test_output)}\nAnalyze carefully and fix."
+        return (
+            f"Previous model failed. Tests output:\n{_strip_urls(test_output)}\n"
+            f"Analyze carefully and fix.{context_note}"
+        )
 
     result = _run_tier_attempts(
         "escalation", escalation_start, escalation_message,
@@ -463,7 +569,7 @@ def _run_task_body(
             _, test_output = run_tests(test_file, cwd=cwd)
             return (
                 f"Previous models failed. Tests output:\n{_strip_urls(test_output)}\n"
-                f"Analyze carefully and fix."
+                f"Analyze carefully and fix.{context_note}"
             )
 
         result = _run_tier_attempts(
@@ -481,7 +587,11 @@ def _run_task_body(
 
     # --- Stage 3: Flag for Claude review ---
     _, test_output = run_tests(test_file, cwd=cwd)
-    failure_label = classify_failure(test_output)
+    failure_label, test_failure_label = _final_failure_label(
+        test_output,
+        ctx["llm_fail_reasons"],
+        ctx["had_successful_model_attempt"],
+    )
     FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
     _ts = datetime.now().strftime("%Y%m%dT%H%M%S")
     fail_log = FORGE_LOGS_DIR / f"FAILED-{task_name}-{_ts}.log"
@@ -495,6 +605,7 @@ def _run_task_body(
         f"+ escalation ({escalation_tier['retries']}x) "
         f"{gemini_note}all exhausted.\n"
         f"Failure class: {failure_label}\n"
+        f"Test failure class: {test_failure_label}\n"
         f"{llm_context}"
         f"Models tried: {', '.join(ctx['models_tried']) or 'none'}\n"
         f"Tokens (sent/received): {ctx['task_stats']['tokens_sent']} / {ctx['task_stats']['tokens_received']}\n"
@@ -512,6 +623,7 @@ def _run_task_body(
         duration_seconds=_elapsed(),
         models_tried=ctx["models_tried"],
         failure_class=failure_label,
+        test_failure_class=test_failure_label,
         llm_fail_reasons=ctx["llm_fail_reasons"],
         base_branch=start_point,
         base_sha=base_sha,

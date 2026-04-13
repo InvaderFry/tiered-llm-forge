@@ -12,10 +12,14 @@ from orchestrator.model_router import (
     get_fallback_models,
     _parse_retry_after,
     _parse_usage,
+    _is_invalid_model_error,
     _wait_for_model,
     _mark_rate_limited,
     _mark_request_too_large,
+    has_pending_rate_limits,
     is_request_too_large,
+    is_invalid_model,
+    mark_invalid_model,
     clear_request_too_large,
 )
 import orchestrator.model_router as _mr
@@ -77,6 +81,7 @@ class TestRateLimitCoordinator:
 
     def setup_method(self):
         _mr._next_available_at.clear()
+        _mr._invalid_models.clear()
         clear_request_too_large()
         self._fake_now = [1000.0]
         self._slept = []
@@ -88,6 +93,7 @@ class TestRateLimitCoordinator:
         _mr._clock = _t.time
         _mr._sleep = _t.sleep
         _mr._next_available_at.clear()
+        _mr._invalid_models.clear()
         clear_request_too_large()
 
     def test_wait_sleeps_remaining_window(self):
@@ -123,6 +129,11 @@ class TestRateLimitCoordinator:
         _wait_for_model("groq/qwen3-32b")
         assert len(self._slept) == 1
         assert abs(self._slept[0] - 10.0) < 0.01
+
+    def test_has_pending_rate_limits(self):
+        assert has_pending_rate_limits() is False
+        _mark_rate_limited("groq/qwen3-32b", 10.0)
+        assert has_pending_rate_limits() is True
 
 
 class TestRequestTooLargePerTask:
@@ -163,6 +174,20 @@ class TestRequestTooLargePerTask:
         assert other_thread_saw == [False]
         # Main thread still sees its own flag
         assert is_request_too_large("groq/qwen/qwen3-32b") is True
+
+
+class TestInvalidModelTracking:
+    def teardown_method(self):
+        _mr._invalid_models.clear()
+
+    def test_mark_and_query_invalid_model(self):
+        assert is_invalid_model("gemini/gemini-2.5-flash") is False
+        mark_invalid_model("gemini/gemini-2.5-flash")
+        assert is_invalid_model("gemini/gemini-2.5-flash") is True
+
+    def test_invalid_model_error_detection(self):
+        msg = 'GeminiException - {"error": {"status": "NOT_FOUND", "message": "model is not found for API version"}}'
+        assert _is_invalid_model_error(msg) is True
 
 
 class TestParseRetryAfter:

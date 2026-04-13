@@ -9,7 +9,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "templates"))
 
 import orchestrator.__main__ as cli
-from orchestrator.__main__ import _blocked_dependencies
+from orchestrator.__main__ import _blocked_dependencies, _should_cooldown
 
 
 def test_blocked_dependencies_detects_failed_and_blocked_upstream():
@@ -55,6 +55,7 @@ def dry_run_spec(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "get_config", lambda: {"cooldown_seconds": 30})
     monkeypatch.setattr(cli, "get_tier", lambda name: {"models": [f"{name}-model"], "retries": 1})
     monkeypatch.setattr(cli, "branch_exists", lambda _: False)
+    monkeypatch.setattr(cli, "run_startup_preflight", lambda repo_root=None: ([], []))
 
     return spec_path
 
@@ -88,3 +89,32 @@ def test_cmd_dry_run_fails_when_specs_or_tests_are_dirty(monkeypatch, dry_run_sp
     assert result == 1
     assert "tests/test_001_example.py has uncommitted changes." in caplog.text
     assert "Commit planner inputs before retrying:" in caplog.text
+
+
+def test_cmd_dry_run_fails_when_startup_preflight_fails(monkeypatch, dry_run_spec, caplog):
+    monkeypatch.setattr(cli, "validate_tracked_clean", lambda _: [])
+    monkeypatch.setattr(cli, "run_startup_preflight", lambda repo_root=None: (["missing aider"], []))
+
+    with caplog.at_level("ERROR"):
+        result = cli.cmd_dry_run()
+
+    assert result == 1
+    assert "Preflight error: missing aider" in caplog.text
+    assert "Cannot dry-run until preflight errors are fixed." in caplog.text
+
+
+def test_cmd_preflight_reports_errors(monkeypatch, caplog):
+    monkeypatch.setattr(cli, "run_startup_preflight", lambda repo_root=None: (["bad model"], ["legacy alias"]))
+
+    with caplog.at_level("WARNING"):
+        result = cli.cmd_preflight()
+
+    assert result == 1
+    assert "Preflight warning: legacy alias" in caplog.text
+    assert "Preflight error: bad model" in caplog.text
+
+
+def test_should_cooldown_skips_pure_skip_blocked_batches(monkeypatch):
+    monkeypatch.setattr(cli, "has_pending_rate_limits", lambda: False)
+    assert _should_cooldown(["skipped", "blocked"]) is False
+    assert _should_cooldown(["passed"]) is True

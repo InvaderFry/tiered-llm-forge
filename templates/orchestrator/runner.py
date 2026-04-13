@@ -1,9 +1,10 @@
 """Test execution and regression detection."""
 
-import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+from .preflight import maybe_prime_maven_cache
 
 
 def _resolve(path, cwd=None):
@@ -15,14 +16,70 @@ def _resolve(path, cwd=None):
 def _pytest_cmd():
     """Return the command prefix for invoking pytest.
 
-    Prefers a bare ``pytest`` when it is on PATH (the common case inside a
-    virtualenv).  Falls back to ``sys.executable -m pytest`` so the
-    orchestrator works even when the ``pytest`` console-script was installed
-    into a directory that isn't on PATH.
+    Always use the active interpreter so the orchestrator and pytest share
+    the same virtualenv, plugin set, and marker registrations.
     """
-    if shutil.which("pytest"):
-        return ["pytest"]
     return [sys.executable, "-m", "pytest"]
+
+
+def _repo_root_for_tests(test_path, cwd=None):
+    """Return the repo root for a test path, preferring the explicit cwd.
+
+    In the default sequential path ``cwd`` is usually ``None``, so a test file
+    under ``tests/`` must walk upward to find the project root rather than
+    treating ``tests/`` itself as the repo root. This matters for runtime
+    preflight helpers such as Maven cache warmup, which need to run where
+    ``pom.xml`` lives.
+    """
+    if cwd:
+        return Path(cwd)
+    start = Path(test_path).resolve()
+    if start.is_file():
+        start = start.parent
+
+    for candidate in (start, *start.parents):
+        if (candidate / "pom.xml").exists() or (candidate / ".git").exists():
+            return candidate
+
+    if start.name == "tests" and start.parent != start:
+        return start.parent
+
+    return start
+
+
+def _text_requests_offline_maven(text):
+    """Return True if a test body appears to run Maven in offline mode."""
+    return "mvn" in text and "-o" in text and ("compile" in text or "package" in text)
+
+
+def _test_requests_offline_maven(test_path):
+    """Return True if the single test file appears to use offline Maven commands."""
+    try:
+        return _text_requests_offline_maven(Path(test_path).read_text(encoding="utf-8"))
+    except OSError:
+        return False
+
+
+def _suite_requests_offline_maven(tests_path):
+    """Return True if any test file under tests_path appears to use offline Maven."""
+    for path in Path(tests_path).rglob("test_*.py"):
+        if _test_requests_offline_maven(path):
+            return True
+    return False
+
+
+def _maybe_prepare_runtime_for_tests(test_path, cwd=None):
+    """Warm known dependency caches needed by the test before pytest runs."""
+    repo_root = _repo_root_for_tests(test_path, cwd=cwd)
+    if _test_requests_offline_maven(test_path):
+        maybe_prime_maven_cache(repo_root, reason="offline Maven compile/package detected in task test")
+
+
+def _maybe_prepare_runtime_for_suite(tests_path, cwd=None):
+    """Warm known dependency caches needed by the full suite before pytest runs."""
+    repo_root = _repo_root_for_tests(tests_path, cwd=cwd)
+    if _suite_requests_offline_maven(tests_path):
+        maybe_prime_maven_cache(repo_root, reason="offline Maven compile/package detected in test suite")
 
 # Timeout for per-task test runs (seconds)
 TEST_TIMEOUT = 120
@@ -41,6 +98,7 @@ def run_tests(test_file, cwd=None):
     if not test_path.exists():
         return False, f"Test file {test_file} does not exist."
 
+    _maybe_prepare_runtime_for_tests(test_path, cwd=cwd)
     cmd = [*_pytest_cmd(), test_file, "-x", "--tb=short"]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=TEST_TIMEOUT, cwd=cwd)
@@ -67,6 +125,7 @@ def run_full_suite(tests_dir="tests", cwd=None):
     if not tests_path.exists():
         return False, f"Tests directory {tests_dir} does not exist."
 
+    _maybe_prepare_runtime_for_suite(tests_path, cwd=cwd)
     cmd = [*_pytest_cmd(), str(tests_dir), "--tb=short", "-q"]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=SUITE_TIMEOUT, cwd=cwd)

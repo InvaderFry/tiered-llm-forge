@@ -8,10 +8,13 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "templates"))
 
 from orchestrator.runner import (
+    _repo_root_for_tests,
     run_tests,
     run_full_suite,
     file_size,
     check_regression,
+    _maybe_prepare_runtime_for_suite,
+    _maybe_prepare_runtime_for_tests,
     _content_looks_valid,
     _CONTENT_MARKERS,
 )
@@ -214,6 +217,29 @@ class TestRunTests:
         assert passed is False
         assert "Vacuous pass" in output
 
+    def test_offline_maven_test_triggers_runtime_preflight(self, tmp_path, monkeypatch):
+        test_file = tmp_path / "test_maven.py"
+        test_file.write_text('run_checked("mvn", "-o", "-q", "-DskipTests", "compile")\n')
+        calls = []
+        monkeypatch.setattr(
+            "orchestrator.runner.maybe_prime_maven_cache",
+            lambda repo_root, reason=None: calls.append((str(repo_root), reason)) or (True, ""),
+        )
+
+        _maybe_prepare_runtime_for_tests(test_file)
+
+        assert calls == [(str(tmp_path), "offline Maven compile/package detected in task test")]
+
+    def test_repo_root_for_tests_walks_up_to_project_root(self, tmp_path):
+        project = tmp_path / "project"
+        tests_dir = project / "tests"
+        tests_dir.mkdir(parents=True)
+        (project / "pom.xml").write_text("<project/>\n")
+        test_file = tests_dir / "test_maven.py"
+        test_file.write_text("pass\n")
+
+        assert _repo_root_for_tests(test_file) == project
+
 
 class TestRunFullSuite:
     def test_passing_suite(self, tmp_path):
@@ -234,3 +260,17 @@ class TestRunFullSuite:
         passed, output = run_full_suite(str(tmp_path / "nope"))
         assert passed is False
         assert "does not exist" in output
+
+    def test_suite_runtime_preflight_scans_for_offline_maven(self, tmp_path, monkeypatch):
+        tests_dir = tmp_path / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_pkg.py").write_text('run_checked("mvn", "-o", "-q", "-DskipTests", "package")\n')
+        calls = []
+        monkeypatch.setattr(
+            "orchestrator.runner.maybe_prime_maven_cache",
+            lambda repo_root, reason=None: calls.append((str(repo_root), reason)) or (True, ""),
+        )
+
+        _maybe_prepare_runtime_for_suite(tests_dir)
+
+        assert calls == [(str(tmp_path), "offline Maven compile/package detected in test suite")]

@@ -2,7 +2,7 @@
 
 This project uses an automated pipeline (`python3 -m orchestrator`) that feeds
 spec files through escalating model tiers:
-**Qwen3 32B → Kimi K2 → Llama 4 Scout → GPT-OSS 120B → Gemini 3 Flash → Gemini 2.5 Flash**
+**Qwen3 32B → Kimi K2 → Llama 4 Scout → GPT-OSS 120B → Gemini 2.5 Flash**
 
 Your job during planning is to produce **files on disk** that the pipeline can
 execute without further human input.
@@ -60,7 +60,7 @@ orchestrator to save tokens — keep important details in other sections.
 
 - **One target file per task.** Split multi-file work into separate tasks.
 - **Zero-padded three-digit task numbers:** `task-001`, `task-002`, etc.
-- **Keep specs under ~12,000 characters.** Longer specs get auto-compressed.
+- **Keep specs under ~12,000 characters.** Longer specs trigger warnings and should be split before orchestration.
 - **Commit planner inputs before orchestration.** Before `make run` or `make parallel`,
   all new or edited task specs and their referenced test files must be tracked by git
   and committed.
@@ -74,6 +74,13 @@ orchestrator to save tokens — keep important details in other sections.
   will fail. Prefer a linear chain (A → B → C) over a fan-in (A, B, C → D)
   whenever the tasks might touch overlapping code.
 - **Never include implementation code.** Signatures and types only.
+
+### Quality bar for generated services
+
+- **Prefer production-leaning contracts over toy scaffolding.** If a task creates a service/client/CLI, the spec should demand explicit error handling, timeouts, and stable interfaces.
+- **For Java/Spring tasks:** prefer typed DTOs/records over raw `Map` parsing, constructor injection over field injection, explicit HTTP timeouts, and clear non-zero exit behavior for CLI failures.
+- **For external calls:** require local mocks in tests and explicit configuration points (`base-url`, output paths, timeouts) so acceptance tests can run without live services.
+- **For cross-cutting setup:** if the tests depend on warmed caches or toolchain state (for example `mvn -o`), note that in `SpecsReadMe.md` and keep the narrowest possible acceptance test that still proves the behavior.
 
 ---
 
@@ -123,9 +130,10 @@ task-004  API layer (depends on task-002 + task-003)
 Quick version:
 1. Read `specs/task-NNN-name.md` + `forgeLogs/FAILED-task-NNN-name-<timestamp>.log`.
    The log header includes a **failure class**
-   (`rate_limit`, `gemini_quota_exhausted`, `request_too_large`,
+   (`dependency_cache_missing`, `invalid_model_config`, `rate_limit`,
+   `gemini_quota_exhausted`, `request_too_large`,
    `collection_error`, `missing_symbol`, `assertion`, `timeout`,
-   `regression_guard`, `merge_conflict`, `unknown`) and the list of
+   `forbidden_file_edit`, `regression_guard`, `merge_conflict`, `unknown`) and the list of
    models tried — use these to pick the right fix before reading the
    full output. If you see `gemini_quota_exhausted`, the Gemini tier
    was already attempted but had no daily quota remaining; this is not
@@ -173,6 +181,7 @@ integration safety + code quality, then MERGE / FIX THEN MERGE / FLAG.
 | Command | What it does |
 |---------|-------------|
 | `make validate` | Check all specs for errors before running |
+| `make preflight` | Validate config, provider env, and runtime prerequisites |
 | `make dry-run` | Preview pipeline without calling models |
 | `make run` | Run the full pipeline |
 | `make resume` | Resume failed tasks from last attempt instead of flagging for review |
@@ -215,7 +224,7 @@ Linear dependency chains see no benefit since each wave has only one task.
 
 | User says... | You do... |
 |---|---|
-| "Build X" | Decompose, write specs + tests + SpecsReadMe.md. End with: "Run `make validate`, then commit `specs/` and `tests/`, then run `make dry-run` before `make run` or `make parallel`." |
+| "Build X" | Decompose, write specs + tests + SpecsReadMe.md. End with: "Run `make validate`, then `make preflight`, then commit `specs/` and `tests/`, then run `make dry-run` before `make run` or `make parallel`." |
 | "Review specs" | Read SpecsReadMe.md, flag issues, edit specs |
 | "Fix the failures" | Read spec + log, checkout branch, fix, pytest, commit |
 | "Review branches" | Diff each branch vs spec, MERGE / FIX / FLAG |

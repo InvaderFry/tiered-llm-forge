@@ -29,9 +29,11 @@ dependencies) and the function signatures / constraints.
 
 ### 2. Understand what went wrong
 Read `forgeLogs/FAILED-task-NNN-name-<timestamp>.log`. The header now contains:
-- A **failure class** tag — one of `rate_limit`, `request_too_large`,
-  `collection_error`, `missing_symbol`, `assertion`, `timeout`,
-  `regression_guard`, `merge_conflict`, or `unknown`.
+- A **failure class** tag — one of `dependency_cache_missing`,
+  `invalid_model_config`, `rate_limit`, `request_too_large`,
+  `forbidden_file_edit`, `collection_error`, `missing_symbol`, `assertion`,
+  `timeout`, `regression_guard`, `merge_conflict`, `gemini_quota_exhausted`,
+  or `unknown`.
 - The list of models tried in order.
 - The full pytest output from the last attempt.
 
@@ -39,9 +41,12 @@ Use the failure class to pick a strategy before reading the body:
 
 | Class | What it usually means | First move |
 |---|---|---|
+| `dependency_cache_missing` | Offline Maven/build tool can't find a dependency that was never fetched | Run `make preflight` to warm the cache, then re-run |
+| `invalid_model_config` | Provider returned 404 — the configured model ID doesn't exist | Check `models.yaml` for typos or placeholder IDs; run `make preflight` |
 | `rate_limit` | Groq throttled every tier | Wait, re-run — not a code bug |
 | `gemini_quota_exhausted` | Gemini daily quota hit before it could fix | Wait until midnight UTC, or fix with Claude now |
 | `request_too_large` | Spec exceeds the model's TPM cap | Split the spec into smaller tasks |
+| `forbidden_file_edit` | Model edited a file outside its allowed write scope | Read the spec target; the model strayed — may need a tighter spec |
 | `collection_error` | pytest could not even import the test file | Fix imports or missing module in target file |
 | `missing_symbol` | `ImportError` / `AttributeError` / `NameError` | Add the symbol the test expects, or fix the spec signature |
 | `assertion` | Tests ran but produced wrong answers | Genuine logic bug — debug normally |
@@ -51,9 +56,12 @@ Use the failure class to pick a strategy before reading the body:
 | `unknown` | No rule matched | Read the full log |
 
 You can also run `cat pipeline-state.json` and look at the task entry
-for its recorded `model`, `models_tried`, `llm_fail_reasons`,
-`duration_seconds`, `tokens_sent`, `tokens_received`, `cost_usd`,
-`base_branch`, and `base_sha`. `llm_fail_reasons` lists any
+for its recorded `model`, `models_tried`, `failure_class`,
+`test_failure_class`, `llm_fail_reasons`, `duration_seconds`,
+`tokens_sent`, `tokens_received`, `cost_usd`, `base_branch`, and `base_sha`.
+`failure_class` is the terminal/actionable label (may reflect an LLM-side
+reason when no model produced a successful edit); `test_failure_class` is the
+raw classification of the final pytest output. `llm_fail_reasons` lists any
 automated-tier-level signals (e.g. `gemini_quota_exhausted`) that
 explain why the pipeline stopped before reaching Claude. `base_branch`
 tells you which branch the task was stacked on — useful when diagnosing

@@ -16,16 +16,14 @@ tiers:
     retries: 2
 
   # Gemini tier: tried after escalation, before flagging for Claude review.
-  # Requires GEMINI_API_KEY=<your-key> in .env (never committed).
+  # Requires GOOGLE_API_KEY=<your-key> in .env (never committed).
+  # GEMINI_API_KEY is still accepted as a legacy alias and mirrored automatically.
   # Aider/LiteLLM picks the key up automatically via the gemini/ provider prefix.
   # Daily quota exhaustion causes immediate model-skip (no sleep), then falls
   # through to Claude review if both models are exhausted for the day.
-  # NOTE: gemini/gemini-3.0-flash is a placeholder — verify the LiteLLM model ID
-  # once Gemini 3 Flash is confirmed available.
   - name: gemini
     models:
-      - gemini/gemini-3.0-flash       # Gemini 3 Flash (primary)
-      - gemini/gemini-2.5-flash       # Gemini 2.5 Flash fallback
+      - gemini/gemini-2.5-flash
     retries: 1                         # One attempt per model; daily quota errors skip, not retry
 
 # Weak model for commit messages and safe operations (low token cost)
@@ -39,6 +37,13 @@ weak_model: groq/llama-3.1-8b-instant
 spec_limits:
   soft_limit_chars: 12000   # validation warning above this
   hard_limit_chars: 16000   # validation warning + likely TPM trouble above this
+
+# Read-only context budget for aider. Spec + test are always attached; dependency
+# target files are attached until these limits are reached.
+context_limits:
+  max_read_files: 4
+  max_dependency_files: 2
+  max_total_bytes: 24000
 
 # Seconds to pause between tasks as a defensive baseline.
 #

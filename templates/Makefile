@@ -1,4 +1,4 @@
-.PHONY: setup env plan run resume parallel validate dry-run fix review status clean
+.PHONY: setup env preflight plan run resume parallel validate dry-run fix review status clean
 
 SHELL := /bin/bash
 
@@ -19,6 +19,10 @@ setup: ## Create .venv and install Python dependencies
 env: ## Print loaded environment (confirm keys are set)
 	@echo "GROQ_API_KEY=$${GROQ_API_KEY:+set (hidden)}"
 	@echo "GOOGLE_API_KEY=$${GOOGLE_API_KEY:+set (hidden)}"
+	@echo "GEMINI_API_KEY=$${GEMINI_API_KEY:+set (hidden, legacy alias)}"
+
+preflight: ## Validate config, provider env, and runtime prerequisites
+	set -o pipefail && $(PYTHON) -m orchestrator --preflight 2>&1 | tee preflight.log
 
 plan: ## Open Claude Code for planning
 	claude

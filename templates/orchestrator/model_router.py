@@ -42,6 +42,7 @@ _next_available_at: dict = {}
 # "daily quota" means the API key has no budget left regardless of which task
 # is asking. Protected by the same _rate_limit_lock.
 _daily_quota_exhausted: set = set()
+_invalid_models: set = set()
 # Request-too-large is per-task and per-thread, not session-wide. A long spec
 # that blows past qwen3's 6k TPM cap must not cause the NEXT task's tiny spec
 # to also skip qwen3. We store the flag on a threading.local so worktree-mode
@@ -125,6 +126,18 @@ def is_daily_quota_exhausted(model: str) -> bool:
         return model in _daily_quota_exhausted
 
 
+def mark_invalid_model(model: str) -> None:
+    """Record that ``model`` is misconfigured or unsupported for this run."""
+    with _rate_limit_lock:
+        _invalid_models.add(model)
+
+
+def is_invalid_model(model: str) -> bool:
+    """Return True if the provider reported ``model`` as unsupported/not found."""
+    with _rate_limit_lock:
+        return model in _invalid_models
+
+
 def all_gemini_quota_exhausted() -> bool:
     """Return True if every model in the gemini tier has exhausted its daily quota.
 
@@ -136,6 +149,13 @@ def all_gemini_quota_exhausted() -> bool:
     except ValueError:
         return False
     return all(is_daily_quota_exhausted(m) for m in tier["models"])
+
+
+def has_pending_rate_limits() -> bool:
+    """Return True when any model still has a future retry window recorded."""
+    now = _clock()
+    with _rate_limit_lock:
+        return any(earliest > now for earliest in _next_available_at.values())
 
 
 def _mark_rate_limited(model, retry_after, buffer=5.0):
@@ -203,6 +223,19 @@ def _is_daily_quota_error(combined_output: str, retry_after) -> bool:
         any(s in combined_output for s in _GEMINI_DAILY_QUOTA_STRINGS)
         and retry_after is None
     )
+
+
+_INVALID_MODEL_STRINGS = (
+    '"status": "NOT_FOUND"',
+    "is not found for API version",
+    "Unknown model",
+    "does not exist for provider",
+)
+
+
+def _is_invalid_model_error(combined_output: str) -> bool:
+    """Return True if provider output says the requested model id is invalid."""
+    return any(s in combined_output for s in _INVALID_MODEL_STRINGS)
 
 
 # Aider stdout reports usage on lines like:
@@ -275,7 +308,7 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
     When ``cwd`` is set, aider runs inside that directory (e.g. a git
     worktree) and all relative paths resolve there.
 
-    Returns ``(success, stats)`` where ``stats`` is the dict produced by
+    Returns ``(success, stats, reason)`` where ``stats`` is the dict produced by
     ``_parse_usage`` summed across every internal retry. Failed runs
     still return whatever stats accrued before the failure (a model can
     burn tokens before crashing).
@@ -338,7 +371,7 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
             )
         except subprocess.TimeoutExpired:
             log.warning("  [aider timed out after %ds on model %s]", aider_timeout, model)
-            return False, invocation_stats
+            return False, invocation_stats, "timeout"
         if result.stdout:
             log.info("%s", result.stdout.rstrip())
         if result.stderr:
@@ -369,7 +402,12 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
         if _is_daily_quota_error(combined, retry_after):
             log.warning("  [Gemini daily quota exhausted for %s -- skipping model]", model)
             mark_daily_quota_exhausted(model)
-            return False, invocation_stats
+            return False, invocation_stats, "daily_quota_exhausted"
+
+        if _is_invalid_model_error(combined):
+            log.warning("  [invalid model config for %s -- skipping model]", model)
+            mark_invalid_model(model)
+            return False, invocation_stats, "invalid_model_config"
 
         if "rate_limit_exceeded" in combined or "Rate limit reached" in combined:
             # "Request too large" means the request itself exceeds the TPM cap —
@@ -378,7 +416,7 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
             if "Request too large" in combined:
                 log.warning("  [request too large for model %s TPM cap -- falling back]", model)
                 _mark_request_too_large(model)
-                return False, invocation_stats
+                return False, invocation_stats, "request_too_large"
 
             wait = retry_after
             if wait:
@@ -394,15 +432,16 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
             if attempt < AIDER_MAX_RATE_RETRIES:
                 _sleep(wait)
                 continue
+            return False, invocation_stats, "rate_limit"
 
         # No rate-limit error — trust the exit code.
         if result.returncode == 0:
-            return True, invocation_stats
+            return True, invocation_stats, "ok"
 
         # Non-rate-limit error or exhausted retries
-        return False, invocation_stats
+        return False, invocation_stats, "error"
 
-    return False, invocation_stats
+    return False, invocation_stats, "rate_limit"
 
 
 def run_with_tier_fallback(tier_name, message, target_file, start_model=None, read_files=None,
@@ -411,7 +450,7 @@ def run_with_tier_fallback(tier_name, message, target_file, start_model=None, re
     Try all models in a tier with fallback.
 
     Tries each model in the tier. On rate limit exhaustion for one model,
-    moves to the next. Returns ``(success, model_used, stats)``. The
+    moves to the next. Returns ``(success, model_used, stats, attempts)``. The
     ``stats`` dict aggregates token / cost usage across every model
     attempted in this call (including failed attempts that still spent
     tokens). ``read_files`` is forwarded to aider as read-only context.
@@ -424,17 +463,25 @@ def run_with_tier_fallback(tier_name, message, target_file, start_model=None, re
         models = models[idx:]
 
     aggregate = _empty_stats()
+    attempts = []
     for model in models:
         if is_request_too_large(model):
             log.info("  Skipping %s -- request too large (already seen this task)", model)
+            attempts.append({"model": model, "reason": "request_too_large", "success": False})
             continue
         if is_daily_quota_exhausted(model):
             log.info("  Skipping %s -- daily quota exhausted", model)
+            attempts.append({"model": model, "reason": "daily_quota_exhausted", "success": False})
+            continue
+        if is_invalid_model(model):
+            log.info("  Skipping %s -- invalid model config", model)
+            attempts.append({"model": model, "reason": "invalid_model_config", "success": False})
             continue
         log.info("  Trying %s...", model)
-        success, stats = run_aider(model, message, target_file, read_files=read_files, cwd=cwd)
+        success, stats, reason = run_aider(model, message, target_file, read_files=read_files, cwd=cwd)
         aggregate = _add_stats(aggregate, stats)
+        attempts.append({"model": model, "reason": reason, "success": success})
         if success:
-            return True, model, aggregate
+            return True, model, aggregate, attempts
 
-    return False, None, aggregate
+    return False, None, aggregate, attempts
