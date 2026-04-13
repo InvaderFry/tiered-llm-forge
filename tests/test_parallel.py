@@ -2,12 +2,13 @@
 
 import os
 import sys
+import tempfile
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "templates"))
 
-from orchestrator.parallel import find_parallel_groups
+from orchestrator.parallel import WorktreePool, find_parallel_groups
 
 
 def _spec(name, deps=None):
@@ -85,3 +86,15 @@ class TestFindParallelGroups:
         groups = find_parallel_groups(specs)
         assert len(groups) == 1
         assert [s["task_name"] for s in groups[0]] == ["C", "A", "B"]
+
+
+class TestWorktreePool:
+    def test_default_base_dir_is_absolute_and_outside_repo(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        pool = WorktreePool()
+        try:
+            assert pool.base_dir.is_absolute()
+            assert str(pool.base_dir).startswith(tempfile.gettempdir())
+            assert tmp_path not in pool.base_dir.parents
+        finally:
+            pool.cleanup()

@@ -11,10 +11,12 @@ def print_summary(results, default_branch, state=None):
     passed = results["passed"]
     failed = results["failed"]
     skipped = results["skipped"]
+    blocked = results.get("blocked", [])
 
     log.info("\n%s", "=" * 50)
     log.info("PASSED:  %d", len(passed))
     log.info("SKIPPED: %d (already passing)", len(skipped))
+    log.info("BLOCKED: %d (dependency failure)", len(blocked))
     log.info("FAILED:  %d", len(failed))
 
     # Observability roll-up: per-model success/failure counts, task
@@ -53,7 +55,8 @@ def print_summary(results, default_branch, state=None):
             line = (
                 f"  {model}: {counts.get('passed', 0)} passed, "
                 f"{counts.get('failed', 0)} failed, "
-                f"{counts.get('skipped', 0)} skipped"
+                f"{counts.get('skipped', 0)} skipped, "
+                f"{counts.get('blocked', 0)} blocked"
             )
             if counts["tokens_sent"] or counts["cost_usd"]:
                 line += (
@@ -71,6 +74,14 @@ def print_summary(results, default_branch, state=None):
             log.info("Failure classes:")
             for fc, n in sorted(fail_classes.items(), key=lambda x: -x[1]):
                 log.info("  %s: %d", fc, n)
+
+    if blocked:
+        log.info("\nBlocked tasks:")
+        for task_name in blocked:
+            entry = state.get("tasks", {}).get(task_name, {}) if state else {}
+            deps = entry.get("blocked_by") or []
+            detail = ", ".join(deps) if deps else "failed dependencies"
+            log.info("  %s (%s)", task_name, detail)
 
     if failed:
         log.info("\n%s", "=" * 50)
@@ -101,6 +112,10 @@ def print_summary(results, default_branch, state=None):
             log.info("  Prompt: > Fix %s. The log is at %s.", f, fail_log)
         log.info("\nAfter Claude fixes each failure, re-run: python3 -m orchestrator")
         log.info("Fixed tasks are detected as passing and skipped automatically.")
+    elif blocked:
+        log.info("\n%s", "=" * 50)
+        log.info("Some tasks were blocked by earlier dependency failures.")
+        log.info("Fix the failed upstream tasks, then re-run the orchestrator.")
     else:
         log.info("\n%s", "=" * 50)
         log.info("All tasks passing -- ready to merge.")

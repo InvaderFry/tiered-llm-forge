@@ -49,11 +49,12 @@ From here, follow the workflow in that project's `ORCHESTRATION.md`.
     > "I want to build [feature]. Generate the specs and tests."
 4.  make validate                    # check specs for errors
 5.  Review specs/ manually
-6.  make run                         # run the pipeline
-7.  For failures: back to claude
+6.  git add specs tests && git commit -m "chore: add task specs and tests"
+7.  make run                         # run the pipeline
+8.  For failures: back to claude
     > "Fix the failures."
-8.  Repeat 6-7 until all tasks pass
-9.  Back to claude for the final quality gate
+9.  Repeat 7-8 until all tasks pass
+10. Back to claude for the final quality gate
     > "Review the task branches and merge them."
 ```
 
@@ -96,6 +97,10 @@ merge review.
 
 Re-running is safe — passing branches are skipped, failing branches go straight
 to Claude review. Pipeline state persists across crashes.
+
+Before any real run, the referenced `specs/` and `tests/` files must already be
+tracked by git and clean. This is required so parallel worktrees and integration
+merges see the same inputs as the main working tree.
 
 Pass `--parallel` (or `make parallel`) to run independent tasks concurrently.
 The orchestrator partitions the dependency graph into waves and executes each

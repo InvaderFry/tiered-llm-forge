@@ -43,6 +43,7 @@ def append_run_summary(state, results):
         "passed": list(results.get("passed", [])),
         "failed": list(results.get("failed", [])),
         "skipped": list(results.get("skipped", [])),
+        "blocked": list(results.get("blocked", [])),
     }
     with _state_lock:
         state.setdefault("runs", []).append(entry)
@@ -66,6 +67,7 @@ def record_task(
     models_tried=None,
     failure_class=None,
     llm_fail_reasons=None,
+    blocked_by=None,
     base_branch=None,
     base_sha=None,
     tokens_sent=None,
@@ -93,6 +95,8 @@ def record_task(
         entry["failure_class"] = failure_class
     if llm_fail_reasons is not None:
         entry["llm_fail_reasons"] = list(llm_fail_reasons)
+    if blocked_by is not None:
+        entry["blocked_by"] = list(blocked_by)
     if base_branch is not None:
         entry["base_branch"] = base_branch
     if base_sha is not None:

@@ -12,11 +12,13 @@ from orchestrator.git_ops import (
     get_default_branch,
     ensure_default_branch_exists,
     branch_exists,
+    changed_files_between,
     checkout,
     current_branch,
     merge_branch,
     delete_branch,
     branch_tip,
+    validate_tracked_clean,
 )
 from orchestrator.task_runner import revert_last_commit
 
@@ -184,6 +186,51 @@ class TestBranchTip:
 
     def test_nonexistent_branch(self, git_repo):
         assert branch_tip("no-such-branch") == ""
+
+
+class TestChangedFilesBetween:
+    def test_reports_repo_relative_changed_files(self, git_repo):
+        before = branch_tip("HEAD")
+        (git_repo / "src.py").write_text("print('hi')\n")
+        subprocess.run(["git", "add", "src.py"], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add src"], check=True, capture_output=True)
+        after = branch_tip("HEAD")
+
+        assert changed_files_between(before, after) == ["src.py"]
+
+
+class TestValidateTrackedClean:
+    def test_clean_tracked_paths_pass(self, git_repo):
+        p = git_repo / "specs"
+        p.mkdir()
+        spec = p / "task-001.md"
+        spec.write_text("hello\n")
+        subprocess.run(["git", "add", "specs/task-001.md"], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add spec"], check=True, capture_output=True)
+
+        assert validate_tracked_clean(["specs/task-001.md"]) == []
+
+    def test_untracked_path_fails(self, git_repo):
+        p = git_repo / "specs"
+        p.mkdir()
+        (p / "task-001.md").write_text("hello\n")
+
+        errors = validate_tracked_clean(["specs/task-001.md"])
+        assert len(errors) == 1
+        assert "not tracked by git" in errors[0]
+
+    def test_dirty_tracked_path_fails(self, git_repo):
+        p = git_repo / "tests"
+        p.mkdir()
+        test_file = p / "test_task.py"
+        test_file.write_text("def test_ok():\n    assert True\n")
+        subprocess.run(["git", "add", "tests/test_task.py"], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add test"], check=True, capture_output=True)
+
+        test_file.write_text("def test_ok():\n    assert False\n")
+        errors = validate_tracked_clean(["tests/test_task.py"])
+        assert len(errors) == 1
+        assert "uncommitted changes" in errors[0]
 
 
 class TestRevertLastCommit:

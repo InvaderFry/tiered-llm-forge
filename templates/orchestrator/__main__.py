@@ -14,14 +14,27 @@ from . import SPECS_DIR
 from .config import load_config, get_config, get_tier
 from .log import setup_logging, get_logger
 from .spec_parser import load_spec, validate_specs, topological_sort
-from .git_ops import get_default_branch, ensure_default_branch_exists, branch_exists
-from .state import load_state, save_state, append_run_summary
+from .git_ops import (
+    get_default_branch,
+    ensure_default_branch_exists,
+    branch_exists,
+    validate_tracked_clean,
+)
+from .state import load_state, save_state, append_run_summary, record_task
 from .task_runner import run_task
 from .integration import integration_gate
 from .parallel import find_parallel_groups, run_parallel_group
 from .summary import print_summary
 
 log = get_logger("cli")
+
+
+def _blocked_dependencies(spec, outcomes):
+    """Return failed/blocked dependencies for *spec* based on prior outcomes."""
+    return [
+        dep for dep in (spec.get("dependencies", []) or [])
+        if outcomes.get(dep) in {"failed", "blocked"}
+    ]
 
 
 def cmd_validate():
@@ -153,10 +166,20 @@ def main():
     cooldown = cfg.get("cooldown_seconds", 30)
 
     state = load_state()
-    results = {"passed": [], "failed": [], "skipped": []}
+    results = {"passed": [], "failed": [], "skipped": [], "blocked": []}
 
     ordered_specs = [load_spec(sf) for sf in ordered]
     specs_by_name = {s["task_name"]: s for s in ordered_specs}
+    preflight_errors = validate_tracked_clean(
+        [str(s["path"]) for s in ordered_specs] + [s["test"] for s in ordered_specs]
+    )
+    if preflight_errors:
+        log.error("Cannot run: task specs/tests must be committed and clean before orchestration.")
+        for err in preflight_errors:
+            log.error("  ✗  %s", err)
+        sys.exit(1)
+
+    outcomes = {}
 
     if args.parallel is not None:
         # Wave mode: group independent tasks and run each wave concurrently
@@ -166,13 +189,40 @@ def main():
                  len(groups), len(ordered_specs), max_workers)
         for wave_i, group in enumerate(groups, 1):
             log.info("\n--- Wave %d: %d task(s) ---", wave_i, len(group))
-            wave_results = run_parallel_group(
-                group, default_branch, state, run_task,
-                specs_by_name=specs_by_name, resume=args.resume,
-                max_workers=max_workers,
-            )
+            runnable = []
+            for spec in group:
+                blocked_by = _blocked_dependencies(spec, outcomes)
+                if blocked_by:
+                    task_name = spec["task_name"]
+                    log.info(
+                        "  [blocked] %s -- dependency failure in %s",
+                        task_name, ", ".join(blocked_by),
+                    )
+                    record_task(
+                        state,
+                        task_name,
+                        "blocked",
+                        duration_seconds=0,
+                        failure_class="dependency_failed",
+                        blocked_by=blocked_by,
+                    )
+                    save_state(state)
+                    results["blocked"].append(task_name)
+                    outcomes[task_name] = "blocked"
+                else:
+                    runnable.append(spec)
+
+            if runnable:
+                wave_results = run_parallel_group(
+                    runnable, default_branch, state, run_task,
+                    specs_by_name=specs_by_name, resume=args.resume,
+                    max_workers=max_workers,
+                )
+            else:
+                wave_results = {}
             for task_name, outcome in wave_results.items():
                 results[outcome].append(task_name)
+                outcomes[task_name] = outcome
 
             # Cooldown between waves
             if wave_i < len(groups) and cooldown > 0:
@@ -191,8 +241,26 @@ def main():
                 max_wave,
             )
         for i, spec in enumerate(ordered_specs):
+            blocked_by = _blocked_dependencies(spec, outcomes)
+            if blocked_by:
+                task_name = spec["task_name"]
+                log.info("  [blocked] %s -- dependency failure in %s", task_name, ", ".join(blocked_by))
+                record_task(
+                    state,
+                    task_name,
+                    "blocked",
+                    duration_seconds=0,
+                    failure_class="dependency_failed",
+                    blocked_by=blocked_by,
+                )
+                save_state(state)
+                results["blocked"].append(task_name)
+                outcomes[task_name] = "blocked"
+                continue
+
             outcome = run_task(spec, default_branch, state, specs_by_name=specs_by_name, resume=args.resume)
             results[outcome].append(spec["task_name"])
+            outcomes[spec["task_name"]] = outcome
 
             # Cooldown between tasks
             if i < len(ordered_specs) - 1 and outcome != "skipped" and cooldown > 0:
@@ -207,11 +275,11 @@ def main():
 
     # Integration gate: only run if every task succeeded (passed or skipped).
     # Failed tasks must be resolved before we try to assemble a merge.
-    if not results["failed"]:
+    if not results["failed"] and not results["blocked"]:
         all_task_names = [s["task_name"] for s in ordered_specs]
         integration_gate(all_task_names, default_branch, state)
     else:
-        log.info("\n[integration gate] Skipped -- resolve failed tasks first.")
+        log.info("\n[integration gate] Skipped -- resolve failed/blocked tasks first.")
 
     save_state(state)
 

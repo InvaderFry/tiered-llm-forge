@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "templates"))
 
-from orchestrator.task_runner import _compute_resume_starts
+from orchestrator.task_runner import _compute_resume_starts, _forbidden_changed_files
 
 
 class TestComputeResumeStarts:
@@ -58,3 +58,15 @@ class TestComputeResumeStarts:
         assert p_start == 1
         assert e_start == 1
         assert skip_gemini is True
+
+
+class TestForbiddenChangedFiles:
+    def test_allows_only_target_file(self):
+        forbidden = _forbidden_changed_files(
+            ["src/app.py", "tests/test_app.py", "README.md"],
+            {"src/app.py"},
+        )
+        assert forbidden == ["README.md", "tests/test_app.py"]
+
+    def test_empty_when_only_allowed_file_changed(self):
+        assert _forbidden_changed_files(["src/app.py"], {"src/app.py"}) == []

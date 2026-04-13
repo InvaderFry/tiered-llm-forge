@@ -4,6 +4,7 @@ import re
 import subprocess
 import time
 from datetime import datetime
+from pathlib import Path
 
 from . import FORGE_LOGS_DIR
 from .config import get_tier
@@ -11,6 +12,7 @@ from .failure_class import classify as classify_failure
 from .git_ops import (
     branch_exists,
     branch_tip,
+    changed_files_between,
     checkout,
     merge_branch,
     resolve_dependency_base,
@@ -36,12 +38,17 @@ def _strip_urls(text):
     return _URL_RE.sub("[URL]", text)
 
 
-def revert_last_commit(target_file, baseline_size, cwd=None):
+def revert_last_commit(target_file, baseline_size, cwd=None, reason=None):
     """Undo the last commit and log a warning about the regression.
 
     Lives here (rather than git_ops.py) because it needs ``file_size`` from
     runner.py; keeping it in git_ops.py would create a runner↔git_ops cycle.
     """
+    if reason:
+        log.warning("  %s", reason)
+        subprocess.run(["git", "reset", "--hard", "HEAD~1"], check=True, timeout=GIT_TIMEOUT, cwd=cwd)
+        return
+
     current = file_size(target_file, cwd=cwd)
     if baseline_size > 0:
         pct = int((1 - current / baseline_size) * 100)
@@ -57,11 +64,21 @@ def revert_last_commit(target_file, baseline_size, cwd=None):
     subprocess.run(["git", "reset", "--hard", "HEAD~1"], check=True, timeout=GIT_TIMEOUT, cwd=cwd)
 
 
+def _normalize_relpath(path):
+    """Normalize a repo-relative path for diff comparisons."""
+    return Path(path).as_posix()
+
+
+def _forbidden_changed_files(changed_files, allowed_write_files):
+    """Return changed files outside the task's allowed write set."""
+    return sorted(f for f in changed_files if f not in allowed_write_files)
+
+
 def _run_tier_attempts(
     tier_name, start_attempt, message_factory,
     target_file, test_file, read_files, cwd,
     task_name, state, worktree, default_branch,
-    start_model, ctx, _elapsed, start_point, base_sha,
+    start_model, ctx, _elapsed, start_point, base_sha, allowed_write_files,
 ):
     """Run all attempts for one tier, updating *ctx* in-place.
 
@@ -112,6 +129,24 @@ def _run_tier_attempts(
 
         head_after = branch_tip("HEAD", cwd=cwd)
         head_moved = bool(head_after) and head_after != head_before
+        if head_moved:
+            changed_files = changed_files_between(head_before, head_after, cwd=cwd)
+            forbidden = _forbidden_changed_files(changed_files, allowed_write_files)
+            if forbidden:
+                if "forbidden_file_edit" not in ctx["llm_fail_reasons"]:
+                    ctx["llm_fail_reasons"].append("forbidden_file_edit")
+                record_attempt(state, task_name, attempt, tier_name, model_used, success, tests_passed=False)
+                save_state(state)
+                revert_last_commit(
+                    target_file,
+                    ctx["baseline_size"],
+                    cwd=cwd,
+                    reason=(
+                        "[FORBIDDEN EDIT] Reverting attempt because it modified files outside the task target: "
+                        + ", ".join(forbidden)
+                    ),
+                )
+                continue
         if head_moved and check_regression(target_file, ctx["baseline_size"], cwd=cwd):
             record_attempt(state, task_name, attempt, tier_name, model_used, success, tests_passed=False)
             save_state(state)
@@ -347,6 +382,7 @@ def _run_task_body(
         base_sha = branch_tip(branch_name, cwd=cwd)
 
     baseline_size = file_size(target_file, cwd=cwd)
+    allowed_write_files = {_normalize_relpath(target_file)}
 
     # Assemble read-only context for the implementer model:
     # the full spec file, the test file, and the target files of every
@@ -389,7 +425,7 @@ def _run_task_body(
             "primary", primary_start, primary_message,
             target_file, test_file, read_files, cwd,
             task_name, state, worktree, default_branch,
-            first_model, ctx, _elapsed, start_point, base_sha,
+            first_model, ctx, _elapsed, start_point, base_sha, allowed_write_files,
         )
         if result == "passed":
             return "passed"
@@ -405,7 +441,7 @@ def _run_task_body(
         "escalation", escalation_start, escalation_message,
         target_file, test_file, read_files, cwd,
         task_name, state, worktree, default_branch,
-        None, ctx, _elapsed, start_point, base_sha,
+        None, ctx, _elapsed, start_point, base_sha, allowed_write_files,
     )
     if result == "passed":
         return "passed"
@@ -434,7 +470,7 @@ def _run_task_body(
             "gemini", 1, gemini_message,
             target_file, test_file, read_files, cwd,
             task_name, state, worktree, default_branch,
-            None, ctx, _elapsed, start_point, base_sha,
+            None, ctx, _elapsed, start_point, base_sha, allowed_write_files,
         )
         if result == "passed":
             return "passed"

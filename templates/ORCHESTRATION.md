@@ -101,6 +101,19 @@ Read `specs/SpecsReadMe.md` and check:
 Edit spec files directly if anything looks wrong. This is your last cheap
 chance to catch mistakes.
 
+### Commit the Task Inputs
+
+Before the orchestrator runs, the task spec files and their referenced test
+files must already be tracked by git and have no uncommitted changes. This is
+required for both sequential integration merges and parallel worktree runs.
+
+Commit them now:
+
+```bash
+git add specs tests
+git commit -m "chore: add task specs and tests"
+```
+
 ---
 
 ## Phase 5: Run the Pipeline

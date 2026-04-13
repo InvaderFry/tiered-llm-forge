@@ -173,3 +173,52 @@ def resolve_dependency_base(dependencies, default_branch, cwd=None):
     return default_branch, dep_branches
 
 
+def changed_files_between(old_ref, new_ref, cwd=None):
+    """Return repo-relative files changed between two refs."""
+    result = subprocess.run(
+        ["git", "diff", "--name-only", old_ref, new_ref],
+        capture_output=True, text=True, timeout=GIT_TIMEOUT, cwd=cwd,
+    )
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def validate_tracked_clean(paths, cwd=None):
+    """Return validation errors for spec/test inputs that must be tracked and clean.
+
+    Worktree mode only sees files that are committed into the main repository.
+    If specs/tests are untracked or dirty, parallel runs can execute against a
+    different input set than the user expects and merges can fail on untracked
+    overwrite errors. This preflight makes that state explicit before any model
+    work starts.
+    """
+    errors = []
+    seen = set()
+    for path in paths:
+        rel = str(path)
+        if not rel or rel in seen:
+            continue
+        seen.add(rel)
+
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", rel],
+            capture_output=True, text=True, timeout=GIT_TIMEOUT, cwd=cwd,
+        )
+        if tracked.returncode != 0:
+            errors.append(
+                f"{rel} is not tracked by git. Commit specs/tests before running the orchestrator."
+            )
+            continue
+
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--", rel],
+            capture_output=True, text=True, timeout=GIT_TIMEOUT, cwd=cwd,
+        )
+        if status.stdout.strip():
+            errors.append(
+                f"{rel} has uncommitted changes. Commit or stash specs/tests before running the orchestrator."
+            )
+
+    return errors
+

@@ -2,6 +2,7 @@
 
 import shutil
 import subprocess
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -43,8 +44,12 @@ class WorktreePool:
     """Manages git worktrees for parallel task execution."""
 
     def __init__(self, base_dir=None):
-        self.base_dir = Path(base_dir or ".worktrees")
-        self.base_dir.mkdir(exist_ok=True)
+        if base_dir is None:
+            repo_name = Path.cwd().resolve().name
+            self.base_dir = Path(tempfile.mkdtemp(prefix=f"forge-worktrees-{repo_name}-"))
+        else:
+            self.base_dir = Path(base_dir).resolve()
+            self.base_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
 
     def create(self, branch_name, start_point):
@@ -66,7 +71,7 @@ class WorktreePool:
                     log.error("Failed to create worktree for %s: %s", branch_name, result.stderr)
                     return None
 
-        return wt_path
+        return wt_path.resolve()
 
     def remove(self, branch_name):
         """Remove a worktree."""
