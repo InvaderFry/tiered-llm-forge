@@ -37,6 +37,24 @@ def _blocked_dependencies(spec, outcomes):
     ]
 
 
+def _spec_test_input_paths(ordered_specs):
+    """Return repo-relative spec and test paths for git preflight checks."""
+    return [str(s["path"]) for s in ordered_specs] + [s["test"] for s in ordered_specs]
+
+
+def _log_tracked_clean_errors(action, errors):
+    """Log a consistent, actionable preflight failure message."""
+    log.error(
+        "Cannot %s: task specs/tests must be committed and clean before orchestration.",
+        action,
+    )
+    for err in errors:
+        log.error("  ✗  %s", err)
+    log.error("Commit planner inputs before retrying:")
+    log.error("  git add specs tests")
+    log.error('  git commit -m "chore: add task specs and tests"')
+
+
 def cmd_validate():
     """Validate all specs and print results."""
     errors, warnings = validate_specs(SPECS_DIR)
@@ -90,6 +108,12 @@ def cmd_dry_run():
     except ValueError:
         ordered = spec_files
 
+    ordered_specs = [load_spec(sf) for sf in ordered]
+    preflight_errors = validate_tracked_clean(_spec_test_input_paths(ordered_specs))
+    if preflight_errors:
+        _log_tracked_clean_errors("dry-run", preflight_errors)
+        return 1
+
     ensure_default_branch_exists()
     default_branch = get_default_branch()
     cfg = get_config()
@@ -104,8 +128,7 @@ def cmd_dry_run():
     log.info("Cooldown: %ds between tasks", cfg.get("cooldown_seconds", 30))
     log.info("=" * 50 + "\n")
 
-    for i, sf in enumerate(ordered, 1):
-        spec = load_spec(sf)
+    for i, spec in enumerate(ordered_specs, 1):
         branch = f"task/{spec['task_name']}"
         status = "EXISTS" if branch_exists(branch) else "NEW"
         model = primary["models"][0]
@@ -170,13 +193,9 @@ def main():
 
     ordered_specs = [load_spec(sf) for sf in ordered]
     specs_by_name = {s["task_name"]: s for s in ordered_specs}
-    preflight_errors = validate_tracked_clean(
-        [str(s["path"]) for s in ordered_specs] + [s["test"] for s in ordered_specs]
-    )
+    preflight_errors = validate_tracked_clean(_spec_test_input_paths(ordered_specs))
     if preflight_errors:
-        log.error("Cannot run: task specs/tests must be committed and clean before orchestration.")
-        for err in preflight_errors:
-            log.error("  ✗  %s", err)
+        _log_tracked_clean_errors("run", preflight_errors)
         sys.exit(1)
 
     outcomes = {}

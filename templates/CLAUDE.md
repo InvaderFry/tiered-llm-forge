@@ -61,6 +61,9 @@ orchestrator to save tokens — keep important details in other sections.
 - **One target file per task.** Split multi-file work into separate tasks.
 - **Zero-padded three-digit task numbers:** `task-001`, `task-002`, etc.
 - **Keep specs under ~12,000 characters.** Longer specs get auto-compressed.
+- **Commit planner inputs before orchestration.** Before `make run` or `make parallel`,
+  all new or edited task specs and their referenced test files must be tracked by git
+  and committed.
 - **Declare dependencies in frontmatter.** The orchestrator both sorts *and*
   stacks by dependency order: task N's git branch is created from the tip
   of its dependency branch(es), so the implementer actually sees upstream
@@ -212,7 +215,7 @@ Linear dependency chains see no benefit since each wave has only one task.
 
 | User says... | You do... |
 |---|---|
-| "Build X" | Decompose, write specs + tests + SpecsReadMe.md. End with: "Run `make validate` to check specs before running the pipeline." |
+| "Build X" | Decompose, write specs + tests + SpecsReadMe.md. End with: "Run `make validate`, then commit `specs/` and `tests/`, then run `make dry-run` before `make run` or `make parallel`." |
 | "Review specs" | Read SpecsReadMe.md, flag issues, edit specs |
 | "Fix the failures" | Read spec + log, checkout branch, fix, pytest, commit |
 | "Review branches" | Diff each branch vs spec, MERGE / FIX / FLAG |
