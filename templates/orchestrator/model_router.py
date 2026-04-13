@@ -228,7 +228,7 @@ def _is_daily_quota_error(combined_output: str, retry_after) -> bool:
 _INVALID_MODEL_STRINGS = (
     '"status": "NOT_FOUND"',
     "is not found for API version",
-    "Unknown model",
+    "litellm.NotFoundError",
     "does not exist for provider",
 )
 

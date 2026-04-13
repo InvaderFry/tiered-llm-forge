@@ -23,7 +23,8 @@ tiers:
   # through to Claude review if both models are exhausted for the day.
   - name: gemini
     models:
-      - gemini/gemini-2.5-flash
+      - gemini/gemini-3-flash-preview  # Gemini 3 Flash (primary)
+      - gemini/gemini-2.5-flash        # Gemini 2.5 Flash fallback
     retries: 1                         # One attempt per model; daily quota errors skip, not retry
 
 # Weak model for commit messages and safe operations (low token cost)
