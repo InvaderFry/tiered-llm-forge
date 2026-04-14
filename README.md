@@ -85,7 +85,8 @@ dependency order:
 6. Writes `forgeLogs/FAILED-task-NNN-name-<timestamp>.log` tagged with a failure
    class (`dependency_cache_missing`, `invalid_model_config`,
    `request_too_large`, `gemini_quota_exhausted`, etc.) if all automated
-   tiers fail.
+   tiers fail. Failure and integration logs include `Start time:` at the top
+   and `End time:` at the bottom.
 6. Records per-task attempts, attempted models, duration, and terminal/test
    failure classes in `pipeline-state.json` for crash recovery and observability.
 7. Returns to the default branch, moves to next task.
@@ -113,6 +114,11 @@ the full trade-off discussion.
 Model configuration lives in a single `models.yaml` file. Three tiers run in
 sequence; adding models to a tier or changing their order is the only config
 needed to change routing behaviour.
+
+The generated `Makefile` also writes command transcripts such as
+`forgeLogs/run-<timestamp>.log`, `forgeLogs/validate-<timestamp>.log`, and
+`forgeLogs/preflight-<timestamp>.log` instead of dropping `*.log` files in the
+repo root. Those transcript logs also include explicit start and end times.
 
 | Tier | Models | Trigger |
 |------|--------|---------|

@@ -157,7 +157,8 @@ The orchestrator processes each spec in dependency order:
 5. If both tiers exhaust, tries the **Gemini tier** (1 attempt per model).
    Skips gracefully when the daily API quota is exhausted.
 6. Writes `forgeLogs/FAILED-task-NNN-name-<timestamp>.log` (tagged with a
-   failure class) if all automated tiers fail.
+   failure class) if all automated tiers fail. Failure and integration logs
+   include `Start time:` at the top and `End time:` at the bottom.
 6. Records per-task attempts, attempted models, base SHA, and both terminal
    and test failure classes in `pipeline-state.json`.
 7. Returns to default branch, moves to next task.
@@ -347,6 +348,7 @@ Phase 8; a failed gate writes `forgeLogs/INTEGRATION-FAILED-<timestamp>.log`.
 | See task branches | `git branch --list "task/*"` |
 | Pipeline state | `cat pipeline-state.json` |
 | Debug log (latest run) | `ls -t forgeLogs/orchestrator-*.log \| head -1 \| xargs cat` |
+| Latest shell transcript | `ls -t forgeLogs/run-*.log forgeLogs/resume-*.log forgeLogs/parallel-*.log 2>/dev/null \| head -1 \| xargs cat` |
 | See all commands | `make help` |
 
 ---

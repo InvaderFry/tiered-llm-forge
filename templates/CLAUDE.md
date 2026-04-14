@@ -197,6 +197,10 @@ integration safety + code quality, then MERGE / FIX THEN MERGE / FLAG.
 | `--verbose` | Enable debug-level output with timestamps |
 
 All runs write debug-level output to `forgeLogs/orchestrator-<timestamp>.log` for post-mortem analysis. Each run gets its own timestamped file so reruns never overwrite previous logs.
+The generated `Makefile` also writes command transcripts like
+`forgeLogs/run-<timestamp>.log`, `forgeLogs/validate-<timestamp>.log`, and
+`forgeLogs/preflight-<timestamp>.log`; all on-disk logs include `Start time:`
+at the top and `End time:` at the bottom.
 
 ### When to use `--parallel`
 
@@ -265,6 +269,8 @@ project-root/
 │   └── task-001-name.md    ← spec files (you generate)
 ├── forgeLogs/
 │   ├── orchestrator-<timestamp>.log  ← full debug log per run
+│   ├── run-<timestamp>.log           ← make-run shell transcript
+│   ├── validate-<timestamp>.log      ← make-validate shell transcript
 │   ├── FAILED-task-*-<timestamp>.log ← written by orchestrator on failure
 │   └── INTEGRATION-FAILED-<timestamp>.log ← written on integration failure
 ├── tests/

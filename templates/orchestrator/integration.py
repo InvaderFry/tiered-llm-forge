@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from . import FORGE_LOGS_DIR
 from .config import get_tier
 from .git_ops import branch_exists, checkout, merge_branch, delete_branch
-from .log import get_logger
+from .log import get_logger, reserve_log_path, write_timestamped_log
 from .model_router import run_with_tier_fallback, all_gemini_quota_exhausted
 from .runner import run_full_suite
 from .state import save_state
@@ -107,6 +107,7 @@ def integration_gate(passed_task_names, default_branch, state):
         log.info("\n[integration gate] No passing tasks -- skipping.")
         return True
 
+    gate_started_at = datetime.now().astimezone()
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     integration_branch = f"integration/run-{timestamp}"
 
@@ -131,14 +132,14 @@ def integration_gate(passed_task_names, default_branch, state):
 
     if failed_merges:
         FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = FORGE_LOGS_DIR / f"INTEGRATION-FAILED-{timestamp}.log"
+        log_path = reserve_log_path("INTEGRATION-FAILED")
         msg = (
             f"Integration gate failed: merge conflict on {failed_merges[0]}.\n"
             "The per-task branches individually pass their own tests, but "
             "they cannot be combined cleanly. Resolve conflicts manually or "
             "rework the spec dependencies.\n"
         )
-        log_path.write_text(msg)
+        write_timestamped_log(log_path, msg, started_at=gate_started_at)
         log.error("\n  INTEGRATION FAILED (merge conflict). See %s", log_path)
         state["integration"] = {
             "branch": integration_branch,
@@ -161,14 +162,18 @@ def integration_gate(passed_task_names, default_branch, state):
         else:
             gemini_exhausted = all_gemini_quota_exhausted()
             FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
-            log_path = FORGE_LOGS_DIR / f"INTEGRATION-FAILED-{timestamp}.log"
+            log_path = reserve_log_path("INTEGRATION-FAILED")
             quota_note = (
                 "\nGemini tier also attempted but daily quota exhausted.\n"
                 if gemini_exhausted else ""
             )
-            log_path.write_text(
-                f"Integration gate failed: full test suite failed on {integration_branch}.\n"
-                f"{quota_note}\n{output}\n"
+            write_timestamped_log(
+                log_path,
+                (
+                    f"Integration gate failed: full test suite failed on {integration_branch}.\n"
+                    f"{quota_note}\n{output}\n"
+                ),
+                started_at=gate_started_at,
             )
             log.error("  INTEGRATION FAILED (test suite). See %s", log_path)
             state["integration"] = {

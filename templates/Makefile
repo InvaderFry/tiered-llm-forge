@@ -1,6 +1,10 @@
 .PHONY: setup env preflight plan run resume parallel validate dry-run fix review status clean
 
 SHELL := /bin/bash
+LOG_DIR := forgeLogs
+SYSTEM_PYTHON := python3
+LOG_FILE_STAMP = $$( $(SYSTEM_PYTHON) -c 'from datetime import datetime; print(datetime.now().strftime("%Y%m%d-%H%M%S%f"))' )
+LOG_TIME_STAMP = $$( $(SYSTEM_PYTHON) -c 'from datetime import datetime; print(datetime.now().astimezone().isoformat(timespec="seconds"))' )
 
 # Load .env automatically for all targets
 ifneq (,$(wildcard .env))
@@ -22,25 +26,85 @@ env: ## Print loaded environment (confirm keys are set)
 	@echo "GEMINI_API_KEY=$${GEMINI_API_KEY:+set (hidden, legacy alias)}"
 
 preflight: ## Validate config, provider env, and runtime prerequisites
-	set -o pipefail && $(PYTHON) -m orchestrator --preflight 2>&1 | tee preflight.log
+	@mkdir -p $(LOG_DIR)
+	@log_file="$(LOG_DIR)/preflight-$(LOG_FILE_STAMP).log"; \
+	started_at="$(LOG_TIME_STAMP)"; \
+	set -o pipefail; \
+	{ \
+		printf 'Start time: %s\n\n' "$$started_at"; \
+		status=0; \
+		$(PYTHON) -m orchestrator --preflight 2>&1 || status=$$?; \
+		printf '\nEnd time: %s\n' "$(LOG_TIME_STAMP)"; \
+		exit $$status; \
+	} | tee "$$log_file"
 
 plan: ## Open Claude Code for planning
 	claude
 
 validate: ## Validate all specs before running the pipeline
-	set -o pipefail && $(PYTHON) -m orchestrator --validate 2>&1 | tee validate.log
+	@mkdir -p $(LOG_DIR)
+	@log_file="$(LOG_DIR)/validate-$(LOG_FILE_STAMP).log"; \
+	started_at="$(LOG_TIME_STAMP)"; \
+	set -o pipefail; \
+	{ \
+		printf 'Start time: %s\n\n' "$$started_at"; \
+		status=0; \
+		$(PYTHON) -m orchestrator --validate 2>&1 || status=$$?; \
+		printf '\nEnd time: %s\n' "$(LOG_TIME_STAMP)"; \
+		exit $$status; \
+	} | tee "$$log_file"
 
 dry-run: ## Preview what the pipeline would do without running models
-	set -o pipefail && $(PYTHON) -m orchestrator --dry-run 2>&1 | tee dry-run.log
+	@mkdir -p $(LOG_DIR)
+	@log_file="$(LOG_DIR)/dry-run-$(LOG_FILE_STAMP).log"; \
+	started_at="$(LOG_TIME_STAMP)"; \
+	set -o pipefail; \
+	{ \
+		printf 'Start time: %s\n\n' "$$started_at"; \
+		status=0; \
+		$(PYTHON) -m orchestrator --dry-run 2>&1 || status=$$?; \
+		printf '\nEnd time: %s\n' "$(LOG_TIME_STAMP)"; \
+		exit $$status; \
+	} | tee "$$log_file"
 
 run: ## Run the orchestrator pipeline
-	set -o pipefail && $(PYTHON) -m orchestrator 2>&1 | tee run.log
+	@mkdir -p $(LOG_DIR)
+	@log_file="$(LOG_DIR)/run-$(LOG_FILE_STAMP).log"; \
+	started_at="$(LOG_TIME_STAMP)"; \
+	set -o pipefail; \
+	{ \
+		printf 'Start time: %s\n\n' "$$started_at"; \
+		status=0; \
+		$(PYTHON) -m orchestrator 2>&1 || status=$$?; \
+		printf '\nEnd time: %s\n' "$(LOG_TIME_STAMP)"; \
+		exit $$status; \
+	} | tee "$$log_file"
 
 resume: ## Resume a crashed/failed run from where it left off
-	set -o pipefail && $(PYTHON) -m orchestrator --resume 2>&1 | tee run.log
+	@mkdir -p $(LOG_DIR)
+	@log_file="$(LOG_DIR)/resume-$(LOG_FILE_STAMP).log"; \
+	started_at="$(LOG_TIME_STAMP)"; \
+	set -o pipefail; \
+	{ \
+		printf 'Start time: %s\n\n' "$$started_at"; \
+		status=0; \
+		$(PYTHON) -m orchestrator --resume 2>&1 || status=$$?; \
+		printf '\nEnd time: %s\n' "$(LOG_TIME_STAMP)"; \
+		exit $$status; \
+	} | tee "$$log_file"
 
 parallel: ## Run independent tasks concurrently in dependency waves (default 4 workers)
-	set -o pipefail && $(PYTHON) -m orchestrator --parallel 2>&1 | tee run.log
+	@mkdir -p $(LOG_DIR)
+	@log_file="$(LOG_DIR)/parallel-$(LOG_FILE_STAMP).log"; \
+	started_at="$(LOG_TIME_STAMP)"; \
+	set -o pipefail; \
+	{ \
+		printf 'Start time: %s\n\n' "$$started_at"; \
+		status=0; \
+		$(PYTHON) -m orchestrator --parallel 2>&1 || status=$$?; \
+		printf '\nEnd time: %s\n' "$(LOG_TIME_STAMP)"; \
+		exit $$status; \
+	} | tee "$$log_file"
 
 fix: ## Open Claude Code to fix failures
 	@echo "Opening Claude Code — say 'Fix the failures.'"
@@ -60,9 +124,9 @@ status: ## Show task branch status and failure logs
 	@echo "=== Pipeline state ==="
 	@cat pipeline-state.json 2>/dev/null || echo "  (no state file — pipeline hasn't run yet)"
 
-clean: ## Remove forgeLogs directory, pipeline state, and legacy debug log (branches are preserved)
-	rm -rf forgeLogs pipeline-state.json orchestrator.log
-	@echo "Cleaned forgeLogs, pipeline state, and debug log."
+clean: ## Remove forgeLogs directory, pipeline state, and legacy root logs (branches are preserved)
+	rm -rf forgeLogs pipeline-state.json orchestrator.log preflight.log validate.log dry-run.log run.log
+	@echo "Cleaned forgeLogs, pipeline state, and legacy root logs."
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \

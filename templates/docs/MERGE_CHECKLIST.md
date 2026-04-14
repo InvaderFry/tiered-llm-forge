@@ -13,7 +13,7 @@ git branch --list "integration/*"
 ```
 
 You need `integration.status == "passed"` **and** no
-`INTEGRATION-FAILED.log`. The passing `integration/run-<timestamp>`
+`INTEGRATION-FAILED-<timestamp>.log`. The passing `integration/run-<timestamp>`
 branch already contains every task merged together with the full test
 suite green — treat it as the source of truth for the combined behaviour.
 

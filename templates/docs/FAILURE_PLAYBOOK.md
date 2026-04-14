@@ -29,6 +29,7 @@ dependencies) and the function signatures / constraints.
 
 ### 2. Understand what went wrong
 Read `forgeLogs/FAILED-task-NNN-name-<timestamp>.log`. The header now contains:
+- A `Start time:` line at the top and an `End time:` line at the bottom.
 - A **failure class** tag — one of `dependency_cache_missing`,
   `invalid_model_config`, `rate_limit`, `request_too_large`,
   `forbidden_file_edit`, `collection_error`, `missing_symbol`, `assertion`,

@@ -18,7 +18,7 @@ from .git_ops import (
     resolve_dependency_base,
     GIT_TIMEOUT,
 )
-from .log import get_logger
+from .log import get_logger, reserve_log_path, write_timestamped_log
 from .model_router import (
     run_with_tier_fallback,
     is_request_too_large,
@@ -339,6 +339,7 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
     branch_name = f"task/{task_name}"
     dependencies = spec.get("dependencies", []) or []
     task_started = time.time()
+    task_started_at = datetime.now().astimezone()
     models_tried = []
     worktree = cwd is not None
 
@@ -367,7 +368,7 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
             spec, default_branch, state, branch_name, task_name,
             target_file, test_file, dependencies, implement_message,
             resume, worktree, branch_preexisted, cwd, models_tried,
-            _elapsed, specs_by_name,
+            _elapsed, specs_by_name, task_started_at,
         )
     finally:
         if not worktree:
@@ -381,7 +382,7 @@ def _run_task_body(
     spec, default_branch, state, branch_name, task_name,
     target_file, test_file, dependencies, implement_message,
     resume, worktree, branch_preexisted, cwd, models_tried,
-    _elapsed, specs_by_name,
+    _elapsed, specs_by_name, task_started_at,
 ):
     """Inner implementation of run_task, separated so run_task can wrap it in
     a try/finally that guarantees HEAD is restored to default_branch."""
@@ -415,9 +416,12 @@ def _run_task_body(
         else:
             log.info("  Previously failed -- escalating to Claude review.")
             FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
-            _ts = datetime.now().strftime("%Y%m%dT%H%M%S")
-            fail_log = FORGE_LOGS_DIR / f"FAILED-{task_name}-{_ts}.log"
-            fail_log.write_text(f"Previously attempted -- still failing on re-run.\n\n{output}")
+            fail_log = reserve_log_path(f"FAILED-{task_name}")
+            write_timestamped_log(
+                fail_log,
+                f"Previously attempted -- still failing on re-run.\n\n{output}",
+                started_at=task_started_at,
+            )
             if not worktree:
                 checkout(default_branch)
             record_task(
@@ -452,13 +456,16 @@ def _run_task_body(
             log.info("  Merging dependency branch %s into %s", dep_branch, branch_name)
             if not merge_branch(dep_branch, message=f"merge: {dep_branch} into {branch_name}", cwd=cwd):
                 FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
-                _ts = datetime.now().strftime("%Y%m%dT%H%M%S")
-                fail_log = FORGE_LOGS_DIR / f"FAILED-{task_name}-{_ts}.log"
-                fail_log.write_text(
-                    f"Merge conflict while assembling dependencies for {task_name}.\n"
-                    f"Conflicting branch: {dep_branch}\n"
-                    "Resolve by running the tasks with fewer simultaneous dependencies, "
-                    "or fix the conflict manually and re-run the orchestrator.\n"
+                fail_log = reserve_log_path(f"FAILED-{task_name}")
+                write_timestamped_log(
+                    fail_log,
+                    (
+                        f"Merge conflict while assembling dependencies for {task_name}.\n"
+                        f"Conflicting branch: {dep_branch}\n"
+                        "Resolve by running the tasks with fewer simultaneous dependencies, "
+                        "or fix the conflict manually and re-run the orchestrator.\n"
+                    ),
+                    started_at=task_started_at,
                 )
                 if not worktree:
                     checkout(default_branch)
@@ -593,24 +600,27 @@ def _run_task_body(
         ctx["had_successful_model_attempt"],
     )
     FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    _ts = datetime.now().strftime("%Y%m%dT%H%M%S")
-    fail_log = FORGE_LOGS_DIR / f"FAILED-{task_name}-{_ts}.log"
+    fail_log = reserve_log_path(f"FAILED-{task_name}")
     llm_context = (
         f"LLM failure reason: {', '.join(ctx['llm_fail_reasons'])}\n"
         if ctx["llm_fail_reasons"] else ""
     )
     gemini_note = f"+ gemini ({gemini_tier['retries']}x) " if gemini_tier else ""
-    fail_log.write_text(
-        f"Failed after primary ({primary_tier['retries']}x) "
-        f"+ escalation ({escalation_tier['retries']}x) "
-        f"{gemini_note}all exhausted.\n"
-        f"Failure class: {failure_label}\n"
-        f"Test failure class: {test_failure_label}\n"
-        f"{llm_context}"
-        f"Models tried: {', '.join(ctx['models_tried']) or 'none'}\n"
-        f"Tokens (sent/received): {ctx['task_stats']['tokens_sent']} / {ctx['task_stats']['tokens_received']}\n"
-        f"Cost: ${ctx['task_stats']['cost_usd']:.4f}\n\n"
-        f"{test_output}"
+    write_timestamped_log(
+        fail_log,
+        (
+            f"Failed after primary ({primary_tier['retries']}x) "
+            f"+ escalation ({escalation_tier['retries']}x) "
+            f"{gemini_note}all exhausted.\n"
+            f"Failure class: {failure_label}\n"
+            f"Test failure class: {test_failure_label}\n"
+            f"{llm_context}"
+            f"Models tried: {', '.join(ctx['models_tried']) or 'none'}\n"
+            f"Tokens (sent/received): {ctx['task_stats']['tokens_sent']} / {ctx['task_stats']['tokens_received']}\n"
+            f"Cost: ${ctx['task_stats']['cost_usd']:.4f}\n\n"
+            f"{test_output}"
+        ),
+        started_at=task_started_at,
     )
     log.warning("ESCALATE TO CLAUDE: %s (failure_class=%s)", task_name, failure_label)
     if not worktree:
