@@ -77,6 +77,17 @@ class TestState:
         assert state["tasks"]["task-001"]["model"] == "groq/qwen/qwen3-32b"
         assert state["tasks"]["task-001"]["attempts"] == 3
 
+    def test_skip_can_store_verification_status(self, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        record_task(
+            state,
+            "task-001",
+            "skipped",
+            verification_status="already_passing_existing_branch",
+        )
+
+        assert state["tasks"]["task-001"]["verification_status"] == "already_passing_existing_branch"
+
     def test_recovered_task_clears_stale_failure_metadata(self, tmp_path):
         state = load_state(tmp_path / "state.json")
         record_task(
@@ -94,3 +105,38 @@ class TestState:
         assert "failure_class" not in entry
         assert "test_failure_class" not in entry
         assert "llm_fail_reasons" not in entry
+
+    def test_failed_task_clears_stale_verification_status(self, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        record_task(
+            state,
+            "task-001",
+            "skipped",
+            verification_status="recovered_after_prior_failure",
+        )
+        record_task(state, "task-001", "failed", failure_class="assertion")
+
+        entry = state["tasks"]["task-001"]
+        assert entry["status"] == "failed"
+        assert "verification_status" not in entry
+
+    def test_failed_task_clears_stale_failure_note_when_new_failure_has_none(self, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        record_task(
+            state,
+            "task-001",
+            "failed",
+            failure_class="merge_conflict",
+            failure_note="Resolve the dependency graph first.",
+        )
+        record_task(
+            state,
+            "task-001",
+            "failed",
+            failure_class="assertion",
+        )
+
+        entry = state["tasks"]["task-001"]
+        assert entry["status"] == "failed"
+        assert entry["failure_class"] == "assertion"
+        assert "failure_note" not in entry

@@ -75,6 +75,8 @@ def record_task(
     tokens_received=None,
     cost_usd=None,
     wall_seconds=None,
+    verification_status=None,
+    failure_note=None,
 ):
     """Record the outcome of a single task.
 
@@ -95,12 +97,16 @@ def record_task(
         entry.pop("test_failure_class", None)
         entry.pop("llm_fail_reasons", None)
         entry.pop("blocked_by", None)
+        entry.pop("failure_note", None)
     elif status == "blocked":
         entry.pop("failure_class", None)
         entry.pop("test_failure_class", None)
         entry.pop("llm_fail_reasons", None)
+        entry.pop("verification_status", None)
+        entry.pop("failure_note", None)
     elif status == "failed":
         entry.pop("blocked_by", None)
+        entry.pop("verification_status", None)
 
     if model is not None:
         entry["model"] = model
@@ -130,6 +136,14 @@ def record_task(
         entry["cost_usd"] = round(float(cost_usd), 6)
     if wall_seconds is not None:
         entry["wall_seconds"] = round(float(wall_seconds), 2)
+    if verification_status is not None:
+        entry["verification_status"] = verification_status
+    else:
+        entry.pop("verification_status", None)
+    if failure_note is not None:
+        entry["failure_note"] = failure_note
+    else:
+        entry.pop("failure_note", None)
 
     with _state_lock:
         state["tasks"][task_name] = entry
@@ -137,7 +151,8 @@ def record_task(
 
 
 def record_attempt(state, task_name, attempt_num, tier, model, aider_success, tests_passed=None,
-                   model_attempts=None, wall_seconds=None):
+                   model_attempts=None, wall_seconds=None, post_check_reason=None,
+                   forbidden_files=None, forbidden_edit_subtype=None):
     """Record a single attempt within a task for granular crash recovery.
 
     Stored under ``state["tasks"][task_name]["attempts_log"]`` as a list,
@@ -159,6 +174,12 @@ def record_attempt(state, task_name, attempt_num, tier, model, aider_success, te
             item["model_attempts"] = list(model_attempts)
         if wall_seconds is not None:
             item["wall_seconds"] = round(float(wall_seconds), 2)
+        if post_check_reason is not None:
+            item["post_check_reason"] = post_check_reason
+        if forbidden_files is not None:
+            item["forbidden_files"] = list(forbidden_files)
+        if forbidden_edit_subtype is not None:
+            item["forbidden_edit_subtype"] = forbidden_edit_subtype
         log.append(item)
 
 

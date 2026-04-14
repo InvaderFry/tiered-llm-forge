@@ -33,6 +33,9 @@ from .state import save_state, record_task, record_attempt, get_resume_point
 log = get_logger("task_runner")
 
 _URL_RE = re.compile(r"https?://\S+")
+_FAILED_COUNT_RE = re.compile(r"\b(\d+)\s+failed\b")
+_FAILED_SUMMARY_RE = re.compile(r"^FAILED\s+(.+?)\s+-\s+(.+)$", re.MULTILINE)
+_TRACEBACK_LINE_RE = re.compile(r"^(.+?\.py:\d+: in .+)$", re.MULTILINE)
 _run_time_breakdown = {}
 _run_time_lock = threading.Lock()
 
@@ -113,7 +116,7 @@ def _build_read_context(spec, test_file, dependencies, specs_by_name, cwd=None):
     Always includes the spec file and task test. Dependency target files are
     included in declared order until one of the configured limits is reached.
 
-    Returns ``(read_files, omitted_dependency_targets)``.
+    Returns ``(read_files, attached_dependency_targets, omitted_dependency_targets)``.
     """
     cfg = get_config()
     limits = cfg.get("context_limits", {})
@@ -124,6 +127,7 @@ def _build_read_context(spec, test_file, dependencies, specs_by_name, cwd=None):
     read_files = [str(spec["path"]), test_file]
     total_bytes = sum(_path_size(path, cwd=cwd) for path in read_files)
 
+    attached = []
     omitted = []
     included_deps = 0
     for dep_name in dependencies:
@@ -131,6 +135,7 @@ def _build_read_context(spec, test_file, dependencies, specs_by_name, cwd=None):
         dep_target = dep_spec.get("target") if dep_spec else None
         if not dep_target:
             continue
+        dep_target_norm = _normalize_relpath(dep_target)
 
         dep_size = _path_size(dep_target, cwd=cwd)
         projected_files = len(read_files) + 1
@@ -140,10 +145,11 @@ def _build_read_context(spec, test_file, dependencies, specs_by_name, cwd=None):
             or projected_files > max_read_files
             or projected_bytes > max_total_bytes
         ):
-            omitted.append(dep_target)
+            omitted.append(dep_target_norm)
             continue
 
         read_files.append(dep_target)
+        attached.append(dep_target_norm)
         total_bytes = projected_bytes
         included_deps += 1
 
@@ -155,7 +161,176 @@ def _build_read_context(spec, test_file, dependencies, specs_by_name, cwd=None):
             ", ".join(omitted),
         )
 
-    return read_files, omitted
+    return read_files, attached, omitted
+
+
+def _dependency_target_files(dependencies, specs_by_name):
+    """Return declared dependency target files in dependency order."""
+    targets = []
+    for dep_name in dependencies or []:
+        dep_spec = specs_by_name.get(dep_name) if specs_by_name else None
+        dep_target = dep_spec.get("target") if dep_spec else None
+        if dep_target:
+            targets.append(_normalize_relpath(dep_target))
+    return targets
+
+
+def _restore_retry_context(state, task_name):
+    """Reconstruct retry-local state from persisted attempt history."""
+    entry = state.get("tasks", {}).get(task_name, {})
+    restored = {
+        "had_successful_model_attempt": False,
+        "last_forbidden_edit": None,
+        "dependency_forbidden_edit_count": 0,
+    }
+
+    for attempt in entry.get("attempts_log", []):
+        if attempt.get("aider_success"):
+            restored["had_successful_model_attempt"] = True
+
+        for model_attempt in attempt.get("model_attempts") or []:
+            if model_attempt.get("success"):
+                restored["had_successful_model_attempt"] = True
+
+        if attempt.get("post_check_reason") != "forbidden_file_edit":
+            continue
+
+        forbidden_files = list(attempt.get("forbidden_files") or [])
+        subtype = attempt.get("forbidden_edit_subtype") or "generic"
+        restored["last_forbidden_edit"] = {
+            "files": forbidden_files,
+            "subtype": subtype,
+        }
+        if subtype == "dependency_target":
+            restored["dependency_forbidden_edit_count"] += 1
+
+    return restored
+
+
+def _forbidden_edit_subtype(forbidden_files, dependency_target_files):
+    """Classify forbidden edits that touch declared dependency targets."""
+    dependency_targets = set(dependency_target_files or [])
+    matches = [path for path in forbidden_files if path in dependency_targets]
+    if matches:
+        return "dependency_target", matches
+    return "generic", []
+
+
+def _has_prior_failure(state, task_name):
+    """Return True if state already records a failed or reverted attempt."""
+    entry = state.get("tasks", {}).get(task_name, {})
+    if entry.get("status") == "failed":
+        return True
+
+    for attempt in entry.get("attempts_log", []):
+        if attempt.get("post_check_reason") in {"forbidden_file_edit", "regression_guard"}:
+            return True
+        if attempt.get("tests_passed") is False:
+            return True
+    return False
+
+
+def _format_scope_guidance(
+    allowed_write_files,
+    attached_dependency_target_files=None,
+    last_forbidden_edit=None,
+):
+    """Return prompt text that makes the task write scope explicit."""
+    lines = [
+        "Write-scope rules:",
+        f"- You may edit only: {', '.join(sorted(allowed_write_files))}.",
+    ]
+    if attached_dependency_target_files:
+        lines.append(
+            "- Dependency target files are attached only as read-only context: "
+            + ", ".join(attached_dependency_target_files)
+            + "."
+        )
+
+    if last_forbidden_edit:
+        files = ", ".join(last_forbidden_edit.get("files") or [])
+        if last_forbidden_edit.get("subtype") == "dependency_target":
+            lines.append(
+                "- Previous attempt incorrectly edited dependency-owned file(s): "
+                + files
+                + ". Do not modify those files."
+            )
+            lines.append(
+                "- If the fix truly requires a dependency-owned file, stop and explain "
+                "that the dependency task must be reopened or a follow-up task added."
+            )
+        elif files:
+            lines.append(
+                "- Previous attempt incorrectly edited: "
+                + files
+                + ". Stay inside the allowed write set."
+            )
+    return "\n".join(lines)
+
+
+def _pytest_failure_digest(test_output):
+    """Return a compact assertion-focused digest, or None if lossy."""
+    failed_count_match = _FAILED_COUNT_RE.search(test_output or "")
+    if not failed_count_match or int(failed_count_match.group(1)) != 1:
+        return None
+
+    summary_match = _FAILED_SUMMARY_RE.search(test_output or "")
+    if not summary_match:
+        return None
+
+    failing_test = summary_match.group(1).strip()
+    summary_detail = summary_match.group(2).strip()
+    if "assert" not in summary_detail and "AssertionError" not in summary_detail:
+        return None
+
+    traceback_match = _TRACEBACK_LINE_RE.search(test_output or "")
+    assertion_source = None
+    comparison_line = None
+    for line in (test_output or "").splitlines():
+        stripped = line.strip()
+        if assertion_source is None and stripped.startswith("assert "):
+            assertion_source = stripped
+            continue
+        if line.startswith("E   assert "):
+            comparison_line = line[4:].strip()
+            break
+        if line.startswith("E   AssertionError:"):
+            comparison_line = line[4:].strip()
+            break
+
+    if assertion_source is None and comparison_line is None:
+        return None
+
+    lines = [f"Failure digest:", f"- Failing test: {failing_test}"]
+    if traceback_match:
+        lines.append(f"- Traceback: {traceback_match.group(1).strip()}")
+    if assertion_source:
+        lines.append(f"- Assertion: {assertion_source}")
+
+    if (
+        assertion_source
+        and comparison_line
+        and assertion_source.startswith("assert ")
+        and comparison_line.startswith("assert ")
+        and " == " in assertion_source
+        and " == " in comparison_line
+    ):
+        actual_value, expected_value = comparison_line[len("assert "):].split(" == ", 1)
+        lines.append(f"- Observed actual value: {actual_value.strip()}")
+        lines.append(f"- Expected value: {expected_value.strip()}")
+
+    if comparison_line:
+        lines.append(f"- Pytest comparison: {comparison_line}")
+
+    return "\n".join(lines)
+
+
+def _format_retry_failure_context(test_output):
+    """Prefer a compact failure digest when the output is a single assertion."""
+    digest = _pytest_failure_digest(_strip_urls(test_output or ""))
+    if digest:
+        return digest
+    return f"Tests output:\n{_strip_urls(test_output)}"
 
 
 def _final_failure_label(test_output, llm_fail_reasons, had_successful_model_attempt):
@@ -176,6 +351,7 @@ def _run_tier_attempts(
     target_file, test_file, read_files, cwd,
     task_name, state, worktree, default_branch,
     start_model, ctx, _elapsed, start_point, base_sha, allowed_write_files,
+    dependency_target_files,
 ):
     """Run all attempts for one tier, updating *ctx* in-place.
 
@@ -191,8 +367,9 @@ def _run_tier_attempts(
                           ``task_stats``, ``llm_fail_reasons``.  Updated in-place.
 
     Returns:
-        ``"passed"`` if any attempt passed tests, ``None`` if the tier was exhausted
-        without a pass (caller should proceed to the next tier or Stage 3).
+        ``"passed"`` if any attempt passed tests, ``"terminal_failure"`` if the
+        runner should stop automated retries immediately, otherwise ``None`` when
+        the tier was exhausted without a pass.
     """
     tier = get_tier(tier_name)
 
@@ -231,18 +408,13 @@ def _run_tier_attempts(
                 _record_time(reason or "unknown", attempt_meta.get("wall_seconds", 0.0))
 
         if not success and not model_used:
-            if model_attempts and all(
-                attempt_meta.get("reason") in {"request_too_large", "pre_screen_too_large"}
-                for attempt_meta in model_attempts
-            ):
-                if "request_too_large" not in ctx["llm_fail_reasons"]:
-                    ctx["llm_fail_reasons"].append("request_too_large")
-            if model_attempts and all(
-                attempt_meta.get("reason") == "invalid_model_config"
-                for attempt_meta in model_attempts
-            ):
-                if "invalid_model_config" not in ctx["llm_fail_reasons"]:
-                    ctx["llm_fail_reasons"].append("invalid_model_config")
+            reasons_seen = {attempt_meta.get("reason") for attempt_meta in model_attempts}
+            if "request_too_large" in reasons_seen and "request_too_large" not in ctx["llm_fail_reasons"]:
+                ctx["llm_fail_reasons"].append("request_too_large")
+            if "pre_screen_too_large" in reasons_seen and "pre_screen_too_large" not in ctx["llm_fail_reasons"]:
+                ctx["llm_fail_reasons"].append("pre_screen_too_large")
+            if reasons_seen == {"invalid_model_config"} and "invalid_model_config" not in ctx["llm_fail_reasons"]:
+                ctx["llm_fail_reasons"].append("invalid_model_config")
 
         head_after = branch_tip("HEAD", cwd=cwd)
         head_moved = bool(head_after) and head_after != head_before
@@ -251,12 +423,29 @@ def _run_tier_attempts(
             changed_files = changed_files_between(head_before, head_after, cwd=cwd)
             forbidden = _forbidden_changed_files(changed_files, allowed_write_files)
             if forbidden:
-                _record_time("reverted_or_failed_tests", pending_wall)
+                subtype, dependency_matches = _forbidden_edit_subtype(forbidden, dependency_target_files)
+                time_bucket = (
+                    "dependency_forbidden_edit_waste"
+                    if subtype == "dependency_target"
+                    else "forbidden_edit_waste"
+                )
+                _record_time(time_bucket, pending_wall)
                 if "forbidden_file_edit" not in ctx["llm_fail_reasons"]:
                     ctx["llm_fail_reasons"].append("forbidden_file_edit")
+                if subtype == "dependency_target":
+                    ctx["dependency_forbidden_edit_count"] += 1
+                    if "dependency_owned_forbidden_edit" not in ctx["llm_fail_reasons"]:
+                        ctx["llm_fail_reasons"].append("dependency_owned_forbidden_edit")
+                ctx["last_forbidden_edit"] = {
+                    "files": dependency_matches if subtype == "dependency_target" else forbidden,
+                    "subtype": subtype,
+                }
                 record_attempt(
                     state, task_name, attempt, tier_name, model_used, success,
                     tests_passed=False, model_attempts=model_attempts, wall_seconds=attempt_wall,
+                    post_check_reason="forbidden_file_edit",
+                    forbidden_files=forbidden,
+                    forbidden_edit_subtype=subtype,
                 )
                 save_state(state)
                 revert_last_commit(
@@ -268,6 +457,17 @@ def _run_tier_attempts(
                         + ", ".join(forbidden)
                     ),
                 )
+                if ctx["dependency_forbidden_edit_count"] >= 2:
+                    ctx["stopped_early"] = True
+                    ctx["terminal_failure_override"] = "forbidden_file_edit"
+                    ctx["failure_note"] = (
+                        "Stopped automated retries after two dependency-owned forbidden edits. "
+                        "Reopen the dependency task that owns "
+                        + ", ".join(sorted(set(dependency_matches)))
+                        + ", or add a follow-up task for the shared file."
+                    )
+                    log.warning("  [stop retries] %s", ctx["failure_note"])
+                    return "terminal_failure"
                 continue
         regression = head_moved and check_regression(target_file, ctx["baseline_size"], cwd=cwd)
         if regression:
@@ -275,6 +475,7 @@ def _run_tier_attempts(
             record_attempt(
                 state, task_name, attempt, tier_name, model_used, success,
                 tests_passed=False, model_attempts=model_attempts, wall_seconds=attempt_wall,
+                post_check_reason="regression_guard",
             )
             save_state(state)
             revert_last_commit(target_file, ctx["baseline_size"], cwd=cwd)
@@ -286,6 +487,7 @@ def _run_tier_attempts(
             record_attempt(
                 state, task_name, attempt, tier_name, model_used, success,
                 tests_passed=False, model_attempts=model_attempts, wall_seconds=attempt_wall,
+                post_check_reason="no_commit",
             )
             save_state(state)
             continue
@@ -318,6 +520,11 @@ def _run_tier_attempts(
                 tokens_received=ctx["task_stats"]["tokens_received"],
                 cost_usd=ctx["task_stats"]["cost_usd"],
                 wall_seconds=ctx["task_stats"]["wall_seconds"],
+                verification_status=(
+                    "recovered_after_prior_failure"
+                    if _has_prior_failure(state, task_name)
+                    else None
+                ),
             )
             save_state(state)
             return "passed"
@@ -441,7 +648,17 @@ def _run_task_body(
             log.info("  Already passing -- skipping.")
             if not worktree:
                 checkout(default_branch)
-            record_task(state, task_name, "skipped", duration_seconds=_elapsed())
+            record_task(
+                state,
+                task_name,
+                "skipped",
+                duration_seconds=_elapsed(),
+                verification_status=(
+                    "recovered_after_prior_failure"
+                    if _has_prior_failure(state, task_name)
+                    else "already_passing_existing_branch"
+                ),
+            )
             save_state(state)
             return "skipped"
 
@@ -472,6 +689,7 @@ def _run_task_body(
                 attempts=0,
                 duration_seconds=_elapsed(),
                 failure_class=classify_failure(output),
+                failure_note="Branch already existed and still failed verification on re-run.",
             )
             save_state(state)
             return "failed"
@@ -519,6 +737,10 @@ def _run_task_body(
                     failure_class="merge_conflict",
                     base_branch=start_point,
                     base_sha=base_sha,
+                    failure_note=(
+                        "Dependency branches conflicted while assembling the task branch. "
+                        "Reshape the dependency graph or resolve the overlap manually."
+                    ),
                 )
                 save_state(state)
                 return "failed"
@@ -527,9 +749,10 @@ def _run_task_body(
 
     baseline_size = file_size(target_file, cwd=cwd)
     allowed_write_files = {_normalize_relpath(target_file)}
+    dependency_target_files = _dependency_target_files(dependencies, specs_by_name)
 
     # Assemble read-only context under a configurable file/size budget.
-    read_files, omitted_dep_targets = _build_read_context(
+    read_files, attached_dep_targets, omitted_dep_targets = _build_read_context(
         spec, test_file, dependencies, specs_by_name, cwd=cwd,
     )
     context_note = ""
@@ -539,6 +762,24 @@ def _run_task_body(
             "Omitted upstream target files: "
             + ", ".join(omitted_dep_targets)
             + ". Rely on the spec contracts and attached tests for those dependencies."
+        )
+
+    base_scope_guidance = _format_scope_guidance(
+        allowed_write_files,
+        attached_dependency_target_files=attached_dep_targets,
+    )
+
+    restored_ctx = _restore_retry_context(state, task_name) if resume_point else {}
+    def _retry_message(prefix, test_output):
+        scope_guidance = _format_scope_guidance(
+            allowed_write_files,
+            attached_dependency_target_files=attached_dep_targets,
+            last_forbidden_edit=ctx.get("last_forbidden_edit"),
+        )
+        return (
+            f"{prefix}\n\n"
+            f"{_format_retry_failure_context(test_output)}\n\n"
+            f"{scope_guidance}{context_note}"
         )
 
     primary_tier = get_tier("primary")
@@ -551,7 +792,12 @@ def _run_task_body(
         "models_tried": models_tried,
         "task_stats": {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 0.0},
         "llm_fail_reasons": [],
-        "had_successful_model_attempt": False,
+        "had_successful_model_attempt": restored_ctx.get("had_successful_model_attempt", False),
+        "last_forbidden_edit": restored_ctx.get("last_forbidden_edit"),
+        "dependency_forbidden_edit_count": restored_ctx.get("dependency_forbidden_edit_count", 0),
+        "failure_note": None,
+        "stopped_early": False,
+        "terminal_failure_override": None,
     }
 
     # On resume, determine where to start: skip tiers/attempts already done
@@ -565,40 +811,44 @@ def _run_task_body(
 
         def primary_message(attempt):
             if attempt == primary_start and not resume_point:
-                return implement_message + context_note
+                return f"{implement_message}\n\n{base_scope_guidance}{context_note}"
             _, test_output = run_tests(test_file, cwd=cwd)
-            return (
-                f"Tests failed. Output:\n{_strip_urls(test_output)}\n"
-                f"Fix the code to pass all tests.{context_note}"
-            )
+            return _retry_message("Tests failed. Fix the code to pass all tests.", test_output)
 
         result = _run_tier_attempts(
             "primary", primary_start, primary_message,
             target_file, test_file, read_files, cwd,
             task_name, state, worktree, default_branch,
             first_model, ctx, _elapsed, start_point, base_sha, allowed_write_files,
+            dependency_target_files,
         )
         if result == "passed":
             return "passed"
+        stop_after_tier = result == "terminal_failure"
+    else:
+        stop_after_tier = False
 
     # --- Stage 2: Escalation tier ---
-    log.info("Stage 2: Escalation (%d attempts, starting at %d)", escalation_tier["retries"], escalation_start)
+    if not stop_after_tier:
+        log.info("Stage 2: Escalation (%d attempts, starting at %d)", escalation_tier["retries"], escalation_start)
 
-    def escalation_message(_attempt):
-        _, test_output = run_tests(test_file, cwd=cwd)
-        return (
-            f"Previous model failed. Tests output:\n{_strip_urls(test_output)}\n"
-            f"Analyze carefully and fix.{context_note}"
+        def escalation_message(_attempt):
+            _, test_output = run_tests(test_file, cwd=cwd)
+            return _retry_message(
+                "Previous model failed. Analyze carefully and fix the code.",
+                test_output,
+            )
+
+        result = _run_tier_attempts(
+            "escalation", escalation_start, escalation_message,
+            target_file, test_file, read_files, cwd,
+            task_name, state, worktree, default_branch,
+            None, ctx, _elapsed, start_point, base_sha, allowed_write_files,
+            dependency_target_files,
         )
-
-    result = _run_tier_attempts(
-        "escalation", escalation_start, escalation_message,
-        target_file, test_file, read_files, cwd,
-        task_name, state, worktree, default_branch,
-        None, ctx, _elapsed, start_point, base_sha, allowed_write_files,
-    )
-    if result == "passed":
-        return "passed"
+        if result == "passed":
+            return "passed"
+        stop_after_tier = result == "terminal_failure"
 
     # --- Stage 2.5: Gemini tier ---
     # Tried after escalation, before flagging for Claude review.
@@ -610,14 +860,14 @@ def _run_task_body(
     except ValueError:
         gemini_tier = None
 
-    if gemini_tier and not skip_gemini:
+    if gemini_tier and not skip_gemini and not stop_after_tier:
         log.info("Stage 2.5: Gemini tier (%d attempt(s) per model)", gemini_tier["retries"])
 
         def gemini_message(_attempt):
             _, test_output = run_tests(test_file, cwd=cwd)
-            return (
-                f"Previous models failed. Tests output:\n{_strip_urls(test_output)}\n"
-                f"Analyze carefully and fix.{context_note}"
+            return _retry_message(
+                "Previous models failed. Analyze carefully and fix the code.",
+                test_output,
             )
 
         result = _run_tier_attempts(
@@ -625,6 +875,7 @@ def _run_task_body(
             target_file, test_file, read_files, cwd,
             task_name, state, worktree, default_branch,
             None, ctx, _elapsed, start_point, base_sha, allowed_write_files,
+            dependency_target_files,
         )
         if result == "passed":
             return "passed"
@@ -635,27 +886,43 @@ def _run_task_body(
 
     # --- Stage 3: Flag for Claude review ---
     _, test_output = run_tests(test_file, cwd=cwd)
-    failure_label, test_failure_label = _final_failure_label(
-        test_output,
-        ctx["llm_fail_reasons"],
-        ctx["had_successful_model_attempt"],
-    )
+    test_failure_label = classify_failure(test_output)
+    if ctx.get("terminal_failure_override"):
+        failure_label = ctx["terminal_failure_override"]
+    else:
+        failure_label, test_failure_label = _final_failure_label(
+            test_output,
+            ctx["llm_fail_reasons"],
+            ctx["had_successful_model_attempt"],
+        )
     FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
     fail_log = reserve_log_path(f"FAILED-{task_name}")
     llm_context = (
         f"LLM failure reason: {', '.join(ctx['llm_fail_reasons'])}\n"
         if ctx["llm_fail_reasons"] else ""
     )
+    failure_note = (
+        f"Recommended action: {ctx['failure_note']}\n"
+        if ctx.get("failure_note") else ""
+    )
     gemini_note = f"+ gemini ({gemini_tier['retries']}x) " if gemini_tier else ""
-    write_timestamped_log(
-        fail_log,
-        (
+    failure_intro = (
+        "Failed after automated retries stopped early.\n"
+        if ctx.get("stopped_early")
+        else (
             f"Failed after primary ({primary_tier['retries']}x) "
             f"+ escalation ({escalation_tier['retries']}x) "
             f"{gemini_note}all exhausted.\n"
+        )
+    )
+    write_timestamped_log(
+        fail_log,
+        (
+            f"{failure_intro}"
             f"Failure class: {failure_label}\n"
             f"Test failure class: {test_failure_label}\n"
             f"{llm_context}"
+            f"{failure_note}"
             f"Models tried: {', '.join(ctx['models_tried']) or 'none'}\n"
             f"Tokens (sent/received): {ctx['task_stats']['tokens_sent']} / {ctx['task_stats']['tokens_received']}\n"
             f"Cost: ${ctx['task_stats']['cost_usd']:.4f}\n\n"
@@ -682,6 +949,7 @@ def _run_task_body(
         tokens_received=ctx["task_stats"]["tokens_received"],
         cost_usd=ctx["task_stats"]["cost_usd"],
         wall_seconds=ctx["task_stats"]["wall_seconds"],
+        failure_note=ctx.get("failure_note"),
     )
     save_state(state)
     return "failed"

@@ -11,7 +11,14 @@ from orchestrator.task_runner import (
     _compute_resume_starts,
     _final_failure_label,
     _forbidden_changed_files,
+    _forbidden_edit_subtype,
+    _format_scope_guidance,
+    _pytest_failure_digest,
+    _restore_retry_context,
+    _run_tier_attempts,
+    run_task,
 )
+from orchestrator.state import load_state, record_task
 
 
 class TestComputeResumeStarts:
@@ -78,6 +85,24 @@ class TestForbiddenChangedFiles:
         assert _forbidden_changed_files(["src/app.py"], {"src/app.py"}) == []
 
 
+class TestForbiddenEditSubtype:
+    def test_marks_dependency_owned_forbidden_edits(self):
+        subtype, matches = _forbidden_edit_subtype(
+            ["pom.xml", "README.md"],
+            ["pom.xml", "src/shared.py"],
+        )
+        assert subtype == "dependency_target"
+        assert matches == ["pom.xml"]
+
+    def test_leaves_unrelated_drift_generic(self):
+        subtype, matches = _forbidden_edit_subtype(
+            ["README.md"],
+            ["pom.xml"],
+        )
+        assert subtype == "generic"
+        assert matches == []
+
+
 class TestBuildReadContext:
     def test_trims_dependency_context_to_budget(self, tmp_path, monkeypatch):
         specs = {
@@ -101,7 +126,7 @@ class TestBuildReadContext:
             lambda: {"context_limits": {"max_read_files": 4, "max_dependency_files": 2, "max_total_bytes": 9999}},
         )
 
-        read_files, omitted = _build_read_context(
+        read_files, attached, omitted = _build_read_context(
             {"path": spec_path},
             "tests/test_004_main.py",
             ["task-001-a", "task-002-b", "task-003-c"],
@@ -115,6 +140,7 @@ class TestBuildReadContext:
             "src/a.py",
             "src/b.py",
         ]
+        assert attached == ["src/a.py", "src/b.py"]
         assert omitted == ["src/c.py"]
 
     def test_omits_first_dependency_when_it_exceeds_byte_budget(self, tmp_path, monkeypatch):
@@ -134,7 +160,7 @@ class TestBuildReadContext:
             lambda: {"context_limits": {"max_read_files": 4, "max_dependency_files": 2, "max_total_bytes": 100}},
         )
 
-        read_files, omitted = _build_read_context(
+        read_files, attached, omitted = _build_read_context(
             {"path": spec_path},
             "tests/test_004_main.py",
             ["task-001-a"],
@@ -143,7 +169,19 @@ class TestBuildReadContext:
         )
 
         assert read_files == [str(spec_path), "tests/test_004_main.py"]
+        assert attached == []
         assert omitted == ["src/a.py"]
+
+
+class TestScopeGuidance:
+    def test_mentions_only_attached_dependency_targets(self):
+        guidance = _format_scope_guidance(
+            {"src/app.py"},
+            attached_dependency_target_files=["pom.xml"],
+        )
+
+        assert "pom.xml" in guidance
+        assert "application.yml" not in guidance
 
 
 class TestFinalFailureLabel:
@@ -164,3 +202,414 @@ class TestFinalFailureLabel:
         )
         assert failure_label == "invalid_model_config"
         assert test_failure_label == "assertion"
+
+
+class TestPytestFailureDigest:
+    def test_extracts_compact_assertion_digest(self):
+        output = """
+=================================== FAILURES ===================================
+________________________ test_maps_temperature ________________________
+tests/test_weather.py:34: in test_maps_temperature
+    assert response["temperature"] == 72.5
+E   assert 0.0 == 72.5
+=========================== short test summary info ============================
+FAILED tests/test_weather.py::test_maps_temperature - assert 0.0 == 72.5
+============================== 1 failed in 0.12s ===============================
+"""
+        digest = _pytest_failure_digest(output)
+
+        assert "Failing test: tests/test_weather.py::test_maps_temperature" in digest
+        assert 'Assertion: assert response["temperature"] == 72.5' in digest
+        assert "Observed actual value: 0.0" in digest
+        assert "Expected value: 72.5" in digest
+
+    def test_returns_none_for_multi_failure_output(self):
+        output = """
+FAILED tests/test_one.py::test_a - assert 1 == 2
+FAILED tests/test_two.py::test_b - assert 3 == 4
+============================== 2 failed in 0.12s ===============================
+"""
+        assert _pytest_failure_digest(output) is None
+
+
+class TestRunTierAttempts:
+    def test_stops_after_two_dependency_owned_forbidden_edits(self, monkeypatch, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        ctx = {
+            "baseline_size": 10,
+            "total_attempts": 0,
+            "models_tried": [],
+            "task_stats": {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 0.0},
+            "llm_fail_reasons": [],
+            "had_successful_model_attempt": False,
+            "last_forbidden_edit": None,
+            "dependency_forbidden_edit_count": 0,
+            "failure_note": None,
+            "terminal_failure_override": None,
+        }
+
+        monkeypatch.setattr(task_runner, "get_tier", lambda _: {"retries": 2})
+        monkeypatch.setattr(
+            task_runner,
+            "run_with_tier_fallback",
+            lambda *args, **kwargs: (
+                True,
+                "primary-model",
+                {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 1.0},
+                [{"model": "primary-model", "reason": "ok", "success": True, "wall_seconds": 1.0}],
+            ),
+        )
+        heads = iter(["head-0", "head-1", "head-1", "head-2"])
+        monkeypatch.setattr(task_runner, "branch_tip", lambda *args, **kwargs: next(heads))
+        monkeypatch.setattr(task_runner, "changed_files_between", lambda *args, **kwargs: ["pom.xml"])
+        monkeypatch.setattr(task_runner, "check_regression", lambda *args, **kwargs: False)
+        monkeypatch.setattr(task_runner, "file_size", lambda *args, **kwargs: 10)
+        monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
+        reverted = []
+        monkeypatch.setattr(task_runner, "revert_last_commit", lambda *args, **kwargs: reverted.append(kwargs.get("reason")))
+
+        result = _run_tier_attempts(
+            "primary",
+            1,
+            lambda attempt: f"attempt {attempt}",
+            "src/app.py",
+            "tests/test_app.py",
+            [],
+            None,
+            "task-001",
+            state,
+            False,
+            "main",
+            "primary-model",
+            ctx,
+            lambda: 0.1,
+            "main",
+            "base-sha",
+            {"src/app.py"},
+            ["pom.xml"],
+        )
+
+        assert result == "terminal_failure"
+        assert ctx["dependency_forbidden_edit_count"] == 2
+        assert "Reopen the dependency task" in ctx["failure_note"]
+        assert len(reverted) == 2
+        attempts = state["tasks"]["task-001"]["attempts_log"]
+        assert len(attempts) == 2
+        assert all(item["post_check_reason"] == "forbidden_file_edit" for item in attempts)
+        assert all(item["forbidden_edit_subtype"] == "dependency_target" for item in attempts)
+
+    def test_generic_forbidden_edit_does_not_trigger_dependency_stop(self, monkeypatch, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        ctx = {
+            "baseline_size": 10,
+            "total_attempts": 0,
+            "models_tried": [],
+            "task_stats": {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 0.0},
+            "llm_fail_reasons": [],
+            "had_successful_model_attempt": False,
+            "last_forbidden_edit": None,
+            "dependency_forbidden_edit_count": 0,
+            "failure_note": None,
+            "terminal_failure_override": None,
+        }
+
+        monkeypatch.setattr(task_runner, "get_tier", lambda _: {"retries": 1})
+        monkeypatch.setattr(
+            task_runner,
+            "run_with_tier_fallback",
+            lambda *args, **kwargs: (
+                True,
+                "primary-model",
+                {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 1.0},
+                [{"model": "primary-model", "reason": "ok", "success": True, "wall_seconds": 1.0}],
+            ),
+        )
+        heads = iter(["head-0", "head-1"])
+        monkeypatch.setattr(task_runner, "branch_tip", lambda *args, **kwargs: next(heads))
+        monkeypatch.setattr(task_runner, "changed_files_between", lambda *args, **kwargs: ["README.md"])
+        monkeypatch.setattr(task_runner, "check_regression", lambda *args, **kwargs: False)
+        monkeypatch.setattr(task_runner, "file_size", lambda *args, **kwargs: 10)
+        monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "revert_last_commit", lambda *args, **kwargs: None)
+
+        result = _run_tier_attempts(
+            "primary",
+            1,
+            lambda attempt: f"attempt {attempt}",
+            "src/app.py",
+            "tests/test_app.py",
+            [],
+            None,
+            "task-001",
+            state,
+            False,
+            "main",
+            "primary-model",
+            ctx,
+            lambda: 0.1,
+            "main",
+            "base-sha",
+            {"src/app.py"},
+            ["pom.xml"],
+        )
+
+        assert result is None
+        assert ctx["dependency_forbidden_edit_count"] == 0
+        assert ctx["failure_note"] is None
+        attempt = state["tasks"]["task-001"]["attempts_log"][0]
+        assert attempt["forbidden_edit_subtype"] == "generic"
+
+
+class TestRestoreRetryContext:
+    def test_restores_dependency_forbidden_edit_history(self, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        state["tasks"]["task-001"] = {
+            "attempts_log": [
+                {
+                    "aider_success": True,
+                    "post_check_reason": "forbidden_file_edit",
+                    "forbidden_files": ["pom.xml"],
+                    "forbidden_edit_subtype": "dependency_target",
+                    "model_attempts": [{"model": "m", "success": True, "reason": "ok"}],
+                }
+            ]
+        }
+
+        restored = _restore_retry_context(state, "task-001")
+
+        assert restored["had_successful_model_attempt"] is True
+        assert restored["dependency_forbidden_edit_count"] == 1
+        assert restored["last_forbidden_edit"] == {
+            "files": ["pom.xml"],
+            "subtype": "dependency_target",
+        }
+
+
+class TestRunTaskVerificationStatus:
+    def test_existing_passing_branch_records_already_passing_status(self, monkeypatch, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        spec = {
+            "task_name": "task-001-example",
+            "target": "src/example.py",
+            "test": "tests/test_001_example.py",
+            "path": tmp_path / "specs" / "task-001-example.md",
+            "dependencies": [],
+        }
+
+        monkeypatch.setattr(task_runner, "branch_exists", lambda *args, **kwargs: True)
+        monkeypatch.setattr(task_runner, "checkout", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "run_tests", lambda *args, **kwargs: (True, ""))
+        monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
+
+        outcome = run_task(spec, "main", state)
+
+        assert outcome == "skipped"
+        assert state["tasks"]["task-001-example"]["verification_status"] == "already_passing_existing_branch"
+
+    def test_existing_passing_branch_after_failure_records_recovered_status(self, monkeypatch, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        record_task(state, "task-001-example", "failed", attempts=2, failure_class="assertion")
+        spec = {
+            "task_name": "task-001-example",
+            "target": "src/example.py",
+            "test": "tests/test_001_example.py",
+            "path": tmp_path / "specs" / "task-001-example.md",
+            "dependencies": [],
+        }
+
+        monkeypatch.setattr(task_runner, "branch_exists", lambda *args, **kwargs: True)
+        monkeypatch.setattr(task_runner, "checkout", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "run_tests", lambda *args, **kwargs: (True, ""))
+        monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
+
+        outcome = run_task(spec, "main", state)
+
+        assert outcome == "skipped"
+        assert state["tasks"]["task-001-example"]["verification_status"] == "recovered_after_prior_failure"
+
+
+class TestRunTaskFailureRouting:
+    def test_early_stop_records_forbidden_file_edit_as_failure_class(self, monkeypatch, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        spec = {
+            "task_name": "task-001-example",
+            "target": "src/example.py",
+            "test": "tests/test_001_example.py",
+            "path": tmp_path / "specs" / "task-001-example.md",
+            "dependencies": ["task-000-dependency"],
+        }
+
+        monkeypatch.setattr(task_runner, "branch_exists", lambda *args, **kwargs: False)
+        monkeypatch.setattr(task_runner, "resolve_dependency_base", lambda *args, **kwargs: ("main", []))
+        monkeypatch.setattr(task_runner, "branch_tip", lambda *args, **kwargs: "sha-1")
+        monkeypatch.setattr(task_runner, "checkout", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "file_size", lambda *args, **kwargs: 10)
+        monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            task_runner,
+            "_build_read_context",
+            lambda *args, **kwargs: ([str(spec["path"]), spec["test"]], [], []),
+        )
+
+        def fake_run_tier_attempts(*args, **kwargs):
+            ctx = args[12]
+            ctx["had_successful_model_attempt"] = True
+            ctx["stopped_early"] = True
+            ctx["terminal_failure_override"] = "forbidden_file_edit"
+            ctx["failure_note"] = "Stopped after repeated dependency-owned forbidden edits."
+            return "terminal_failure"
+
+        monkeypatch.setattr(task_runner, "_run_tier_attempts", fake_run_tier_attempts)
+        monkeypatch.setattr(
+            task_runner,
+            "get_tier",
+            lambda name: {"models": ["primary-model"], "retries": 1}
+            if name == "primary"
+            else {"models": ["escalation-model"], "retries": 0},
+        )
+        monkeypatch.setattr(
+            task_runner,
+            "run_tests",
+            lambda *args, **kwargs: (False, "AssertionError: assert 1 == 2"),
+        )
+
+        outcome = run_task(spec, "main", state, specs_by_name={"task-000-dependency": {"target": "pom.xml"}})
+
+        assert outcome == "failed"
+        entry = state["tasks"]["task-001-example"]
+        assert entry["failure_class"] == "forbidden_file_edit"
+        assert entry["test_failure_class"] == "assertion"
+
+    def test_resume_counts_previous_dependency_forbidden_edit_before_retrying(self, monkeypatch, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        state["tasks"]["task-001-example"] = {
+            "attempts_log": [
+                {
+                    "attempt": 1,
+                    "tier": "primary",
+                    "model": "primary-model",
+                    "aider_success": True,
+                    "tests_passed": False,
+                    "post_check_reason": "forbidden_file_edit",
+                    "forbidden_files": ["pom.xml"],
+                    "forbidden_edit_subtype": "dependency_target",
+                    "model_attempts": [{"model": "primary-model", "success": True, "reason": "ok", "wall_seconds": 1.0}],
+                }
+            ]
+        }
+        spec = {
+            "task_name": "task-001-example",
+            "target": "src/example.py",
+            "test": "tests/test_001_example.py",
+            "path": tmp_path / "specs" / "task-001-example.md",
+            "dependencies": ["task-000-dependency"],
+        }
+
+        monkeypatch.setattr(task_runner, "branch_exists", lambda *args, **kwargs: True)
+        monkeypatch.setattr(task_runner, "checkout", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
+        heads = iter(["base-sha", "head-before", "head-after"])
+        monkeypatch.setattr(task_runner, "branch_tip", lambda *args, **kwargs: next(heads))
+        monkeypatch.setattr(task_runner, "file_size", lambda *args, **kwargs: 10)
+        monkeypatch.setattr(
+            task_runner,
+            "_build_read_context",
+            lambda *args, **kwargs: ([str(spec["path"]), spec["test"]], ["pom.xml"], []),
+        )
+        monkeypatch.setattr(task_runner, "changed_files_between", lambda *args, **kwargs: ["pom.xml"])
+        monkeypatch.setattr(task_runner, "check_regression", lambda *args, **kwargs: False)
+        monkeypatch.setattr(task_runner, "revert_last_commit", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            task_runner,
+            "get_tier",
+            lambda name: {"models": ["primary-model"], "retries": 2}
+            if name == "primary"
+            else {"models": ["escalation-model"], "retries": 0},
+        )
+
+        test_outputs = iter([
+            (False, "still failing before resume"),
+            (False, "still failing during retry prompt"),
+            (False, "AssertionError: assert 1 == 2"),
+        ])
+        monkeypatch.setattr(task_runner, "run_tests", lambda *args, **kwargs: next(test_outputs))
+        monkeypatch.setattr(
+            task_runner,
+            "run_with_tier_fallback",
+            lambda *args, **kwargs: (
+                True,
+                "primary-model",
+                {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 1.0},
+                [{"model": "primary-model", "reason": "ok", "success": True, "wall_seconds": 1.0}],
+            ),
+        )
+
+        outcome = run_task(
+            spec,
+            "main",
+            state,
+            specs_by_name={"task-000-dependency": {"target": "pom.xml"}},
+            resume=True,
+        )
+
+        assert outcome == "failed"
+        entry = state["tasks"]["task-001-example"]
+        assert entry["failure_class"] == "forbidden_file_edit"
+        assert "Reopen the dependency task" in entry["failure_note"]
+
+    def test_first_attempt_prompt_mentions_only_attached_dependency_targets(self, monkeypatch, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        spec = {
+            "task_name": "task-001-example",
+            "target": "src/example.py",
+            "test": "tests/test_001_example.py",
+            "path": tmp_path / "specs" / "task-001-example.md",
+            "dependencies": ["task-000-dependency", "task-000-config"],
+        }
+
+        captured_messages = []
+        monkeypatch.setattr(task_runner, "branch_exists", lambda *args, **kwargs: False)
+        monkeypatch.setattr(task_runner, "resolve_dependency_base", lambda *args, **kwargs: ("main", []))
+        monkeypatch.setattr(task_runner, "branch_tip", lambda *args, **kwargs: "sha-1")
+        monkeypatch.setattr(task_runner, "checkout", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "file_size", lambda *args, **kwargs: 10)
+        monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            task_runner,
+            "_build_read_context",
+            lambda *args, **kwargs: ([str(spec["path"]), spec["test"], "pom.xml"], ["pom.xml"], ["application.yml"]),
+        )
+        def fake_get_tier(name):
+            if name == "gemini":
+                raise ValueError("no gemini tier")
+            if name == "primary":
+                return {"models": ["primary-model"], "retries": 1}
+            return {"models": ["escalation-model"], "retries": 0}
+
+        monkeypatch.setattr(task_runner, "get_tier", fake_get_tier)
+        monkeypatch.setattr(
+            task_runner,
+            "run_with_tier_fallback",
+            lambda tier_name, message, *args, **kwargs: (
+                captured_messages.append(message) or False,
+                None,
+                {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 0.0},
+                [],
+            ),
+        )
+        monkeypatch.setattr(task_runner, "run_tests", lambda *args, **kwargs: (False, "AssertionError: assert 1 == 2"))
+
+        run_task(
+            spec,
+            "main",
+            state,
+            specs_by_name={
+                "task-000-dependency": {"target": "pom.xml"},
+                "task-000-config": {"target": "application.yml"},
+            },
+        )
+
+        first_message = captured_messages[0]
+        assert "Dependency target files are attached only as read-only context: pom.xml." in first_message
+        assert "Dependency target files are attached only as read-only context: pom.xml, application.yml." not in first_message
+        assert "Omitted upstream target files: application.yml." in first_message

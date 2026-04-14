@@ -7,6 +7,23 @@ from .config import get_config
 
 # Match YAML frontmatter delimited by ---
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n?", re.DOTALL)
+_SAFE_BUILD_FILES = {
+    "pom.xml",
+    "Makefile",
+    "package.json",
+    "package-lock.json",
+    "requirements.txt",
+    "build.gradle",
+    "settings.gradle",
+    "build.gradle.kts",
+    "settings.gradle.kts",
+}
+_SAFE_CONFIG_FILES = {
+    "application.yml",
+    "application.yaml",
+    ".env.example",
+    ".gitignore",
+}
 
 
 def parse_frontmatter(spec_text):
@@ -90,6 +107,36 @@ def load_spec(spec_file):
     }
 
 
+def classify_target_path(target):
+    """Classify a task target path for validation messaging."""
+    path = Path(target)
+    normalized = path.as_posix()
+    suffix = path.suffix.lower()
+    name = path.name
+
+    if normalized.startswith("src/"):
+        return "source", None
+    if name in _SAFE_BUILD_FILES:
+        return "build", None
+    if (
+        name in _SAFE_CONFIG_FILES
+        or normalized.startswith(("config/", "configs/", "resources/"))
+        or suffix in {".yml", ".yaml", ".toml", ".ini", ".env"}
+    ):
+        return "config", None
+    if name == "README.md" or normalized.startswith("docs/") or suffix == ".md":
+        return "docs", None
+    if normalized.startswith("tests/"):
+        return (
+            "unusual",
+            f"target '{target}' writes under tests/; verify this task is intentionally test-only",
+        )
+    return (
+        "unusual",
+        f"target '{target}' is an unusual write path; verify the task really owns that location",
+    )
+
+
 def validate_specs(specs_dir):
     """
     Validate all spec files in the specs directory.
@@ -117,9 +164,10 @@ def validate_specs(specs_dir):
         if not spec["target"]:
             errors.append(f"{task_name}: missing target file (add YAML frontmatter or ## Target file header)")
 
-        # Check target is within src/
-        if spec["target"] and not spec["target"].startswith("src/"):
-            warnings.append(f"{task_name}: target '{spec['target']}' is outside src/")
+        if spec["target"]:
+            _, target_warning = classify_target_path(spec["target"])
+            if target_warning:
+                warnings.append(f"{task_name}: {target_warning}")
 
         # Check for duplicate targets
         if spec["target"] in seen_targets:

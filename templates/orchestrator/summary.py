@@ -7,16 +7,39 @@ from .task_runner import get_run_time_breakdown
 log = get_logger("summary")
 
 
+def _time_bucket_label(reason):
+    labels = {
+        "productive": "Productive (edit + tests passed)",
+        "reverted_or_failed_tests": "Edit produced but reverted/failed tests",
+        "forbidden_edit_waste": "Forbidden-edit drift",
+        "dependency_forbidden_edit_waste": "Dependency-owned forbidden edits",
+    }
+    return labels.get(reason, f"Wasted on {reason}")
+
+
 def print_summary(results, default_branch, state=None):
     """Print final summary of pipeline run."""
     passed = results["passed"]
     failed = results["failed"]
     skipped = results["skipped"]
     blocked = results.get("blocked", [])
+    recovered_skips = 0
+    already_passing_skips = len(skipped)
+    if state and state.get("tasks"):
+        recovered_skips = sum(
+            1 for name in skipped
+            if state["tasks"].get(name, {}).get("verification_status") == "recovered_after_prior_failure"
+        )
+        already_passing_skips = len(skipped) - recovered_skips
 
     log.info("\n%s", "=" * 50)
     log.info("PASSED:  %d", len(passed))
-    log.info("SKIPPED: %d (already passing)", len(skipped))
+    log.info(
+        "SKIPPED: %d (%d already passing, %d recovered since last run)",
+        len(skipped),
+        already_passing_skips,
+        recovered_skips,
+    )
     log.info("BLOCKED: %d (dependency failure)", len(blocked))
     log.info("FAILED:  %d", len(failed))
 
@@ -24,6 +47,12 @@ def print_summary(results, default_branch, state=None):
     # timings, and token / cost totals scraped from aider's stdout.
     if state and state.get("tasks"):
         attempted_by_model = {}
+        oversized_context = {
+            "provider_rejections": 0,
+            "fast_skips_after_rejection": 0,
+            "pre_screen_skips": 0,
+        }
+        forbidden_edit_attempts = {"generic": 0, "dependency_target": 0}
         total_time = 0.0
         total_tokens_sent = 0
         total_tokens_received = 0
@@ -39,6 +68,7 @@ def print_summary(results, default_branch, state=None):
                 if model_attempts:
                     for model_attempt in model_attempts:
                         model = model_attempt.get("model") or "(none)"
+                        reason = model_attempt.get("reason")
                         bucket = attempted_by_model.setdefault(
                             model,
                             {"attempts": 0, "aider_successes": 0, "test_passes": 0},
@@ -48,18 +78,29 @@ def print_summary(results, default_branch, state=None):
                             bucket["aider_successes"] += 1
                             if attempt.get("tests_passed"):
                                 bucket["test_passes"] += 1
-                    continue
+                        if reason == "pre_screen_too_large":
+                            oversized_context["pre_screen_skips"] += 1
+                        elif reason == "request_too_large":
+                            if (model_attempt.get("wall_seconds") or 0.0) > 0:
+                                oversized_context["provider_rejections"] += 1
+                            else:
+                                oversized_context["fast_skips_after_rejection"] += 1
+                else:
+                    model = attempt.get("model") or "(none)"
+                    bucket = attempted_by_model.setdefault(
+                        model,
+                        {"attempts": 0, "aider_successes": 0, "test_passes": 0},
+                    )
+                    bucket["attempts"] += 1
+                    if attempt.get("aider_success"):
+                        bucket["aider_successes"] += 1
+                        if attempt.get("tests_passed"):
+                            bucket["test_passes"] += 1
 
-                model = attempt.get("model") or "(none)"
-                bucket = attempted_by_model.setdefault(
-                    model,
-                    {"attempts": 0, "aider_successes": 0, "test_passes": 0},
-                )
-                bucket["attempts"] += 1
-                if attempt.get("aider_success"):
-                    bucket["aider_successes"] += 1
-                    if attempt.get("tests_passed"):
-                        bucket["test_passes"] += 1
+                post_check_reason = attempt.get("post_check_reason")
+                if post_check_reason == "forbidden_file_edit":
+                    subtype = attempt.get("forbidden_edit_subtype") or "generic"
+                    forbidden_edit_attempts[subtype] = forbidden_edit_attempts.get(subtype, 0) + 1
 
         log.info("\nTotal task time: %.1fs", total_time)
         if total_tokens_sent or total_tokens_received or total_cost:
@@ -87,19 +128,26 @@ def print_summary(results, default_branch, state=None):
             log.info("Failure classes:")
             for fc, n in sorted(fail_classes.items(), key=lambda x: -x[1]):
                 log.info("  %s: %d", fc, n)
+        if any(oversized_context.values()):
+            log.info("Oversized context handling:")
+            log.info("  Provider rejections: %d", oversized_context["provider_rejections"])
+            log.info("  Fast skips after prior rejection: %d", oversized_context["fast_skips_after_rejection"])
+            log.info("  Pre-screen skips: %d", oversized_context["pre_screen_skips"])
+        if any(forbidden_edit_attempts.values()):
+            log.info("Forbidden-edit retries:")
+            log.info("  Generic drift: %d", forbidden_edit_attempts.get("generic", 0))
+            log.info(
+                "  Dependency-owned files: %d",
+                forbidden_edit_attempts.get("dependency_target", 0),
+            )
 
     breakdown = get_run_time_breakdown()
     total_wall = sum(breakdown.values())
     if total_wall > 0:
-        productive = breakdown.pop("productive", 0.0)
-        reverted = breakdown.pop("reverted_or_failed_tests", 0.0)
         log.info("\nTime breakdown:")
-        log.info("  Productive (edit + tests passed): %.1fs", productive)
-        if reverted > 0:
-            log.info("  Edit produced but reverted/failed tests: %.1fs", reverted)
         for reason, seconds in sorted(breakdown.items(), key=lambda x: -x[1]):
             if seconds > 0:
-                log.info("  Wasted on %s: %.1fs", reason, seconds)
+                log.info("  %s: %.1fs", _time_bucket_label(reason), seconds)
         log.info("  Total aider wall time: %.1fs", total_wall)
 
     if blocked:

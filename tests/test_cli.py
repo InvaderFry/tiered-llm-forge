@@ -9,7 +9,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "templates"))
 
 import orchestrator.__main__ as cli
-from orchestrator.__main__ import _blocked_dependencies, _should_cooldown
+from orchestrator.__main__ import _blocked_dependencies, _cooldown_duration, _should_cooldown
 
 
 def test_blocked_dependencies_detects_failed_and_blocked_upstream():
@@ -114,7 +114,13 @@ def test_cmd_preflight_reports_errors(monkeypatch, caplog):
     assert "Preflight error: bad model" in caplog.text
 
 
-def test_should_cooldown_skips_pure_skip_blocked_batches(monkeypatch):
-    monkeypatch.setattr(cli, "has_pending_rate_limits", lambda: False)
-    assert _should_cooldown(["skipped", "blocked"]) is False
-    assert _should_cooldown(["passed"]) is True
+def test_should_cooldown_uses_adaptive_provider_pressure(monkeypatch):
+    monkeypatch.setattr(cli, "adaptive_cooldown_seconds", lambda cooldown: 12.5 if cooldown == 30 else 0.0)
+    assert _cooldown_duration(30) == 12.5
+    assert _should_cooldown(["skipped", "blocked"], 30) is True
+
+
+def test_should_cooldown_skips_when_no_provider_pressure(monkeypatch):
+    monkeypatch.setattr(cli, "adaptive_cooldown_seconds", lambda cooldown: 0.0)
+    assert _cooldown_duration(30) == 0.0
+    assert _should_cooldown(["passed"], 30) is False

@@ -159,15 +159,17 @@ The orchestrator processes each spec in dependency order:
 6. Writes `forgeLogs/FAILED-task-NNN-name-<timestamp>.log` (tagged with a
    failure class) if all automated tiers fail. Failure and integration logs
    include `Start time:` at the top and `End time:` at the bottom.
-6. Records per-task attempts, attempted models, base SHA, and both terminal
-   and test failure classes in `pipeline-state.json`.
+6. Records per-task attempts, attempted models, base SHA, both terminal
+   and test failure classes, and verification status in `pipeline-state.json`.
 7. Returns to default branch, moves to next task.
 
 After every task passes, the orchestrator runs an **integration gate**
 (see Phase 7 below).
 
-**Re-running is safe.** Passing branches are skipped. Failing branches go
-straight to Claude review.
+**Re-running is safe.** Passing branches are skipped. `pipeline-state.json`
+distinguishes `already_passing_existing_branch` from
+`recovered_after_prior_failure`, so resume state shows whether a branch was
+always green or fixed after an earlier failure.
 
 ### Parallel mode
 
@@ -202,9 +204,9 @@ simultaneously in isolated git worktrees via a thread pool.
   `forgeLogs/orchestrator-<timestamp>.log` simultaneously. Use `--verbose`
   and grep by task name when debugging.
 - **Rate-limit amplification.** More concurrent requests can hit provider
-  rate limits faster. The coordinator mitigates this, and fixed cooldowns are
-  only applied after real work or pending retry windows, but wide waves can
-  still create more provider pressure than sequential runs.
+  rate limits faster. The coordinator mitigates this, and adaptive cooldowns
+  only fire when the run has explicit provider-pressure signals, but wide
+  waves can still create more provider pressure than sequential runs.
 - **Not the default.** Sequential mode (`make run`) is simpler and easier to
   debug. Prefer it for first runs or when diagnosing failures.
 
@@ -217,9 +219,14 @@ Models are configured in `models.yaml`. Default tiers, tried in order:
 
 | Tier | Models | Trigger | API key |
 |------|--------|---------|---------|
-| Primary | Qwen3 32B → Kimi K2 → Llama 4 Scout | Every task, 3 attempts | `GROQ_API_KEY` |
-| Escalation | GPT-OSS 120B | Primary exhausted, 2 attempts | `GROQ_API_KEY` |
-| Gemini | Gemini 2.5 Flash | Escalation exhausted, 1 attempt each | `GOOGLE_API_KEY` |
+| Primary | Kimi K2 | Every task, 3 attempts | `GROQ_API_KEY` |
+| Escalation | Llama 4 Scout | Primary exhausted, 2 attempts | `GROQ_API_KEY` |
+| Gemini | Gemini 3 Flash → Gemini 2.5 Flash | Escalation exhausted, 1 attempt each | `GOOGLE_API_KEY` |
+
+Models can also declare `max_input_tokens` in `models.yaml`. The router uses
+that only for conservative pre-screen skips; actual provider
+`request_too_large` rejections are tracked separately so the summary can
+distinguish real provider failures from fast skips.
 
 The Gemini tier uses **daily quota** semantics: if a model's free-tier quota is
 exhausted for the day, it is skipped immediately (no sleep) and the next model
@@ -379,10 +386,10 @@ The orchestrator already skipped the exhausted models cleanly. Options:
 → The orchestrator handles this at two levels. First, a per-model coordinator
 records the "try again in Ns" hint from each 429 and sleeps exactly that
 long before the next request to that model — across tasks, not just within
-one retry loop. Second, `cooldown_seconds` in `models.yaml` provides a
-defensive baseline between tasks for signals the parser misses, but it only
-fires after real work or pending retry windows. If you are still seeing 429s
-at the start of each task, raise `cooldown_seconds`. If
+one retry loop. Second, `cooldown_seconds` in `models.yaml` acts as an
+adaptive ceiling between tasks for recent provider-pressure signals; it does
+not force a sleep after every green task. If you are still seeing 429s
+at the start of the next task, raise `cooldown_seconds`. If
 all models exhaust their retries, wait a few minutes — Groq limits reset
 hourly.
 
@@ -415,11 +422,12 @@ next pass.
 
 **I want to see per-model stats, costs, and failure classes**
 → `cat pipeline-state.json` — each task records `model`, `models_tried`,
-`duration_seconds`, `failure_class`, `tokens_sent`, `tokens_received`,
+`duration_seconds`, `failure_class`, `test_failure_class`,
+`verification_status`, `failure_note`, `tokens_sent`, `tokens_received`,
 and `cost_usd` (scraped from aider's stdout). `make run` also prints a
-rolled-up summary at the end with totals and per-model token / dollar
-counts so you can see whether the escalation tier is actually
-earning its keep.
+rolled-up summary at the end with totals, per-model attempt stats,
+oversized-context handling, and forbidden-edit waste so you can see
+whether the escalation tier and retry policy are actually earning their keep.
 
 **Want to add a new model provider**
 → Edit `models.yaml` and add models to the appropriate tier. The orchestrator

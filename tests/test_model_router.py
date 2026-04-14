@@ -9,6 +9,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "templates"))
 
 from orchestrator.model_router import (
+    adaptive_cooldown_seconds,
     get_fallback_models,
     _parse_retry_after,
     _parse_usage,
@@ -82,6 +83,7 @@ class TestRateLimitCoordinator:
     def setup_method(self):
         _mr._next_available_at.clear()
         _mr._invalid_models.clear()
+        _mr._last_provider_pressure_at = 0.0
         clear_request_too_large()
         self._fake_now = [1000.0]
         self._slept = []
@@ -94,6 +96,7 @@ class TestRateLimitCoordinator:
         _mr._sleep = _t.sleep
         _mr._next_available_at.clear()
         _mr._invalid_models.clear()
+        _mr._last_provider_pressure_at = 0.0
         clear_request_too_large()
 
     def test_wait_sleeps_remaining_window(self):
@@ -134,6 +137,15 @@ class TestRateLimitCoordinator:
         assert has_pending_rate_limits() is False
         _mark_rate_limited("groq/qwen3-32b", 10.0)
         assert has_pending_rate_limits() is True
+
+    def test_adaptive_cooldown_uses_pending_window_but_respects_ceiling(self):
+        _mark_rate_limited("groq/qwen3-32b", 40.0, buffer=0.0)
+        assert adaptive_cooldown_seconds(30) == 30
+
+    def test_adaptive_cooldown_uses_recent_pressure_when_window_has_passed(self):
+        _mr._last_provider_pressure_at = self._fake_now[0]
+        self._fake_now[0] += 12.0
+        assert adaptive_cooldown_seconds(30) == 18.0
 
 
 class TestRequestTooLargePerTask:

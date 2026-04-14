@@ -11,6 +11,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "templates"))
 
 from orchestrator.spec_parser import (
+    classify_target_path,
     parse_frontmatter,
     parse_target_file,
     load_spec,
@@ -164,6 +165,57 @@ class TestValidateSpecs:
             assert len(errors) == 0
         finally:
             os.chdir(old_cwd)
+
+    def test_known_build_and_config_targets_do_not_warn_generically(self, tmp_path):
+        specs = tmp_path / "specs"
+        specs.mkdir()
+        tests = tmp_path / "tests"
+        tests.mkdir()
+        (specs / "task-001-build.md").write_text(
+            "---\ntarget: pom.xml\ntest: tests/test_001_build.py\n---\n# Body"
+        )
+        (specs / "task-002-config.md").write_text(
+            "---\ntarget: application.yml\ntest: tests/test_002_config.py\n---\n# Body"
+        )
+        (tests / "test_001_build.py").write_text("def test_x(): pass")
+        (tests / "test_002_config.py").write_text("def test_y(): pass")
+
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            errors, warnings = validate_specs(specs)
+            assert errors == []
+            assert warnings == []
+        finally:
+            os.chdir(old_cwd)
+
+    def test_unusual_target_warning_explains_why_it_matters(self, tmp_path):
+        specs = tmp_path / "specs"
+        specs.mkdir()
+        tests = tmp_path / "tests"
+        tests.mkdir()
+        (specs / "task-001-script.md").write_text(
+            "---\ntarget: scripts/deploy.sh\ntest: tests/test_001_script.py\n---\n# Body"
+        )
+        (tests / "test_001_script.py").write_text("def test_x(): pass")
+
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            errors, warnings = validate_specs(specs)
+            assert errors == []
+            assert warnings == [
+                "task-001-script: target 'scripts/deploy.sh' is an unusual write path; verify the task really owns that location"
+            ]
+        finally:
+            os.chdir(old_cwd)
+
+
+class TestClassifyTargetPath:
+    def test_recognizes_docs_build_and_config_paths(self):
+        assert classify_target_path("README.md") == ("docs", None)
+        assert classify_target_path("pom.xml") == ("build", None)
+        assert classify_target_path("application.yml") == ("config", None)
 
 
 class TestTopologicalSort:

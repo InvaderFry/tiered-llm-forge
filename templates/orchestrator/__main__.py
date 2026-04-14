@@ -14,7 +14,7 @@ from pathlib import Path
 from . import SPECS_DIR
 from .config import load_config, get_config, get_tier
 from .log import setup_logging, get_logger
-from .model_router import has_pending_rate_limits
+from .model_router import adaptive_cooldown_seconds
 from .preflight import run_startup_preflight
 from .spec_parser import load_spec, validate_specs, topological_sort
 from .git_ops import (
@@ -142,7 +142,7 @@ def cmd_dry_run():
     log.info("Default branch: %s", default_branch)
     log.info("Primary models: %s (%d retries)", ", ".join(primary["models"]), primary["retries"])
     log.info("Escalation models: %s (%d retries)", ", ".join(escalation["models"]), escalation["retries"])
-    log.info("Cooldown: %ds between tasks", cfg.get("cooldown_seconds", 30))
+    log.info("Cooldown: up to %ds between tasks when provider pressure is detected", cfg.get("cooldown_seconds", 30))
     log.info("=" * 50 + "\n")
 
     for i, spec in enumerate(ordered_specs, 1):
@@ -174,9 +174,15 @@ def cmd_preflight():
     return 0
 
 
-def _should_cooldown(outcomes):
-    """Return True if we should sleep before the next task or wave."""
-    return any(o not in {"skipped", "blocked"} for o in outcomes) or has_pending_rate_limits()
+def _cooldown_duration(max_cooldown):
+    """Return the adaptive cooldown to apply before the next task or wave."""
+    return adaptive_cooldown_seconds(max_cooldown)
+
+
+def _should_cooldown(outcomes, max_cooldown):
+    """Return True if adaptive provider-pressure signals warrant a cooldown."""
+    del outcomes
+    return _cooldown_duration(max_cooldown) > 0
 
 
 def main():
@@ -289,9 +295,10 @@ def main():
                 outcomes[task_name] = outcome
 
             # Cooldown between waves
-            if wave_i < len(groups) and cooldown > 0 and _should_cooldown(wave_results.values()):
-                log.info("  [cooldown: sleeping %ds between waves]", cooldown)
-                time.sleep(cooldown)
+            cooldown_wait = _cooldown_duration(cooldown)
+            if wave_i < len(groups) and cooldown_wait > 0 and _should_cooldown(wave_results.values(), cooldown):
+                log.info("  [cooldown: sleeping %.1fs between waves]", cooldown_wait)
+                time.sleep(cooldown_wait)
     else:
         # Sequential mode (default). If the dependency graph has any wave
         # wider than one task, suggest --parallel once up-front so the user
@@ -327,9 +334,10 @@ def main():
             outcomes[spec["task_name"]] = outcome
 
             # Cooldown between tasks
-            if i < len(ordered_specs) - 1 and cooldown > 0 and _should_cooldown([outcome]):
-                log.info("  [cooldown: sleeping %ds between tasks]", cooldown)
-                time.sleep(cooldown)
+            cooldown_wait = _cooldown_duration(cooldown)
+            if i < len(ordered_specs) - 1 and cooldown_wait > 0 and _should_cooldown([outcome], cooldown):
+                log.info("  [cooldown: sleeping %.1fs between tasks]", cooldown_wait)
+                time.sleep(cooldown_wait)
 
     print_summary(results, default_branch, state)
 

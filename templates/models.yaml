@@ -49,17 +49,18 @@ context_limits:
   max_dependency_files: 2
   max_total_bytes: 24000
 
-# Seconds to pause between tasks as a defensive baseline.
+# Maximum generic cooldown to apply between tasks or waves.
 #
 # The orchestrator also keeps a per-model rate-limit coordinator: when any
 # task receives a Groq 429 with a "try again in Ns" hint, that exact wait
 # is recorded and honoured before the next request to that model, across
-# tasks and retries. So in practice the coordinator handles the precise
-# case and cooldown_seconds is a fallback for signals the parser misses.
+# tasks and retries. In addition, recent 429/backoff events can trigger a
+# shorter adaptive pause between tasks. So in practice the coordinator
+# handles the precise case and cooldown_seconds is only a ceiling.
 #
-# You can lower this if your tasks are short and the coordinator is
-# catching most rate limits; raise it if you are still seeing 429s at the
-# start of each task.
+# You can lower this if your tasks are short and the coordinator is catching
+# most provider pressure. Raise it if you are still seeing 429s at the start
+# of the next task even after the adaptive waits.
 cooldown_seconds: 30
 
 # Maximum seconds to wait for a single aider invocation before timing out.

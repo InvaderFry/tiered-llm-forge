@@ -43,6 +43,7 @@ _next_available_at: dict = {}
 # is asking. Protected by the same _rate_limit_lock.
 _daily_quota_exhausted: set = set()
 _invalid_models: set = set()
+_last_provider_pressure_at = 0.0
 # Request-too-large is per-task and per-thread, not session-wide. A long spec
 # that blows past qwen3's 6k TPM cap must not cause the NEXT task's tiny spec
 # to also skip qwen3. We store the flag on a threading.local so worktree-mode
@@ -161,6 +162,23 @@ def has_pending_rate_limits() -> bool:
         return any(earliest > now for earliest in _next_available_at.values())
 
 
+def adaptive_cooldown_seconds(max_cooldown):
+    """Return a bounded cooldown based on recent provider-pressure signals."""
+    if max_cooldown <= 0:
+        return 0.0
+
+    now = _clock()
+    with _rate_limit_lock:
+        pending_waits = [earliest - now for earliest in _next_available_at.values() if earliest > now]
+        recent_pressure_age = now - _last_provider_pressure_at if _last_provider_pressure_at else None
+
+    if pending_waits:
+        return round(min(max_cooldown, max(pending_waits)), 2)
+    if recent_pressure_age is not None and recent_pressure_age < max_cooldown:
+        return round(max_cooldown - recent_pressure_age, 2)
+    return 0.0
+
+
 def _mark_rate_limited(model, retry_after, buffer=5.0):
     """Record that ``model`` should not be called for ``retry_after`` seconds.
 
@@ -168,8 +186,10 @@ def _mark_rate_limited(model, retry_after, buffer=5.0):
     matches the buffer already applied inside the local retry loop.
     Thread-safe: writes under a lock.
     """
+    global _last_provider_pressure_at
     with _rate_limit_lock:
         _next_available_at[model] = _clock() + retry_after + buffer
+        _last_provider_pressure_at = _clock()
 
 
 def get_fallback_models(current_model, tier_name):

@@ -47,7 +47,7 @@ Use the failure class to pick a strategy before reading the body:
 | `rate_limit` | Groq throttled every tier | Wait, re-run — not a code bug |
 | `gemini_quota_exhausted` | Gemini daily quota hit before it could fix | Wait until midnight UTC, or fix with Claude now |
 | `request_too_large` | Spec exceeds the model's TPM cap | Split the spec into smaller tasks |
-| `forbidden_file_edit` | Model edited a file outside its allowed write scope | Read the spec target; the model strayed — may need a tighter spec |
+| `forbidden_file_edit` | Model edited a file outside its allowed write scope | If it touched a dependency-owned file, reopen that dependency task or add a follow-up task; otherwise tighten the spec/prompt |
 | `collection_error` | pytest could not even import the test file | Fix imports or missing module in target file |
 | `missing_symbol` | `ImportError` / `AttributeError` / `NameError` | Add the symbol the test expects, or fix the spec signature |
 | `assertion` | Tests ran but produced wrong answers | Genuine logic bug — debug normally |
@@ -59,14 +59,19 @@ Use the failure class to pick a strategy before reading the body:
 You can also run `cat pipeline-state.json` and look at the task entry
 for its recorded `model`, `models_tried`, `failure_class`,
 `test_failure_class`, `llm_fail_reasons`, `duration_seconds`,
-`tokens_sent`, `tokens_received`, `cost_usd`, `base_branch`, and `base_sha`.
+`tokens_sent`, `tokens_received`, `cost_usd`, `base_branch`, `base_sha`,
+`verification_status`, and `failure_note`.
 `failure_class` is the terminal/actionable label (may reflect an LLM-side
 reason when no model produced a successful edit); `test_failure_class` is the
 raw classification of the final pytest output. `llm_fail_reasons` lists any
 automated-tier-level signals (e.g. `gemini_quota_exhausted`) that
 explain why the pipeline stopped before reaching Claude. `base_branch`
 tells you which branch the task was stacked on — useful when diagnosing
-dependency ordering bugs.
+dependency ordering bugs. `verification_status` distinguishes an already-green
+existing branch from a branch that was fixed after a prior failure and then
+verified on resume. `failure_note` carries the orchestrator's actionable stop
+reason when it terminates retries early, such as repeated dependency-owned
+forbidden edits.
 
 ### 3. Get on the branch
 ```bash

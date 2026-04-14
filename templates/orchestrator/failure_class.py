@@ -54,6 +54,8 @@ def classify(output):
 _LLM_REASON_TO_CLASS = {
     "invalid_model_config": "invalid_model_config",
     "forbidden_file_edit": "forbidden_file_edit",
+    "dependency_owned_forbidden_edit": "forbidden_file_edit",
+    "pre_screen_too_large": "request_too_large",
     "request_too_large": "request_too_large",
     "gemini_quota_exhausted": "gemini_quota_exhausted",
 }
