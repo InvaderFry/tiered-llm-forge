@@ -5,15 +5,17 @@
 tiers:
   - name: primary
     models:
-      - groq/qwen/qwen3-32b
-      - groq/moonshotai/kimi-k2-instruct
-      - groq/meta-llama/llama-4-scout-17b-16e-instruct
+      - id: groq/moonshotai/kimi-k2-instruct
+        max_input_tokens: 131072
     retries: 3
+    aider_timeout_seconds: 120
 
   - name: escalation
     models:
-      - groq/openai/gpt-oss-120b
+      - id: groq/meta-llama/llama-4-scout-17b-16e-instruct
+        max_input_tokens: 30000
     retries: 2
+    aider_timeout_seconds: 180
 
   # Gemini tier: tried after escalation, before flagging for Claude review.
   # Requires GOOGLE_API_KEY=<your-key> in .env (never committed).
@@ -23,9 +25,10 @@ tiers:
   # through to Claude review if both models are exhausted for the day.
   - name: gemini
     models:
-      - gemini/gemini-3-flash-preview  # Gemini 3 Flash (primary)
-      - gemini/gemini-2.5-flash        # Gemini 2.5 Flash fallback
+      - id: gemini/gemini-3-flash-preview  # Gemini 3 Flash (primary)
+      - id: gemini/gemini-2.5-flash        # Gemini 2.5 Flash fallback
     retries: 1                         # One attempt per model; daily quota errors skip, not retry
+    aider_timeout_seconds: 600
 
 # Weak model for commit messages and safe operations (low token cost)
 weak_model: groq/llama-3.1-8b-instant

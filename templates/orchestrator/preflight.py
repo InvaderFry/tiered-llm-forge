@@ -6,7 +6,7 @@ import subprocess
 import threading
 from pathlib import Path
 
-from .config import get_config
+from .config import get_config, model_id as _model_id
 from .log import get_logger
 
 log = get_logger("preflight")
@@ -56,6 +56,7 @@ def validate_config(cfg=None) -> tuple[list[str], list[str]]:
     for idx, tier in enumerate(tiers, 1):
         name = tier.get("name", "").strip()
         retries = tier.get("retries")
+        tier_timeout = tier.get("aider_timeout_seconds")
         models = tier.get("models") or []
 
         if not name:
@@ -67,25 +68,39 @@ def validate_config(cfg=None) -> tuple[list[str], list[str]]:
 
         if not isinstance(retries, int) or retries < 1:
             errors.append(f"Tier '{name}' must set retries to an integer >= 1.")
+        if tier_timeout is not None and (
+            not isinstance(tier_timeout, (int, float)) or tier_timeout < 1
+        ):
+            errors.append(
+                f"Tier '{name}': aider_timeout_seconds must be a positive number when set."
+            )
 
         if not isinstance(models, list) or not models:
             errors.append(f"Tier '{name}' must declare at least one model.")
             continue
 
         for model in models:
-            if not isinstance(model, str) or "/" not in model:
+            model_id = model if isinstance(model, str) else model.get("id", "") if isinstance(model, dict) else ""
+            if not isinstance(model_id, str) or "/" not in model_id:
                 errors.append(f"Tier '{name}' has invalid model id: {model!r}")
                 continue
-            if any(marker in model for marker in ("<", ">", "your-", "placeholder")):
-                errors.append(f"Tier '{name}' contains placeholder model id '{model}'.")
-            bad_reason = _KNOWN_BAD_MODEL_IDS.get(model)
-            if bad_reason:
-                errors.append(f"Tier '{name}' model '{model}': {bad_reason}")
+            if isinstance(model, dict):
+                cap = model.get("max_input_tokens")
+                if cap is not None and (not isinstance(cap, int) or cap < 1):
+                    errors.append(
+                        f"Tier '{name}' model '{model_id}': max_input_tokens must be a positive integer."
+                    )
 
-            previous_tier = seen_models.setdefault(model, name)
+            if any(marker in model_id for marker in ("<", ">", "your-", "placeholder")):
+                errors.append(f"Tier '{name}' contains placeholder model id '{model_id}'.")
+            bad_reason = _KNOWN_BAD_MODEL_IDS.get(model_id)
+            if bad_reason:
+                errors.append(f"Tier '{name}' model '{model_id}': {bad_reason}")
+
+            previous_tier = seen_models.setdefault(model_id, name)
             if previous_tier != name:
                 warnings.append(
-                    f"Model '{model}' appears in both tiers '{previous_tier}' and '{name}'. "
+                    f"Model '{model_id}' appears in both tiers '{previous_tier}' and '{name}'. "
                     "That usually wastes retries instead of giving a true fallback."
                 )
 
@@ -100,10 +115,11 @@ def validate_provider_env(cfg=None) -> tuple[list[str], list[str]]:
 
     required_envs = set()
     for tier in cfg.get("tiers", []):
-        for model in tier.get("models") or []:
-            if isinstance(model, str) and model.startswith("groq/"):
+        for raw_model in tier.get("models") or []:
+            mid = _model_id(raw_model)
+            if mid.startswith("groq/"):
                 required_envs.add("GROQ_API_KEY")
-            elif isinstance(model, str) and model.startswith("gemini/"):
+            elif mid.startswith("gemini/"):
                 required_envs.add("GOOGLE_API_KEY")
 
     for env_name in sorted(required_envs):

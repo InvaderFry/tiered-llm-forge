@@ -74,6 +74,7 @@ def record_task(
     tokens_sent=None,
     tokens_received=None,
     cost_usd=None,
+    wall_seconds=None,
 ):
     """Record the outcome of a single task.
 
@@ -127,6 +128,8 @@ def record_task(
         entry["tokens_received"] = int(tokens_received)
     if cost_usd is not None:
         entry["cost_usd"] = round(float(cost_usd), 6)
+    if wall_seconds is not None:
+        entry["wall_seconds"] = round(float(wall_seconds), 2)
 
     with _state_lock:
         state["tasks"][task_name] = entry
@@ -134,7 +137,7 @@ def record_task(
 
 
 def record_attempt(state, task_name, attempt_num, tier, model, aider_success, tests_passed=None,
-                   model_attempts=None):
+                   model_attempts=None, wall_seconds=None):
     """Record a single attempt within a task for granular crash recovery.
 
     Stored under ``state["tasks"][task_name]["attempts_log"]`` as a list,
@@ -154,6 +157,8 @@ def record_attempt(state, task_name, attempt_num, tier, model, aider_success, te
         }
         if model_attempts is not None:
             item["model_attempts"] = list(model_attempts)
+        if wall_seconds is not None:
+            item["wall_seconds"] = round(float(wall_seconds), 2)
         log.append(item)
 
 

@@ -51,6 +51,11 @@ _invalid_models: set = set()
 _request_too_large_tls = threading.local()
 _rate_limit_lock = threading.Lock()
 
+# Rough aider overhead beyond attached files: system prompt, repo map,
+# orchestration prompt text, and retry/test-output context.
+_AIDER_OVERHEAD_TOKENS = 2000
+_PRE_SCREEN_SAFETY_MULTIPLIER = 1.4
+
 
 def _request_too_large_set():
     """Return (creating if needed) the per-thread request-too-large set."""
@@ -59,7 +64,6 @@ def _request_too_large_set():
         s = set()
         _request_too_large_tls.models = s
     return s
-
 
 def clear_request_too_large():
     """Forget every request-too-large flag for the current task.
@@ -102,7 +106,6 @@ def _mark_request_too_large(model):
     """
     with _rate_limit_lock:
         _request_too_large_set().add(model)
-
 
 def is_request_too_large(model):
     """Return True if this model is flagged as too-large for the current task."""
@@ -286,7 +289,7 @@ def _parse_usage(output):
 
 
 def _empty_stats():
-    return {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0}
+    return {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 0.0}
 
 
 def _add_stats(a, b):
@@ -294,10 +297,27 @@ def _add_stats(a, b):
         "tokens_sent": a["tokens_sent"] + b["tokens_sent"],
         "tokens_received": a["tokens_received"] + b["tokens_received"],
         "cost_usd": a["cost_usd"] + b["cost_usd"],
+        "wall_seconds": a.get("wall_seconds", 0.0) + b.get("wall_seconds", 0.0),
     }
 
 
-def run_aider(model, message, target_file, read_files=None, cwd=None):
+def _estimate_request_tokens(target_file, message, read_files=None, cwd=None):
+    """Estimate aider request tokens using file size, prompt size, and fixed overhead."""
+    total_bytes = 0
+    for path in [target_file] + list(read_files or []):
+        resolved = Path(cwd) / path if cwd and not Path(path).is_absolute() else Path(path)
+        try:
+            total_bytes += resolved.stat().st_size
+        except OSError:
+            pass
+
+    file_tokens = total_bytes // 4
+    message_tokens = len(message) // 4 if message else 0
+    raw_estimate = file_tokens + message_tokens + _AIDER_OVERHEAD_TOKENS
+    return int(raw_estimate * _PRE_SCREEN_SAFETY_MULTIPLIER)
+
+
+def run_aider(model, message, target_file, read_files=None, cwd=None, timeout_override=None):
     """
     Run aider with a specific model, handling rate limit retries.
 
@@ -315,7 +335,11 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
     """
     cfg = get_config()
     weak_model = cfg.get("weak_model", "groq/llama-3.1-8b-instant")
-    aider_timeout = int(cfg.get("aider_timeout_seconds", _AIDER_TIMEOUT_DEFAULT))
+    aider_timeout = (
+        timeout_override
+        if timeout_override is not None
+        else int(cfg.get("aider_timeout_seconds", _AIDER_TIMEOUT_DEFAULT))
+    )
 
     # Resolve the target file to an absolute path and ensure its parent
     # directory exists. If aider is handed a relative path to a file whose
@@ -358,6 +382,12 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
     aider_env["LITELLM_NUM_RETRIES"] = "0"
 
     invocation_stats = _empty_stats()
+    t0 = time.time()
+
+    def _finish(success, reason):
+        invocation_stats["wall_seconds"] = round(time.time() - t0, 2)
+        return success, invocation_stats, reason
+
     fallback_wait = 15
     for attempt in range(1, AIDER_MAX_RATE_RETRIES + 1):
         # Respect any rate-limit window recorded for this model by a
@@ -371,7 +401,7 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
             )
         except subprocess.TimeoutExpired:
             log.warning("  [aider timed out after %ds on model %s]", aider_timeout, model)
-            return False, invocation_stats, "timeout"
+            return _finish(False, "timeout")
         if result.stdout:
             log.info("%s", result.stdout.rstrip())
         if result.stderr:
@@ -402,12 +432,12 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
         if _is_daily_quota_error(combined, retry_after):
             log.warning("  [Gemini daily quota exhausted for %s -- skipping model]", model)
             mark_daily_quota_exhausted(model)
-            return False, invocation_stats, "daily_quota_exhausted"
+            return _finish(False, "daily_quota_exhausted")
 
         if _is_invalid_model_error(combined):
             log.warning("  [invalid model config for %s -- skipping model]", model)
             mark_invalid_model(model)
-            return False, invocation_stats, "invalid_model_config"
+            return _finish(False, "invalid_model_config")
 
         if "rate_limit_exceeded" in combined or "Rate limit reached" in combined:
             # "Request too large" means the request itself exceeds the TPM cap —
@@ -416,7 +446,7 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
             if "Request too large" in combined:
                 log.warning("  [request too large for model %s TPM cap -- falling back]", model)
                 _mark_request_too_large(model)
-                return False, invocation_stats, "request_too_large"
+                return _finish(False, "request_too_large")
 
             wait = retry_after
             if wait:
@@ -432,16 +462,16 @@ def run_aider(model, message, target_file, read_files=None, cwd=None):
             if attempt < AIDER_MAX_RATE_RETRIES:
                 _sleep(wait)
                 continue
-            return False, invocation_stats, "rate_limit"
+            return _finish(False, "rate_limit")
 
         # No rate-limit error — trust the exit code.
         if result.returncode == 0:
-            return True, invocation_stats, "ok"
+            return _finish(True, "ok")
 
         # Non-rate-limit error or exhausted retries
-        return False, invocation_stats, "error"
+        return _finish(False, "error")
 
-    return False, invocation_stats, "rate_limit"
+    return _finish(False, "rate_limit")
 
 
 def run_with_tier_fallback(tier_name, message, target_file, start_model=None, read_files=None,
@@ -457,6 +487,8 @@ def run_with_tier_fallback(tier_name, message, target_file, start_model=None, re
     """
     tier = get_tier(tier_name)
     models = tier["models"]
+    model_meta = tier.get("model_meta", {})
+    tier_timeout = tier.get("aider_timeout_seconds")
 
     if start_model and start_model in models:
         idx = models.index(start_model)
@@ -464,23 +496,54 @@ def run_with_tier_fallback(tier_name, message, target_file, start_model=None, re
 
     aggregate = _empty_stats()
     attempts = []
+    estimated_tokens = _estimate_request_tokens(target_file, message, read_files, cwd)
     for model in models:
+        meta = model_meta.get(model, {})
+        cap = meta.get("max_input_tokens")
+        if cap and estimated_tokens > cap:
+            log.info(
+                "  Skipping %s -- estimated %d tokens exceeds declared cap %d",
+                model,
+                estimated_tokens,
+                cap,
+            )
+            attempts.append(
+                {"model": model, "reason": "pre_screen_too_large", "success": False, "wall_seconds": 0.0}
+            )
+            continue
         if is_request_too_large(model):
             log.info("  Skipping %s -- request too large (already seen this task)", model)
-            attempts.append({"model": model, "reason": "request_too_large", "success": False})
+            attempts.append(
+                {"model": model, "reason": "request_too_large", "success": False, "wall_seconds": 0.0}
+            )
             continue
         if is_daily_quota_exhausted(model):
             log.info("  Skipping %s -- daily quota exhausted", model)
-            attempts.append({"model": model, "reason": "daily_quota_exhausted", "success": False})
+            attempts.append(
+                {"model": model, "reason": "daily_quota_exhausted", "success": False, "wall_seconds": 0.0}
+            )
             continue
         if is_invalid_model(model):
             log.info("  Skipping %s -- invalid model config", model)
-            attempts.append({"model": model, "reason": "invalid_model_config", "success": False})
+            attempts.append(
+                {"model": model, "reason": "invalid_model_config", "success": False, "wall_seconds": 0.0}
+            )
             continue
         log.info("  Trying %s...", model)
-        success, stats, reason = run_aider(model, message, target_file, read_files=read_files, cwd=cwd)
+        t0 = time.time()
+        success, stats, reason = run_aider(
+            model,
+            message,
+            target_file,
+            read_files=read_files,
+            cwd=cwd,
+            timeout_override=tier_timeout,
+        )
+        model_wall = round(time.time() - t0, 2)
         aggregate = _add_stats(aggregate, stats)
-        attempts.append({"model": model, "reason": reason, "success": success})
+        attempts.append(
+            {"model": model, "reason": reason, "success": success, "wall_seconds": model_wall}
+        )
         if success:
             return True, model, aggregate, attempts
 

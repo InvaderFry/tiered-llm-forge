@@ -24,7 +24,7 @@ from .git_ops import (
     validate_tracked_clean,
 )
 from .state import load_state, save_state, append_run_summary, record_task
-from .task_runner import run_task
+from .task_runner import run_task, reset_run_time_breakdown
 from .integration import integration_gate
 from .parallel import find_parallel_groups, run_parallel_group
 from .summary import print_summary
@@ -233,6 +233,7 @@ def main():
         sys.exit(1)
 
     state = load_state()
+    reset_run_time_breakdown()
     results = {"passed": [], "failed": [], "skipped": [], "blocked": []}
 
     ordered_specs = [load_spec(sf) for sf in ordered]

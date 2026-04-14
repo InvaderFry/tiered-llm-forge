@@ -2,6 +2,7 @@
 
 from . import FORGE_LOGS_DIR
 from .log import get_logger
+from .task_runner import get_run_time_breakdown
 
 log = get_logger("summary")
 
@@ -86,6 +87,20 @@ def print_summary(results, default_branch, state=None):
             log.info("Failure classes:")
             for fc, n in sorted(fail_classes.items(), key=lambda x: -x[1]):
                 log.info("  %s: %d", fc, n)
+
+    breakdown = get_run_time_breakdown()
+    total_wall = sum(breakdown.values())
+    if total_wall > 0:
+        productive = breakdown.pop("productive", 0.0)
+        reverted = breakdown.pop("reverted_or_failed_tests", 0.0)
+        log.info("\nTime breakdown:")
+        log.info("  Productive (edit + tests passed): %.1fs", productive)
+        if reverted > 0:
+            log.info("  Edit produced but reverted/failed tests: %.1fs", reverted)
+        for reason, seconds in sorted(breakdown.items(), key=lambda x: -x[1]):
+            if seconds > 0:
+                log.info("  Wasted on %s: %.1fs", reason, seconds)
+        log.info("  Total aider wall time: %.1fs", total_wall)
 
     if blocked:
         log.info("\nBlocked tasks:")

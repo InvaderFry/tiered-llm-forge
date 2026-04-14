@@ -9,6 +9,27 @@ CONFIG_FILE = Path(__file__).parent.parent / "models.yaml"
 _config = None
 
 
+def normalize_model_entry(entry):
+    """Normalize a model entry to a dict with an ``id`` and optional metadata."""
+    if isinstance(entry, str):
+        return {"id": entry, "max_input_tokens": None}
+    if isinstance(entry, dict):
+        return {
+            "id": entry["id"],
+            "max_input_tokens": entry.get("max_input_tokens"),
+        }
+    raise ValueError(f"Invalid model entry: {entry!r}")
+
+
+def model_id(entry):
+    """Extract the model-id string from either a string or dict config entry."""
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        return entry.get("id", "")
+    return ""
+
+
 def load_config(path=None):
     """Load and cache the models.yaml configuration."""
     global _config
@@ -31,9 +52,15 @@ def get_config():
 
 
 def get_tier(name):
-    """Return a tier dict by name (e.g., 'primary', 'escalation')."""
+    """Return a tier dict by name with normalized model metadata."""
     cfg = get_config()
     for tier in cfg["tiers"]:
         if tier["name"] == name:
-            return tier
+            raw_models = tier.get("models", [])
+            normalized = [normalize_model_entry(m) for m in raw_models]
+            return {
+                **tier,
+                "models": [m["id"] for m in normalized],
+                "model_meta": {m["id"]: m for m in normalized},
+            }
     raise ValueError(f"Unknown tier: {name}")

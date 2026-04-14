@@ -2,6 +2,7 @@
 
 import re
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +33,28 @@ from .state import save_state, record_task, record_attempt, get_resume_point
 log = get_logger("task_runner")
 
 _URL_RE = re.compile(r"https?://\S+")
+_run_time_breakdown = {}
+_run_time_lock = threading.Lock()
+
+
+def reset_run_time_breakdown():
+    """Clear the per-run time breakdown accumulator."""
+    with _run_time_lock:
+        _run_time_breakdown.clear()
+
+
+def get_run_time_breakdown():
+    """Return a copy of the current run's time breakdown."""
+    with _run_time_lock:
+        return dict(_run_time_breakdown)
+
+
+def _record_time(bucket, seconds):
+    """Add aider wall time to a final breakdown bucket."""
+    if seconds <= 0:
+        return
+    with _run_time_lock:
+        _run_time_breakdown[bucket] = _run_time_breakdown.get(bucket, 0.0) + seconds
 
 
 def _strip_urls(text):
@@ -179,6 +202,7 @@ def _run_tier_attempts(
         ctx["task_stats"]["tokens_sent"] += stats.get("tokens_sent", 0)
         ctx["task_stats"]["tokens_received"] += stats.get("tokens_received", 0)
         ctx["task_stats"]["cost_usd"] += stats.get("cost_usd", 0.0)
+        ctx["task_stats"]["wall_seconds"] += stats.get("wall_seconds", 0.0)
 
     for attempt in range(start_attempt, tier["retries"] + 1):
         ctx["total_attempts"] += 1
@@ -191,6 +215,7 @@ def _run_tier_attempts(
             read_files=read_files, cwd=cwd,
         )
         _accumulate(stats)
+        pending_wall = 0.0
         for attempt_meta in model_attempts:
             attempted_model = attempt_meta.get("model")
             if attempted_model and attempted_model not in ctx["models_tried"]:
@@ -201,27 +226,37 @@ def _run_tier_attempts(
                 ctx["llm_fail_reasons"].append(reason)
             if attempt_meta.get("success"):
                 ctx["had_successful_model_attempt"] = True
+                pending_wall += attempt_meta.get("wall_seconds", 0.0)
+            else:
+                _record_time(reason or "unknown", attempt_meta.get("wall_seconds", 0.0))
 
         if not success and not model_used:
-            tier_models = get_tier(tier_name)["models"]
-            if all(is_request_too_large(m) for m in tier_models):
+            if model_attempts and all(
+                attempt_meta.get("reason") in {"request_too_large", "pre_screen_too_large"}
+                for attempt_meta in model_attempts
+            ):
                 if "request_too_large" not in ctx["llm_fail_reasons"]:
                     ctx["llm_fail_reasons"].append("request_too_large")
-            if all(is_invalid_model(m) for m in tier_models):
+            if model_attempts and all(
+                attempt_meta.get("reason") == "invalid_model_config"
+                for attempt_meta in model_attempts
+            ):
                 if "invalid_model_config" not in ctx["llm_fail_reasons"]:
                     ctx["llm_fail_reasons"].append("invalid_model_config")
 
         head_after = branch_tip("HEAD", cwd=cwd)
         head_moved = bool(head_after) and head_after != head_before
+        attempt_wall = sum(ma.get("wall_seconds", 0.0) for ma in model_attempts)
         if head_moved:
             changed_files = changed_files_between(head_before, head_after, cwd=cwd)
             forbidden = _forbidden_changed_files(changed_files, allowed_write_files)
             if forbidden:
+                _record_time("reverted_or_failed_tests", pending_wall)
                 if "forbidden_file_edit" not in ctx["llm_fail_reasons"]:
                     ctx["llm_fail_reasons"].append("forbidden_file_edit")
                 record_attempt(
                     state, task_name, attempt, tier_name, model_used, success,
-                    tests_passed=False, model_attempts=model_attempts,
+                    tests_passed=False, model_attempts=model_attempts, wall_seconds=attempt_wall,
                 )
                 save_state(state)
                 revert_last_commit(
@@ -234,10 +269,12 @@ def _run_tier_attempts(
                     ),
                 )
                 continue
-        if head_moved and check_regression(target_file, ctx["baseline_size"], cwd=cwd):
+        regression = head_moved and check_regression(target_file, ctx["baseline_size"], cwd=cwd)
+        if regression:
+            _record_time("reverted_or_failed_tests", pending_wall)
             record_attempt(
                 state, task_name, attempt, tier_name, model_used, success,
-                tests_passed=False, model_attempts=model_attempts,
+                tests_passed=False, model_attempts=model_attempts, wall_seconds=attempt_wall,
             )
             save_state(state)
             revert_last_commit(target_file, ctx["baseline_size"], cwd=cwd)
@@ -248,7 +285,7 @@ def _run_tier_attempts(
             log.info("  [no commit produced by aider -- nothing to revert]")
             record_attempt(
                 state, task_name, attempt, tier_name, model_used, success,
-                tests_passed=False, model_attempts=model_attempts,
+                tests_passed=False, model_attempts=model_attempts, wall_seconds=attempt_wall,
             )
             save_state(state)
             continue
@@ -258,11 +295,12 @@ def _run_tier_attempts(
 
         record_attempt(
             state, task_name, attempt, tier_name, model_used, success,
-            tests_passed=passed, model_attempts=model_attempts,
+            tests_passed=passed, model_attempts=model_attempts, wall_seconds=attempt_wall,
         )
         save_state(state)
 
         if passed:
+            _record_time("productive", pending_wall)
             log.info("PASSED (%s, attempt %d): %s", tier_name, attempt, task_name)
             if not worktree:
                 checkout(default_branch)
@@ -279,9 +317,12 @@ def _run_tier_attempts(
                 tokens_sent=ctx["task_stats"]["tokens_sent"],
                 tokens_received=ctx["task_stats"]["tokens_received"],
                 cost_usd=ctx["task_stats"]["cost_usd"],
+                wall_seconds=ctx["task_stats"]["wall_seconds"],
             )
             save_state(state)
             return "passed"
+
+        _record_time("reverted_or_failed_tests", pending_wall)
 
     return None  # tier exhausted without passing
 
@@ -508,7 +549,7 @@ def _run_task_body(
         "baseline_size": baseline_size,
         "total_attempts": resume_point["total_attempts"] if resume_point else 0,
         "models_tried": models_tried,
-        "task_stats": {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0},
+        "task_stats": {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 0.0},
         "llm_fail_reasons": [],
         "had_successful_model_attempt": False,
     }
@@ -640,6 +681,7 @@ def _run_task_body(
         tokens_sent=ctx["task_stats"]["tokens_sent"],
         tokens_received=ctx["task_stats"]["tokens_received"],
         cost_usd=ctx["task_stats"]["cost_usd"],
+        wall_seconds=ctx["task_stats"]["wall_seconds"],
     )
     save_state(state)
     return "failed"
