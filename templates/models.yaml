@@ -15,7 +15,7 @@ tiers:
       - id: groq/openai/gpt-oss-120b
         max_input_tokens: 16000
       - id: groq/llama-3.3-70b-versatile
-        max_input_tokens: 12000
+        max_input_tokens: 16000
     retries: 1
     aider_timeout_seconds: 300
 

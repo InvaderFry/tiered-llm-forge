@@ -128,6 +128,9 @@ repo root. Those transcript logs also include explicit start and end times.
 | Escalation | GPT-OSS 120B → Llama 3.3 70B | Primary exhausted |
 | Gemini | Gemini 2.5 Flash | Escalation exhausted and integration repair; requires `GOOGLE_API_KEY` |
 
+The default Groq entries use conservative 16K-token prescreen caps so normal
+configured context budgets can reach every stable Groq tier before Gemini.
+
 ---
 
 ## Repo structure

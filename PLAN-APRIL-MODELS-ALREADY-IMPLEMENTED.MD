@@ -1,6 +1,6 @@
 # April Model Implementation Plan
 
-Status: implementation plan only. This file defines what to change later. It does not change repo behavior by itself.
+Status: Phase 1 has been implemented. This file records the implemented default-routing decision and the remaining optional follow-up phases.
 
 ## Objective
 
@@ -43,7 +43,7 @@ Implication:
 
 ## Phase 1: Exact Scope
 
-Phase 1 is the immediate implementation target.
+Phase 1 is the implemented default-routing change.
 
 ### In Scope
 
@@ -114,29 +114,29 @@ Reason:
 
 ## Phase 1: Config Shape
 
-This is the target structure to implement after verifying exact model IDs:
+This is the implemented default structure:
 
 ```yaml
 tiers:
   - name: primary
     models:
-      - id: <verified Groq GPT-OSS 20B model id>
-        max_input_tokens: <validated prescreen cap>
+      - id: groq/openai/gpt-oss-20b
+        max_input_tokens: 16000
     retries: 3
     aider_timeout_seconds: 180
 
   - name: escalation
     models:
-      - id: <verified Groq GPT-OSS 120B model id>
-        max_input_tokens: <validated prescreen cap>
-      - id: <verified Groq Llama 3.3 70B model id>
-        max_input_tokens: <validated prescreen cap>
+      - id: groq/openai/gpt-oss-120b
+        max_input_tokens: 16000
+      - id: groq/llama-3.3-70b-versatile
+        max_input_tokens: 16000
     retries: 1
     aider_timeout_seconds: 300
 
   - name: gemini
     models:
-      - id: <verified Gemini 2.5 Flash model id>
+      - id: gemini/gemini-2.5-flash
     retries: 1
     aider_timeout_seconds: 600
 
@@ -160,8 +160,8 @@ In this repo, `max_input_tokens` is not treated as the provider context window. 
 
 ### Implementation Guidance
 
-- Start with cautious values only after checking current request sizes.
-- Validate the chosen caps against the current request estimator and context budget.
+- Default Groq prescreen caps are currently `16000`, which clears the configured context budget in tests.
+- Validate future cap changes against the current request estimator and context budget.
 - Expect to tune these values after dry-run and test feedback.
 
 ### Do Not Do This
@@ -257,7 +257,7 @@ Implementation rule:
 
 ## Acceptance Criteria For Phase 1
 
-Phase 1 is complete only when all of the following are true:
+Phase 1 is complete because all of the following are true:
 
 1. `templates/models.yaml` uses the new stable-first routing.
 2. Default config no longer references removed models such as `Kimi K2`.
@@ -337,9 +337,9 @@ Implementation rule:
 - do not rely on unverified provider model IDs
 - do not leave dead model references in docs or fixtures
 
-## Execution Order
+## Historical Execution Order
 
-Implement in this order:
+Phase 1 was implemented in this order:
 
 1. Verify exact provider model IDs to use.
 2. Update `templates/models.yaml`.

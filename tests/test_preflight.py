@@ -108,7 +108,7 @@ def test_template_model_configs_validate():
     assert errors == []
 
 
-def test_template_gpt_oss_caps_clear_default_context_budget(tmp_path):
+def test_template_groq_caps_clear_default_context_budget(tmp_path):
     repo_root = Path(__file__).resolve().parent.parent
     cfg = yaml.safe_load((repo_root / "templates" / "models.yaml").read_text())
     context_limits = cfg["context_limits"]
@@ -141,6 +141,7 @@ def test_template_gpt_oss_caps_clear_default_context_budget(tmp_path):
 
     assert caps["groq/openai/gpt-oss-20b"] > estimated_tokens
     assert caps["groq/openai/gpt-oss-120b"] > estimated_tokens
+    assert caps["groq/llama-3.3-70b-versatile"] > estimated_tokens
 
 
 def test_validate_config_warns_on_duplicate_model_across_tiers():

@@ -230,6 +230,8 @@ Models can also declare `max_input_tokens` in `models.yaml`. The router uses
 that only for conservative pre-screen skips; actual provider
 `request_too_large` rejections are tracked separately so the summary can
 distinguish real provider failures from fast skips.
+The default Groq entries use 16K-token prescreen caps so normal configured
+context budgets can reach every stable Groq tier before Gemini.
 
 The Gemini tier uses **daily quota** semantics: if the shared free-tier backup
 budget is exhausted for the day, the model is skipped immediately (no sleep).

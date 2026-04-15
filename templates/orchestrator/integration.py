@@ -68,7 +68,7 @@ def _attempt_gemini_integration_fix(test_output: str, passed_task_names: list) -
         f"Focus on {primary_target}. Do not modify test files."
     )
     log.info("  [integration] trying Gemini fix (target: %s)...", primary_target)
-    success, model_used, _ = run_with_tier_fallback(
+    success, model_used, _, _ = run_with_tier_fallback(
         "gemini", message, primary_target, read_files=read_files,
     )
     if not success:

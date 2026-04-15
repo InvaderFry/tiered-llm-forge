@@ -6,6 +6,16 @@
 
 ---
 
+## Implemented Repo Default
+
+This repo uses the stable-only Phase 1 default, not the preview-heavy maximum-capacity options below:
+
+`Claude plan -> GPT-OSS 20B primary -> GPT-OSS 120B / Llama 3.3 70B escalation -> Gemini 2.5 Flash overflow and integration repair`
+
+Gemini 3.1 Flash Lite, Qwen3 32B, Gemini 3 Flash, and Llama 4 Scout remain research/profile candidates only; they are not part of the generated default route.
+
+---
+
 ## What's Actually Available
 
 **Groq production text models (4):** GPT-OSS 120B, GPT-OSS 20B, Llama 3.3 70B, Llama 3.1 8B  
