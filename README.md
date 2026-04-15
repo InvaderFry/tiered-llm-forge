@@ -17,7 +17,7 @@ and copy of all the workflow files.
 
 - [Aider](https://aider.chat) installed and on your PATH
 - A [Groq API key](https://console.groq.com)
-- A [Google AI Studio / Gemini API key](https://aistudio.google.com) (free tier; used for the Gemini fix tier)
+- A [Google AI Studio / Gemini API key](https://aistudio.google.com) (free tier; used for Gemini overflow and integration repair)
 - Python 3.10+ with `python3-venv` (`sudo apt install python3-venv` on Debian/Ubuntu)
 
 ---
@@ -59,9 +59,10 @@ From here, follow the workflow in that project's `ORCHESTRATION.md`.
     > "Review the task branches and merge them."
 ```
 
-The pipeline (step 6) uses zero Claude tokens — it runs on Groq models and
-Gemini via Aider. Claude is only used for planning (step 3) and fixing failures
-that exhaust all automated tiers (step 7).
+The pipeline uses zero Claude tokens while it runs — it goes through stable
+Groq implementation tiers first and uses Gemini via Aider as shared overflow
+and integration-repair backup. Claude is only used for planning and for
+failures that exhaust every automated stage.
 
 ---
 
@@ -77,19 +78,20 @@ dependency order:
 2. Attaches the spec file, test file, and dependency target files to
    Aider as read-only context, but trims that context to a configurable
    file/size budget so large fan-in tasks do not blow past provider TPM caps.
-3. Tries primary tier models with automatic fallback (3 attempts).
-4. Escalates to the escalation tier if primary fails (2 attempts).
-5. If both tiers exhaust, tries the **Gemini tier** as a last automated attempt.
-   If Gemini's daily API quota is exhausted for all configured models, skips
-   gracefully.
+3. Tries the `primary` tier first: **GPT-OSS 20B** (3 attempts).
+4. Escalates to stable Groq fallback models in `escalation`:
+   **GPT-OSS 120B → Llama 3.3 70B** (1 tier attempt).
+5. If both Groq tiers exhaust, tries the **Gemini tier**:
+   **Gemini 2.5 Flash** as the shared overflow and integration-repair backup.
+   If Gemini's daily API quota is exhausted, skips gracefully.
 6. Writes `forgeLogs/FAILED-task-NNN-name-<timestamp>.log` tagged with a failure
    class (`dependency_cache_missing`, `invalid_model_config`,
    `request_too_large`, `gemini_quota_exhausted`, etc.) if all automated
    tiers fail. Failure and integration logs include `Start time:` at the top
    and `End time:` at the bottom.
-6. Records per-task attempts, attempted models, duration, and terminal/test
+7. Records per-task attempts, attempted models, duration, and terminal/test
    failure classes in `pipeline-state.json` for crash recovery and observability.
-7. Returns to the default branch, moves to next task.
+8. Returns to the default branch, moves to next task.
 
 After every task passes, an **integration gate** assembles
 `integration/run-<timestamp>` by merging each task branch in dependency
@@ -122,9 +124,9 @@ repo root. Those transcript logs also include explicit start and end times.
 
 | Tier | Models | Trigger |
 |------|--------|---------|
-| Primary | Qwen3 32B → Kimi K2 → Llama 4 Scout | Every task, first |
-| Escalation | GPT-OSS 120B | Primary exhausted |
-| Gemini | Gemini 2.5 Flash | Escalation exhausted; requires `GOOGLE_API_KEY` |
+| Primary | GPT-OSS 20B | Every task, first |
+| Escalation | GPT-OSS 120B → Llama 3.3 70B | Primary exhausted |
+| Gemini | Gemini 2.5 Flash | Escalation exhausted and integration repair; requires `GOOGLE_API_KEY` |
 
 ---
 

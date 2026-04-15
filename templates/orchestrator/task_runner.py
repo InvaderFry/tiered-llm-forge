@@ -592,7 +592,7 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
     worktree = cwd is not None
 
     # Request-too-large is a per-task property, not session-wide: a task with
-    # a tiny spec should not inherit "skip qwen3" from an earlier huge task.
+    # a tiny spec should not inherit a stale Groq skip from an earlier huge task.
     clear_request_too_large()
 
     def _elapsed():

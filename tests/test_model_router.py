@@ -34,14 +34,17 @@ def mock_config(tmp_path):
         tiers:
           - name: primary
             models:
-              - groq/qwen/qwen3-32b
-              - groq/moonshotai/kimi-k2-instruct
-              - groq/meta-llama/llama-4-scout-17b-16e-instruct
+              - groq/openai/gpt-oss-20b
             retries: 3
           - name: escalation
             models:
               - groq/openai/gpt-oss-120b
-            retries: 2
+              - groq/llama-3.3-70b-versatile
+            retries: 1
+          - name: gemini
+            models:
+              - gemini/gemini-2.5-flash
+            retries: 1
         weak_model: groq/llama-3.1-8b-instant
         spec_limits:
           soft_limit_chars: 12000
@@ -56,19 +59,19 @@ def mock_config(tmp_path):
 
 class TestGetFallbackModels:
     def test_returns_remaining_after_current(self):
-        fallbacks = get_fallback_models("groq/qwen/qwen3-32b", "primary")
-        assert fallbacks == [
-            "groq/moonshotai/kimi-k2-instruct",
-            "groq/meta-llama/llama-4-scout-17b-16e-instruct",
-        ]
+        fallbacks = get_fallback_models("groq/openai/gpt-oss-120b", "escalation")
+        assert fallbacks == ["groq/llama-3.3-70b-versatile"]
 
     def test_returns_all_if_model_not_in_tier(self):
-        fallbacks = get_fallback_models("unknown/model", "primary")
-        assert len(fallbacks) == 3
+        fallbacks = get_fallback_models("unknown/model", "escalation")
+        assert fallbacks == [
+            "groq/openai/gpt-oss-120b",
+            "groq/llama-3.3-70b-versatile",
+        ]
 
     def test_last_model_returns_empty(self):
         fallbacks = get_fallback_models(
-            "groq/meta-llama/llama-4-scout-17b-16e-instruct", "primary"
+            "groq/llama-3.3-70b-versatile", "escalation"
         )
         assert fallbacks == []
 
@@ -100,15 +103,15 @@ class TestRateLimitCoordinator:
         clear_request_too_large()
 
     def test_wait_sleeps_remaining_window(self):
-        _mark_rate_limited("groq/qwen3-32b", 12.0, buffer=5.0)  # earliest = 1017
-        _wait_for_model("groq/qwen3-32b")
+        _mark_rate_limited("groq/openai/gpt-oss-20b", 12.0, buffer=5.0)  # earliest = 1017
+        _wait_for_model("groq/openai/gpt-oss-20b")
         assert len(self._slept) == 1
         assert abs(self._slept[0] - 17.0) < 0.01
 
     def test_no_wait_when_window_passed(self):
-        _mark_rate_limited("groq/qwen3-32b", 12.0)
+        _mark_rate_limited("groq/openai/gpt-oss-20b", 12.0)
         self._fake_now[0] += 100          # clock advances past the window
-        _wait_for_model("groq/qwen3-32b")
+        _wait_for_model("groq/openai/gpt-oss-20b")
         assert self._slept == []
 
     def test_unknown_model_no_wait(self):
@@ -116,30 +119,30 @@ class TestRateLimitCoordinator:
         assert self._slept == []
 
     def test_models_tracked_independently(self):
-        _mark_rate_limited("groq/qwen3-32b", 12.0)
-        _wait_for_model("groq/kimi-k2-instruct")   # different model, no window
+        _mark_rate_limited("groq/openai/gpt-oss-20b", 12.0)
+        _wait_for_model("groq/openai/gpt-oss-120b")   # different model, no window
         assert self._slept == []
 
     def test_mark_updates_existing_entry(self):
-        _mark_rate_limited("groq/qwen3-32b", 5.0)
-        _mark_rate_limited("groq/qwen3-32b", 20.0)  # longer window overwrites
-        _wait_for_model("groq/qwen3-32b")
+        _mark_rate_limited("groq/openai/gpt-oss-20b", 5.0)
+        _mark_rate_limited("groq/openai/gpt-oss-20b", 20.0)  # longer window overwrites
+        _wait_for_model("groq/openai/gpt-oss-20b")
         assert len(self._slept) == 1
         assert abs(self._slept[0] - 25.0) < 0.01   # 20 + 5 buffer
 
     def test_zero_buffer(self):
-        _mark_rate_limited("groq/qwen3-32b", 10.0, buffer=0.0)
-        _wait_for_model("groq/qwen3-32b")
+        _mark_rate_limited("groq/openai/gpt-oss-20b", 10.0, buffer=0.0)
+        _wait_for_model("groq/openai/gpt-oss-20b")
         assert len(self._slept) == 1
         assert abs(self._slept[0] - 10.0) < 0.01
 
     def test_has_pending_rate_limits(self):
         assert has_pending_rate_limits() is False
-        _mark_rate_limited("groq/qwen3-32b", 10.0)
+        _mark_rate_limited("groq/openai/gpt-oss-20b", 10.0)
         assert has_pending_rate_limits() is True
 
     def test_adaptive_cooldown_uses_pending_window_but_respects_ceiling(self):
-        _mark_rate_limited("groq/qwen3-32b", 40.0, buffer=0.0)
+        _mark_rate_limited("groq/openai/gpt-oss-20b", 40.0, buffer=0.0)
         assert adaptive_cooldown_seconds(30) == 30
 
     def test_adaptive_cooldown_uses_recent_pressure_when_window_has_passed(self):
@@ -151,8 +154,8 @@ class TestRateLimitCoordinator:
 class TestRequestTooLargePerTask:
     """The request-too-large flag must be per-task, not session-wide.
 
-    A huge spec that blows past qwen3's TPM cap should not cause the next
-    (possibly tiny) task to skip qwen3. Clearing is the caller's job and
+    A huge spec that blows past GPT-OSS 20B's prescreen cap should not cause
+    the next (possibly tiny) task to skip GPT-OSS 20B. Clearing is the caller's job and
     happens at the top of run_task.
     """
 
@@ -160,23 +163,23 @@ class TestRequestTooLargePerTask:
         clear_request_too_large()
 
     def test_mark_and_query(self):
-        assert is_request_too_large("groq/qwen/qwen3-32b") is False
-        _mark_request_too_large("groq/qwen/qwen3-32b")
-        assert is_request_too_large("groq/qwen/qwen3-32b") is True
+        assert is_request_too_large("groq/openai/gpt-oss-20b") is False
+        _mark_request_too_large("groq/openai/gpt-oss-20b")
+        assert is_request_too_large("groq/openai/gpt-oss-20b") is True
 
     def test_clear_resets_flag(self):
-        _mark_request_too_large("groq/qwen/qwen3-32b")
+        _mark_request_too_large("groq/openai/gpt-oss-20b")
         clear_request_too_large()
-        assert is_request_too_large("groq/qwen/qwen3-32b") is False
+        assert is_request_too_large("groq/openai/gpt-oss-20b") is False
 
     def test_per_thread_isolation(self):
         import threading
-        _mark_request_too_large("groq/qwen/qwen3-32b")
+        _mark_request_too_large("groq/openai/gpt-oss-20b")
 
         other_thread_saw = []
 
         def in_other_thread():
-            other_thread_saw.append(is_request_too_large("groq/qwen/qwen3-32b"))
+            other_thread_saw.append(is_request_too_large("groq/openai/gpt-oss-20b"))
 
         t = threading.Thread(target=in_other_thread)
         t.start()
@@ -185,7 +188,7 @@ class TestRequestTooLargePerTask:
         # Other thread has its own set -- should not see main thread's flag
         assert other_thread_saw == [False]
         # Main thread still sees its own flag
-        assert is_request_too_large("groq/qwen/qwen3-32b") is True
+        assert is_request_too_large("groq/openai/gpt-oss-20b") is True
 
 
 class TestInvalidModelTracking:

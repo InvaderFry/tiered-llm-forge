@@ -8,7 +8,11 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "templates"))
 
-from orchestrator.state import load_state, save_state, record_task
+from orchestrator.state import (
+    load_state,
+    save_state,
+    record_task,
+)
 
 
 class TestState:
@@ -21,13 +25,13 @@ class TestState:
     def test_save_and_load(self, tmp_path):
         path = tmp_path / "state.json"
         state = load_state(path)
-        record_task(state, "task-001-foo", "passed", model="groq/qwen3", attempts=2)
+        record_task(state, "task-001-foo", "passed", model="groq/openai/gpt-oss-20b", attempts=2)
         save_state(state, path)
 
         loaded = load_state(path)
         assert "task-001-foo" in loaded["tasks"]
         assert loaded["tasks"]["task-001-foo"]["status"] == "passed"
-        assert loaded["tasks"]["task-001-foo"]["model"] == "groq/qwen3"
+        assert loaded["tasks"]["task-001-foo"]["model"] == "groq/openai/gpt-oss-20b"
         assert loaded["tasks"]["task-001-foo"]["attempts"] == 2
 
     def test_record_multiple_tasks(self, tmp_path):
@@ -67,14 +71,14 @@ class TestState:
             state,
             "task-001",
             "failed",
-            model="groq/qwen/qwen3-32b",
+            model="groq/openai/gpt-oss-20b",
             attempts=3,
-            models_tried=["groq/qwen/qwen3-32b"],
+            models_tried=["groq/openai/gpt-oss-20b"],
         )
         record_task(state, "task-001", "skipped", duration_seconds=0.2)
 
         assert state["tasks"]["task-001"]["status"] == "skipped"
-        assert state["tasks"]["task-001"]["model"] == "groq/qwen/qwen3-32b"
+        assert state["tasks"]["task-001"]["model"] == "groq/openai/gpt-oss-20b"
         assert state["tasks"]["task-001"]["attempts"] == 3
 
     def test_skip_can_store_verification_status(self, tmp_path):

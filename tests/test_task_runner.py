@@ -359,7 +359,6 @@ class TestRunTierAttempts:
         attempt = state["tasks"]["task-001"]["attempts_log"][0]
         assert attempt["forbidden_edit_subtype"] == "generic"
 
-
 class TestRestoreRetryContext:
     def test_restores_dependency_forbidden_edit_history(self, tmp_path):
         state = load_state(tmp_path / "state.json")
@@ -426,7 +425,6 @@ class TestRunTaskVerificationStatus:
 
         assert outcome == "skipped"
         assert state["tasks"]["task-001-example"]["verification_status"] == "recovered_after_prior_failure"
-
 
 class TestRunTaskFailureRouting:
     def test_early_stop_records_forbidden_file_edit_as_failure_class(self, monkeypatch, tmp_path):

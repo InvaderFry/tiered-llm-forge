@@ -2,7 +2,11 @@
 
 This project uses an automated pipeline (`python3 -m orchestrator`) that feeds
 spec files through escalating model tiers:
-**Qwen3 32B → Kimi K2 → Llama 4 Scout → GPT-OSS 120B → Gemini 2.5 Flash**
+**GPT-OSS 20B → GPT-OSS 120B → Llama 3.3 70B → Gemini 2.5 Flash**
+
+Default routing is stable-first. Claude remains the planner and reviewer, and
+Gemini is reserved for overflow and integration-repair backup after the Groq
+tiers are exhausted.
 
 Your job during planning is to produce **files on disk** that the pipeline can
 execute without further human input.
@@ -49,8 +53,8 @@ dependencies: []
 - Use dataclasses, not Pydantic
 
 ## Context
-Brief explanation of why this task exists. This section gets stripped by the
-orchestrator to save tokens — keep important details in other sections.
+Brief explanation of why this task exists. Keep important context concise but
+explicit so the implementer has the right architectural background.
 
 ```
 

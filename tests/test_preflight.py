@@ -5,12 +5,15 @@ import sys
 import textwrap
 import threading
 import time
+from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "templates"))
 
 from orchestrator import config as config_mod
+from orchestrator.model_router import _estimate_request_tokens
 import orchestrator.preflight as preflight
 from orchestrator.preflight import (
     maybe_prime_maven_cache,
@@ -29,8 +32,13 @@ def loaded_config(tmp_path):
         tiers:
           - name: primary
             models:
-              - groq/qwen/qwen3-32b
+              - groq/openai/gpt-oss-20b
             retries: 3
+          - name: escalation
+            models:
+              - groq/openai/gpt-oss-120b
+              - groq/llama-3.3-70b-versatile
+            retries: 1
           - name: gemini
             models:
               - gemini/gemini-2.5-flash
@@ -75,16 +83,78 @@ def test_validate_provider_env_reports_missing_keys(monkeypatch, loaded_config):
     assert any("GOOGLE_API_KEY" in err for err in errors)
 
 
-def test_validate_config_rejects_known_bad_model_id():
+@pytest.mark.parametrize(
+    "tier_name,model_id",
+    [
+        ("primary", "groq/moonshotai/kimi-k2-instruct"),
+        ("gemini", "gemini/gemini-3.0-flash"),
+        ("gemini", "gemini/gemini-3-flash-preview"),
+        ("gemini", "gemini/gemini-2.5-pro"),
+        ("gemini", "gemini/gemini-3.1-pro"),
+    ],
+)
+def test_validate_config_rejects_known_bad_model_id(tier_name, model_id):
+    cfg = {"tiers": [{"name": tier_name, "models": [model_id], "retries": 1}]}
+
+    errors, warnings = validate_config(cfg)
+
+    assert any(model_id in err for err in errors)
+
+
+def test_template_model_configs_validate():
+    repo_root = Path(__file__).resolve().parent.parent
+    cfg = yaml.safe_load((repo_root / "templates" / "models.yaml").read_text())
+    errors, warnings = validate_config(cfg)
+    assert errors == []
+
+
+def test_template_gpt_oss_caps_clear_default_context_budget(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    cfg = yaml.safe_load((repo_root / "templates" / "models.yaml").read_text())
+    context_limits = cfg["context_limits"]
+    max_total_bytes = int(context_limits["max_total_bytes"])
+
+    spec_file = tmp_path / "task.md"
+    spec_file.write_text("s" * 16_000)
+    test_file = tmp_path / "test_task.py"
+    test_file.write_text("t" * (max_total_bytes - 16_000))
+    target_file = tmp_path / "target.py"
+    target_file.write_text("x" * 4_096)
+
+    message = (
+        f"Implement the task described in {spec_file.name}. "
+        f"All requirements (function signatures, types, constraints) live in "
+        f"that file. Edit {target_file.name} so that the tests in {test_file.name} pass. "
+        f"Do not modify the test file."
+    )
+    estimated_tokens = _estimate_request_tokens(
+        str(target_file),
+        message,
+        read_files=[str(spec_file), str(test_file)],
+    )
+
+    caps = {}
+    for tier in cfg["tiers"]:
+        for model in tier["models"]:
+            if isinstance(model, dict):
+                caps[model["id"]] = model.get("max_input_tokens")
+
+    assert caps["groq/openai/gpt-oss-20b"] > estimated_tokens
+    assert caps["groq/openai/gpt-oss-120b"] > estimated_tokens
+
+
+def test_validate_config_warns_on_duplicate_model_across_tiers():
     cfg = {
         "tiers": [
-            {"name": "gemini", "models": ["gemini/gemini-3.0-flash"], "retries": 1},
+            {"name": "escalation", "models": ["groq/openai/gpt-oss-120b"], "retries": 1},
+            {"name": "gemini", "models": ["groq/openai/gpt-oss-120b"], "retries": 1},
         ]
     }
 
     errors, warnings = validate_config(cfg)
 
-    assert any("gemini/gemini-3.0-flash" in err for err in errors)
+    assert errors == []
+    assert any("groq/openai/gpt-oss-120b" in warning for warning in warnings)
 
 
 def test_validate_runtime_prereqs_reports_missing_aider(monkeypatch, tmp_path):

@@ -12,9 +12,25 @@ from .log import get_logger
 log = get_logger("preflight")
 
 _KNOWN_BAD_MODEL_IDS = {
+    # Removed from Groq's production roster; fail fast instead of waiting for runtime 404s.
+    "groq/moonshotai/kimi-k2-instruct": (
+        "Retired Groq model id. Replace it with a supported stable model before running the pipeline."
+    ),
     # Placeholder kept in older templates; observed to return provider 404s.
     "gemini/gemini-3.0-flash": (
         "Invalid placeholder model id. Replace it with a supported Gemini model "
+        "before running the pipeline."
+    ),
+    "gemini/gemini-3-flash-preview": (
+        "Preview placeholder from an older default route. Replace it with a supported Gemini model "
+        "before running the pipeline."
+    ),
+    "gemini/gemini-2.5-pro": (
+        "Unavailable Gemini Pro model id for this project. Replace it with a supported Gemini model "
+        "before running the pipeline."
+    ),
+    "gemini/gemini-3.1-pro": (
+        "Unavailable Gemini Pro model id for this project. Replace it with a supported Gemini model "
         "before running the pipeline."
     ),
 }

@@ -26,9 +26,9 @@ _AIDER_TIMEOUT_DEFAULT = 300
 # subsequent retries within the same task) check this before each aider
 # invocation and sleep the remaining window instead of wasting the call.
 #
-# Keyed by full model name ("groq/qwen/qwen3-32b") — Groq rate limits are
-# per-model, not per-account, so hitting qwen3's window tells us nothing
-# about kimi's. Foreign providers (gemini/*, etc.) slot in automatically.
+# Keyed by full model name ("groq/openai/gpt-oss-20b") — Groq rate limits are
+# per-model, not per-account, so hitting one model's window tells us nothing
+# about another's. Foreign providers (gemini/*, etc.) slot in automatically.
 #
 # The dict is process-local and not persisted — rate-limit windows are
 # seconds, shorter than typical between-run gaps.
@@ -45,10 +45,11 @@ _daily_quota_exhausted: set = set()
 _invalid_models: set = set()
 _last_provider_pressure_at = 0.0
 # Request-too-large is per-task and per-thread, not session-wide. A long spec
-# that blows past qwen3's 6k TPM cap must not cause the NEXT task's tiny spec
-# to also skip qwen3. We store the flag on a threading.local so worktree-mode
-# parallel tasks don't poison each other either. Access still goes through
-# _rate_limit_lock for consistency with the other coordinator state.
+# that blows past one task's Groq prescreen cap must not cause the NEXT task's
+# tiny spec to also skip that model. We store the flag on a threading.local so
+# worktree-mode parallel tasks don't poison each other either. Access still
+# goes through _rate_limit_lock for consistency with the other coordinator
+# state.
 _request_too_large_tls = threading.local()
 _rate_limit_lock = threading.Lock()
 

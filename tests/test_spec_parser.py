@@ -28,11 +28,16 @@ def mock_config(monkeypatch, tmp_path):
     config_yaml.write_text(textwrap.dedent("""\
         tiers:
           - name: primary
-            models: ["groq/qwen/qwen3-32b"]
+            models: ["groq/openai/gpt-oss-20b"]
             retries: 3
           - name: escalation
-            models: ["groq/openai/gpt-oss-120b"]
-            retries: 2
+            models:
+              - "groq/openai/gpt-oss-120b"
+              - "groq/llama-3.3-70b-versatile"
+            retries: 1
+          - name: gemini
+            models: ["gemini/gemini-2.5-flash"]
+            retries: 1
         weak_model: groq/llama-3.1-8b-instant
         spec_limits:
           soft_limit_chars: 100

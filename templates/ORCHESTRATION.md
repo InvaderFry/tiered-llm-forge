@@ -1,7 +1,7 @@
 # {{PROJECT_NAME}}
 
 Tiered LLM coding workflow project.
-Claude plans and reviews. Free Groq models implement.
+Claude plans and reviews. Stable Groq models implement by default.
 
 ---
 
@@ -152,16 +152,19 @@ The orchestrator processes each spec in dependency order:
    as read-only context for Aider, but trims that context to a
    configurable file/size budget so large fan-in tasks do not overflow
    provider TPM caps.
-3. Tries all primary tier models with fallback (3 attempts).
-4. Escalates to the escalation tier if primary fails (2 attempts).
-5. If both tiers exhaust, tries the **Gemini tier** (1 attempt per model).
+3. Tries the `primary` tier first: **GPT-OSS 20B** (3 attempts).
+4. Escalates to stable Groq fallback models in `escalation`:
+   **GPT-OSS 120B → Llama 3.3 70B** (1 tier attempt).
+5. If both Groq tiers exhaust, tries the **Gemini tier**:
+   **Gemini 2.5 Flash** as shared overflow and integration-repair backup.
    Skips gracefully when the daily API quota is exhausted.
 6. Writes `forgeLogs/FAILED-task-NNN-name-<timestamp>.log` (tagged with a
    failure class) if all automated tiers fail. Failure and integration logs
    include `Start time:` at the top and `End time:` at the bottom.
-6. Records per-task attempts, attempted models, base SHA, both terminal
-   and test failure classes, and verification status in `pipeline-state.json`.
-7. Returns to default branch, moves to next task.
+7. Records per-task attempts, attempted models, base SHA, both terminal and
+   test failure classes, and verification status in
+   `pipeline-state.json`.
+8. Returns to default branch, moves to next task.
 
 After every task passes, the orchestrator runs an **integration gate**
 (see Phase 7 below).
@@ -219,19 +222,19 @@ Models are configured in `models.yaml`. Default tiers, tried in order:
 
 | Tier | Models | Trigger | API key |
 |------|--------|---------|---------|
-| Primary | Kimi K2 | Every task, 3 attempts | `GROQ_API_KEY` |
-| Escalation | Llama 4 Scout | Primary exhausted, 2 attempts | `GROQ_API_KEY` |
-| Gemini | Gemini 3 Flash → Gemini 2.5 Flash | Escalation exhausted, 1 attempt each | `GOOGLE_API_KEY` |
+| Primary | GPT-OSS 20B | Every task, 3 attempts | `GROQ_API_KEY` |
+| Escalation | GPT-OSS 120B → Llama 3.3 70B | Primary exhausted, 1 tier attempt | `GROQ_API_KEY` |
+| Gemini | Gemini 2.5 Flash | Escalation exhausted and integration repair | `GOOGLE_API_KEY` |
 
 Models can also declare `max_input_tokens` in `models.yaml`. The router uses
 that only for conservative pre-screen skips; actual provider
 `request_too_large` rejections are tracked separately so the summary can
 distinguish real provider failures from fast skips.
 
-The Gemini tier uses **daily quota** semantics: if a model's free-tier quota is
-exhausted for the day, it is skipped immediately (no sleep) and the next model
-is tried. When both Gemini models are exhausted, the task is flagged for Claude
-review and a note is printed at the end of the run.
+The Gemini tier uses **daily quota** semantics: if the shared free-tier backup
+budget is exhausted for the day, the model is skipped immediately (no sleep).
+When Gemini is exhausted, the task is flagged for Claude review and a note is
+printed at the end of the run.
 
 ---
 
@@ -239,7 +242,7 @@ review and a note is printed at the end of the run.
 
 The pipeline automatically tries every automated tier (primary → escalation →
 Gemini) before flagging a task for human review. If you see failures, they have
-already exhausted all automated options.
+already exhausted the stable Groq path and the shared Gemini backup.
 
 ```bash
 ls forgeLogs/FAILED-*.log    # check for failures
