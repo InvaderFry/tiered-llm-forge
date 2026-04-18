@@ -51,6 +51,11 @@ def get_config():
     return _config
 
 
+def get_auto_parallel():
+    """Return whether auto-parallel mode is enabled in the loaded config."""
+    return bool(get_config().get("auto_parallel", False))
+
+
 def get_tier(name):
     """Return a tier dict by name with normalized model metadata."""
     cfg = get_config()

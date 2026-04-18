@@ -124,3 +124,103 @@ def test_should_cooldown_skips_when_no_provider_pressure(monkeypatch):
     monkeypatch.setattr(cli, "adaptive_cooldown_seconds", lambda cooldown: 0.0)
     assert _cooldown_duration(30) == 0.0
     assert _should_cooldown(["passed"], 30) is False
+
+
+def _basic_main_spec(tmp_path, task_name="task-001-example"):
+    spec_path = tmp_path / "specs" / f"{task_name}.md"
+    spec_path.parent.mkdir(exist_ok=True)
+    spec_path.write_text("---\n", encoding="utf-8")
+    return {
+        "task_name": task_name,
+        "path": Path(f"specs/{task_name}.md"),
+        "target": "src/example.py",
+        "test": "tests/test_001_example.py",
+        "dependencies": [],
+        "raw_text": "---\n",
+    }
+
+
+def _patch_main_basics(monkeypatch, tmp_path, groups):
+    monkeypatch.setattr(cli, "setup_logging", lambda verbose=False: None)
+    monkeypatch.setattr(cli, "load_config", lambda path=None: {})
+    monkeypatch.setattr(cli, "ensure_default_branch_exists", lambda: None)
+    monkeypatch.setattr(cli, "get_default_branch", lambda: "main")
+    monkeypatch.setattr(cli, "SPECS_DIR", tmp_path / "specs")
+    monkeypatch.setattr(cli, "topological_sort", lambda files: list(files))
+    monkeypatch.setattr(cli, "get_config", lambda: {"cooldown_seconds": 30})
+    monkeypatch.setattr(cli, "get_auto_parallel", lambda: False)
+    monkeypatch.setattr(cli, "run_startup_preflight", lambda repo_root=None: ([], []))
+    monkeypatch.setattr(cli, "validate_tracked_clean", lambda paths: [])
+    monkeypatch.setattr(cli, "load_state", lambda: {})
+    monkeypatch.setattr(cli, "save_state", lambda state: None)
+    monkeypatch.setattr(cli, "append_run_summary", lambda state, results: None)
+    monkeypatch.setattr(cli, "print_summary", lambda results, default_branch, state: None)
+    monkeypatch.setattr(cli, "integration_gate", lambda all_task_names, default_branch, state: None)
+    monkeypatch.setattr(cli, "reset_run_time_breakdown", lambda: None)
+    monkeypatch.setattr(cli, "find_parallel_groups", lambda ordered_specs: groups)
+
+
+def test_main_runs_tasks_after_tracked_clean_preflight(monkeypatch, tmp_path):
+    spec = _basic_main_spec(tmp_path)
+    _patch_main_basics(monkeypatch, tmp_path, [[spec]])
+    monkeypatch.setattr(sys, "argv", ["orchestrator"])
+    monkeypatch.setattr(cli, "load_spec", lambda _: spec)
+
+    call_order = []
+    monkeypatch.setattr(cli, "validate_tracked_clean", lambda paths: call_order.append("tracked") or [])
+    monkeypatch.setattr(
+        cli,
+        "run_task",
+        lambda *args, **kwargs: call_order.append("run") or "passed",
+    )
+
+    cli.main()
+
+    assert call_order == ["tracked", "run"]
+
+
+def test_main_auto_parallel_switches_to_wave_mode(monkeypatch, tmp_path, caplog):
+    spec_a = _basic_main_spec(tmp_path, "task-001-example")
+    spec_b = _basic_main_spec(tmp_path, "task-002-example")
+    groups = [[spec_a, spec_b]]
+    _patch_main_basics(monkeypatch, tmp_path, groups)
+    monkeypatch.setattr(sys, "argv", ["orchestrator", "--auto-parallel"])
+    specs_iter = iter([spec_a, spec_b])
+    monkeypatch.setattr(cli, "load_spec", lambda _: next(specs_iter))
+    monkeypatch.setattr(
+        cli,
+        "run_parallel_group",
+        lambda *args, **kwargs: {
+            "task-001-example": "passed",
+            "task-002-example": "passed",
+        },
+    )
+    monkeypatch.setattr(cli, "run_task", lambda *args, **kwargs: pytest.fail("sequential path should not run"))
+
+    with caplog.at_level("INFO"):
+        cli.main()
+
+    assert "Auto-parallel: switching to parallel mode" in caplog.text
+
+
+def test_main_no_auto_parallel_flag_overrides_config(monkeypatch, tmp_path):
+    spec_a = _basic_main_spec(tmp_path, "task-001-example")
+    spec_b = _basic_main_spec(tmp_path, "task-002-example")
+    groups = [[spec_a, spec_b]]
+    _patch_main_basics(monkeypatch, tmp_path, groups)
+    monkeypatch.setattr(sys, "argv", ["orchestrator", "--no-auto-parallel"])
+    monkeypatch.setattr(cli, "get_auto_parallel", lambda: True)
+    specs_iter = iter([spec_a, spec_b])
+    monkeypatch.setattr(cli, "load_spec", lambda _: next(specs_iter))
+    monkeypatch.setattr(cli, "run_parallel_group", lambda *args, **kwargs: pytest.fail("parallel path should not run"))
+
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_task",
+        lambda spec, *args, **kwargs: calls.append(spec["task_name"]) or "passed",
+    )
+
+    cli.main()
+
+    assert calls == ["task-001-example", "task-002-example"]

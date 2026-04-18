@@ -142,8 +142,14 @@ Quick version:
    full output. If you see `gemini_quota_exhausted`, the Gemini tier
    was already attempted but had no daily quota remaining; this is not
    a code bug — the implementation just needs a human fix.
-2. `git checkout task/task-NNN-name` (the branch is already stacked
-   on its dependencies, so upstream code is present).
+2. Confirm the task branch before editing anything:
+
+   ```bash
+   git checkout task/task-NNN-name
+   git branch --show-current
+   ```
+
+   **Never edit files before confirming the branch name matches the task.**
 3. Diagnose: bad spec or bad implementation?
 4. Fix, run `pytest tests/test_NNN_name.py -v`, commit.
 5. Stay on branch — orchestrator detects passing branches on re-run.
@@ -190,6 +196,7 @@ integration safety + code quality, then MERGE / FIX THEN MERGE / FLAG.
 | `make run` | Run the full pipeline |
 | `make resume` | Resume failed tasks from last attempt instead of flagging for review |
 | `make parallel` | Run independent tasks concurrently in dependency waves (default 4 workers) |
+| `make auto-parallel` | Auto-enable wave mode only when the dependency graph has parallel work |
 | `make status` | Show branches, failures, and pipeline state |
 
 ### CLI flags (can also be passed directly)
@@ -198,6 +205,8 @@ integration safety + code quality, then MERGE / FIX THEN MERGE / FLAG.
 |------|--------|
 | `--resume` | Resume from the exact attempt that crashed/failed |
 | `--parallel [N]` | Run tasks concurrently in dependency waves using git worktrees (N = max workers, default 4) |
+| `--auto-parallel` | Auto-switch to parallel waves when the graph has a wave wider than one task |
+| `--no-auto-parallel` | Force sequential mode even if `models.yaml` sets `auto_parallel: true` |
 | `--verbose` | Enable debug-level output with timestamps |
 
 All runs write debug-level output to `forgeLogs/orchestrator-<timestamp>.log` for post-mortem analysis. Each run gets its own timestamped file so reruns never overwrite previous logs.

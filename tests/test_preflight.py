@@ -20,6 +20,7 @@ from orchestrator.preflight import (
     normalize_provider_env,
     run_startup_preflight,
     validate_config,
+    validate_pytest_collection,
     validate_provider_env,
     validate_runtime_prereqs,
 )
@@ -142,6 +143,7 @@ def test_template_groq_caps_clear_default_context_budget(tmp_path):
     assert caps["groq/openai/gpt-oss-20b"] > estimated_tokens
     assert caps["groq/openai/gpt-oss-120b"] > estimated_tokens
     assert caps["groq/llama-3.3-70b-versatile"] > estimated_tokens
+    assert caps["gemini/gemini-2.5-flash"] > estimated_tokens
 
 
 def test_validate_config_warns_on_duplicate_model_across_tiers():
@@ -164,6 +166,56 @@ def test_validate_runtime_prereqs_reports_missing_aider(monkeypatch, tmp_path):
     errors, warnings = validate_runtime_prereqs(repo_root=tmp_path)
 
     assert any("aider" in err for err in errors)
+
+
+def test_validate_pytest_collection_skips_empty_input(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(
+        preflight.subprocess,
+        "run",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    errors, warnings = validate_pytest_collection([], repo_root=tmp_path)
+
+    assert errors == []
+    assert warnings == []
+    assert calls == []
+
+
+def test_validate_pytest_collection_reports_collection_errors(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        preflight.subprocess,
+        "run",
+        lambda *args, **kwargs: type(
+            "Result",
+            (),
+            {
+                "returncode": 2,
+                "stdout": "ERROR collecting tests/test_005_weather.py\n",
+                "stderr": "",
+            },
+        )(),
+    )
+
+    errors, warnings = validate_pytest_collection(["tests/test_005_weather.py"], repo_root=tmp_path)
+
+    assert warnings == []
+    assert len(errors) == 1
+    assert "tests/test_005_weather.py" in errors[0]
+
+
+def test_validate_pytest_collection_turns_timeout_into_warning(monkeypatch, tmp_path):
+    def fake_run(*args, **kwargs):
+        raise preflight.subprocess.TimeoutExpired(cmd=args[0], timeout=30)
+
+    monkeypatch.setattr(preflight.subprocess, "run", fake_run)
+
+    errors, warnings = validate_pytest_collection(["tests/test_001_example.py"], repo_root=tmp_path)
+
+    assert errors == []
+    assert len(warnings) == 1
+    assert "timed out" in warnings[0]
 
 
 def test_validate_runtime_prereqs_warms_maven_when_pom_exists(monkeypatch, tmp_path):

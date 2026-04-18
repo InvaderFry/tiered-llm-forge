@@ -3,6 +3,8 @@
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "templates"))
 
 import orchestrator.task_runner as task_runner
@@ -233,6 +235,188 @@ FAILED tests/test_two.py::test_b - assert 3 == 4
 
 
 class TestRunTierAttempts:
+    def test_stops_early_when_no_remaining_tier_can_accept_request(self, monkeypatch, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        ctx = {
+            "baseline_size": 10,
+            "total_attempts": 0,
+            "models_tried": [],
+            "task_stats": {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 0.0},
+            "llm_fail_reasons": [],
+            "had_successful_model_attempt": False,
+            "last_forbidden_edit": None,
+            "dependency_forbidden_edit_count": 0,
+            "failure_note": None,
+            "stopped_early": False,
+            "terminal_failure_override": None,
+        }
+
+        monkeypatch.setattr(task_runner, "get_tier", lambda _: {"retries": 1})
+        monkeypatch.setattr(
+            task_runner,
+            "run_with_tier_fallback",
+            lambda *args, **kwargs: (
+                False,
+                None,
+                {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 0.0},
+                [
+                    {"model": "m1", "reason": "pre_screen_too_large", "success": False, "wall_seconds": 0.0},
+                    {"model": "m2", "reason": "request_too_large", "success": False, "wall_seconds": 0.0},
+                ],
+            ),
+        )
+        heads = iter(["head-0", "head-0"])
+        monkeypatch.setattr(task_runner, "branch_tip", lambda *args, **kwargs: next(heads))
+        monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "_remaining_tiers_can_accept_request", lambda *args, **kwargs: False)
+
+        result = _run_tier_attempts(
+            "primary",
+            1,
+            lambda attempt: f"attempt {attempt}",
+            "src/app.py",
+            "tests/test_app.py",
+            [],
+            None,
+            "task-001",
+            state,
+            False,
+            "main",
+            "primary-model",
+            ctx,
+            lambda: 0.1,
+            "main",
+            "base-sha",
+            {"src/app.py"},
+            [],
+        )
+
+        assert result == "terminal_failure"
+        assert ctx["stopped_early"] is True
+        assert ctx["terminal_failure_override"] == "request_too_large"
+        assert "pre_screen_too_large" in ctx["llm_fail_reasons"]
+
+    def test_continues_when_later_tier_can_accept_request(self, monkeypatch, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        ctx = {
+            "baseline_size": 10,
+            "total_attempts": 0,
+            "models_tried": [],
+            "task_stats": {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 0.0},
+            "llm_fail_reasons": [],
+            "had_successful_model_attempt": False,
+            "last_forbidden_edit": None,
+            "dependency_forbidden_edit_count": 0,
+            "failure_note": None,
+            "stopped_early": False,
+            "terminal_failure_override": None,
+        }
+
+        monkeypatch.setattr(task_runner, "get_tier", lambda _: {"retries": 1})
+        monkeypatch.setattr(
+            task_runner,
+            "run_with_tier_fallback",
+            lambda *args, **kwargs: (
+                False,
+                None,
+                {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 0.0},
+                [{"model": "primary-model", "reason": "pre_screen_too_large", "success": False, "wall_seconds": 0.0}],
+            ),
+        )
+        heads = iter(["head-0", "head-0"])
+        monkeypatch.setattr(task_runner, "branch_tip", lambda *args, **kwargs: next(heads))
+        monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "_remaining_tiers_can_accept_request", lambda *args, **kwargs: True)
+
+        result = _run_tier_attempts(
+            "primary",
+            1,
+            lambda attempt: f"attempt {attempt}",
+            "src/app.py",
+            "tests/test_app.py",
+            [],
+            None,
+            "task-001",
+            state,
+            False,
+            "main",
+            "primary-model",
+            ctx,
+            lambda: 0.1,
+            "main",
+            "base-sha",
+            {"src/app.py"},
+            [],
+        )
+
+        assert result is None
+        assert ctx["terminal_failure_override"] is None
+        assert "pre_screen_too_large" in ctx["llm_fail_reasons"]
+
+    def test_collection_error_does_not_stop_remaining_retries(self, monkeypatch, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        ctx = {
+            "baseline_size": 10,
+            "total_attempts": 0,
+            "models_tried": [],
+            "task_stats": {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 0.0},
+            "llm_fail_reasons": [],
+            "had_successful_model_attempt": False,
+            "last_forbidden_edit": None,
+            "dependency_forbidden_edit_count": 0,
+            "failure_note": None,
+            "stopped_early": False,
+            "terminal_failure_override": None,
+        }
+
+        monkeypatch.setattr(task_runner, "get_tier", lambda _: {"retries": 2})
+        calls = []
+        monkeypatch.setattr(
+            task_runner,
+            "run_with_tier_fallback",
+            lambda *args, **kwargs: (
+                calls.append("attempt") or True,
+                "primary-model",
+                {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 1.0},
+                [{"model": "primary-model", "reason": "ok", "success": True, "wall_seconds": 1.0}],
+            ),
+        )
+        heads = iter(["head-0", "head-0", "head-0", "head-0"])
+        monkeypatch.setattr(task_runner, "branch_tip", lambda *args, **kwargs: next(heads))
+        monkeypatch.setattr(task_runner, "check_regression", lambda *args, **kwargs: False)
+        monkeypatch.setattr(task_runner, "file_size", lambda *args, **kwargs: 10)
+        monkeypatch.setattr(
+            task_runner,
+            "run_tests",
+            lambda *args, **kwargs: (False, "ERROR collecting tests/test_app.py\nImportError while importing test"),
+        )
+        monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
+
+        result = _run_tier_attempts(
+            "primary",
+            1,
+            lambda attempt: f"attempt {attempt}",
+            "src/app.py",
+            "tests/test_app.py",
+            [],
+            None,
+            "task-001",
+            state,
+            False,
+            "main",
+            "primary-model",
+            ctx,
+            lambda: 0.1,
+            "main",
+            "base-sha",
+            {"src/app.py"},
+            [],
+        )
+
+        assert result is None
+        assert calls == ["attempt", "attempt"]
+        assert ctx["terminal_failure_override"] is None
+
     def test_stops_after_two_dependency_owned_forbidden_edits(self, monkeypatch, tmp_path):
         state = load_state(tmp_path / "state.json")
         ctx = {
@@ -385,6 +569,46 @@ class TestRestoreRetryContext:
 
 
 class TestRunTaskVerificationStatus:
+    def test_branch_check_raises_before_attempts_when_checkout_lands_on_wrong_branch(self, monkeypatch, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        spec = {
+            "task_name": "task-001-example",
+            "target": "src/example.py",
+            "test": "tests/test_001_example.py",
+            "path": tmp_path / "specs" / "task-001-example.md",
+            "dependencies": [],
+        }
+
+        monkeypatch.setattr(task_runner, "branch_exists", lambda *args, **kwargs: True)
+        monkeypatch.setattr(task_runner, "checkout", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "current_branch", lambda *args, **kwargs: "master")
+
+        with pytest.raises(RuntimeError, match="expected 'task/task-001-example'"):
+            run_task(spec, "main", state)
+
+    def test_worktree_mode_skips_branch_check(self, monkeypatch, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        spec = {
+            "task_name": "task-001-example",
+            "target": "src/example.py",
+            "test": "tests/test_001_example.py",
+            "path": tmp_path / "specs" / "task-001-example.md",
+            "dependencies": [],
+        }
+
+        monkeypatch.setattr(task_runner, "run_tests", lambda *args, **kwargs: (True, ""))
+        monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
+
+        outcome = run_task(
+            spec,
+            "main",
+            state,
+            cwd=str(tmp_path),
+            branch_preexisted=True,
+        )
+
+        assert outcome == "skipped"
+
     def test_existing_passing_branch_records_already_passing_status(self, monkeypatch, tmp_path):
         state = load_state(tmp_path / "state.json")
         spec = {
@@ -397,6 +621,7 @@ class TestRunTaskVerificationStatus:
 
         monkeypatch.setattr(task_runner, "branch_exists", lambda *args, **kwargs: True)
         monkeypatch.setattr(task_runner, "checkout", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "current_branch", lambda *args, **kwargs: "task/task-001-example")
         monkeypatch.setattr(task_runner, "run_tests", lambda *args, **kwargs: (True, ""))
         monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
 
@@ -418,6 +643,7 @@ class TestRunTaskVerificationStatus:
 
         monkeypatch.setattr(task_runner, "branch_exists", lambda *args, **kwargs: True)
         monkeypatch.setattr(task_runner, "checkout", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "current_branch", lambda *args, **kwargs: "task/task-001-example")
         monkeypatch.setattr(task_runner, "run_tests", lambda *args, **kwargs: (True, ""))
         monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
 
@@ -441,6 +667,7 @@ class TestRunTaskFailureRouting:
         monkeypatch.setattr(task_runner, "resolve_dependency_base", lambda *args, **kwargs: ("main", []))
         monkeypatch.setattr(task_runner, "branch_tip", lambda *args, **kwargs: "sha-1")
         monkeypatch.setattr(task_runner, "checkout", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "current_branch", lambda *args, **kwargs: "task/task-001-example")
         monkeypatch.setattr(task_runner, "file_size", lambda *args, **kwargs: 10)
         monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
         monkeypatch.setattr(
@@ -505,6 +732,7 @@ class TestRunTaskFailureRouting:
 
         monkeypatch.setattr(task_runner, "branch_exists", lambda *args, **kwargs: True)
         monkeypatch.setattr(task_runner, "checkout", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "current_branch", lambda *args, **kwargs: "task/task-001-example")
         monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
         heads = iter(["base-sha", "head-before", "head-after"])
         monkeypatch.setattr(task_runner, "branch_tip", lambda *args, **kwargs: next(heads))
@@ -570,6 +798,7 @@ class TestRunTaskFailureRouting:
         monkeypatch.setattr(task_runner, "resolve_dependency_base", lambda *args, **kwargs: ("main", []))
         monkeypatch.setattr(task_runner, "branch_tip", lambda *args, **kwargs: "sha-1")
         monkeypatch.setattr(task_runner, "checkout", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "current_branch", lambda *args, **kwargs: "task/task-001-example")
         monkeypatch.setattr(task_runner, "file_size", lambda *args, **kwargs: 10)
         monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
         monkeypatch.setattr(

@@ -28,6 +28,7 @@ tiers:
   - name: gemini
     models:
       - id: gemini/gemini-2.5-flash
+        max_input_tokens: 16000
     retries: 1
     aider_timeout_seconds: 600
 
@@ -49,6 +50,10 @@ context_limits:
   max_read_files: 4
   max_dependency_files: 2
   max_total_bytes: 24000
+
+# Opt-in only: when true, a normal sequential run can automatically switch
+# to parallel wave execution if the dependency graph contains independent tasks.
+auto_parallel: false
 
 # Maximum generic cooldown to apply between tasks or waves.
 #

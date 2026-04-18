@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from . import SPECS_DIR
-from .config import load_config, get_config, get_tier
+from .config import load_config, get_auto_parallel, get_config, get_tier
 from .log import setup_logging, get_logger
 from .model_router import adaptive_cooldown_seconds
 from .preflight import run_startup_preflight
@@ -185,6 +185,54 @@ def _should_cooldown(outcomes, max_cooldown):
     return _cooldown_duration(max_cooldown) > 0
 
 
+def _run_parallel_schedule(groups, default_branch, state, run_task_fn, specs_by_name,
+                           resume, max_workers, cooldown, results, outcomes):
+    """Run dependency waves in parallel and update shared result trackers."""
+    log.info("Wave mode: %d wave(s) across %d tasks (max workers: %d)",
+             len(groups), len(specs_by_name), max_workers)
+    for wave_i, group in enumerate(groups, 1):
+        log.info("\n--- Wave %d: %d task(s) ---", wave_i, len(group))
+        runnable = []
+        for spec in group:
+            blocked_by = _blocked_dependencies(spec, outcomes)
+            if blocked_by:
+                task_name = spec["task_name"]
+                log.info(
+                    "  [blocked] %s -- dependency failure in %s",
+                    task_name, ", ".join(blocked_by),
+                )
+                record_task(
+                    state,
+                    task_name,
+                    "blocked",
+                    duration_seconds=0,
+                    failure_class="dependency_failed",
+                    blocked_by=blocked_by,
+                )
+                save_state(state)
+                results["blocked"].append(task_name)
+                outcomes[task_name] = "blocked"
+            else:
+                runnable.append(spec)
+
+        if runnable:
+            wave_results = run_parallel_group(
+                runnable, default_branch, state, run_task_fn,
+                specs_by_name=specs_by_name, resume=resume,
+                max_workers=max_workers,
+            )
+        else:
+            wave_results = {}
+        for task_name, outcome in wave_results.items():
+            results[outcome].append(task_name)
+            outcomes[task_name] = outcome
+
+        cooldown_wait = _cooldown_duration(cooldown)
+        if wave_i < len(groups) and cooldown_wait > 0 and _should_cooldown(wave_results.values(), cooldown):
+            log.info("  [cooldown: sleeping %.1fs between waves]", cooldown_wait)
+            time.sleep(cooldown_wait)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Tiered LLM orchestrator — run cheap models against spec files."
@@ -197,6 +245,20 @@ def main():
     parser.add_argument("--parallel", nargs="?", type=int, const=4, default=None,
                         metavar="N",
                         help="Run independent tasks concurrently in waves (N = max workers, default 4)")
+    auto_parallel_group = parser.add_mutually_exclusive_group()
+    auto_parallel_group.add_argument(
+        "--auto-parallel",
+        dest="auto_parallel",
+        action="store_true",
+        help="Automatically switch to wave mode when the dependency graph has independent tasks",
+    )
+    auto_parallel_group.add_argument(
+        "--no-auto-parallel",
+        dest="auto_parallel",
+        action="store_false",
+        help="Force sequential mode even if models.yaml enables auto_parallel",
+    )
+    parser.set_defaults(auto_parallel=None)
     parser.add_argument("--verbose", action="store_true", help="Enable debug-level output with timestamps")
     args = parser.parse_args()
 
@@ -231,16 +293,17 @@ def main():
 
     cfg = get_config()
     cooldown = cfg.get("cooldown_seconds", 30)
+    auto_parallel_enabled = (
+        args.auto_parallel
+        if args.auto_parallel is not None
+        else get_auto_parallel()
+    )
 
     preflight_errors, preflight_warnings = run_startup_preflight(repo_root=Path.cwd())
     _log_preflight_messages(preflight_errors, preflight_warnings)
     if preflight_errors:
         log.error("Cannot run the pipeline until preflight errors are fixed.")
         sys.exit(1)
-
-    state = load_state()
-    reset_run_time_breakdown()
-    results = {"passed": [], "failed": [], "skipped": [], "blocked": []}
 
     ordered_specs = [load_spec(sf) for sf in ordered]
     specs_by_name = {s["task_name"]: s for s in ordered_specs}
@@ -249,62 +312,46 @@ def main():
         _log_tracked_clean_errors("run", preflight_errors)
         sys.exit(1)
 
+    state = load_state()
+    reset_run_time_breakdown()
+    results = {"passed": [], "failed": [], "skipped": [], "blocked": []}
+
     outcomes = {}
 
-    if args.parallel is not None:
-        # Wave mode: group independent tasks and run each wave concurrently
-        max_workers = args.parallel
-        groups = find_parallel_groups(ordered_specs)
-        log.info("Wave mode: %d wave(s) across %d tasks (max workers: %d)",
-                 len(groups), len(ordered_specs), max_workers)
-        for wave_i, group in enumerate(groups, 1):
-            log.info("\n--- Wave %d: %d task(s) ---", wave_i, len(group))
-            runnable = []
-            for spec in group:
-                blocked_by = _blocked_dependencies(spec, outcomes)
-                if blocked_by:
-                    task_name = spec["task_name"]
-                    log.info(
-                        "  [blocked] %s -- dependency failure in %s",
-                        task_name, ", ".join(blocked_by),
-                    )
-                    record_task(
-                        state,
-                        task_name,
-                        "blocked",
-                        duration_seconds=0,
-                        failure_class="dependency_failed",
-                        blocked_by=blocked_by,
-                    )
-                    save_state(state)
-                    results["blocked"].append(task_name)
-                    outcomes[task_name] = "blocked"
-                else:
-                    runnable.append(spec)
+    seq_groups = find_parallel_groups(ordered_specs)
+    max_wave = max((len(g) for g in seq_groups), default=0)
+    explicit_parallel = args.parallel is not None
+    auto_parallel_active = (
+        not explicit_parallel
+        and auto_parallel_enabled
+        and max_wave > 1
+    )
 
-            if runnable:
-                wave_results = run_parallel_group(
-                    runnable, default_branch, state, run_task,
-                    specs_by_name=specs_by_name, resume=args.resume,
-                    max_workers=max_workers,
-                )
-            else:
-                wave_results = {}
-            for task_name, outcome in wave_results.items():
-                results[outcome].append(task_name)
-                outcomes[task_name] = outcome
-
-            # Cooldown between waves
-            cooldown_wait = _cooldown_duration(cooldown)
-            if wave_i < len(groups) and cooldown_wait > 0 and _should_cooldown(wave_results.values(), cooldown):
-                log.info("  [cooldown: sleeping %.1fs between waves]", cooldown_wait)
-                time.sleep(cooldown_wait)
+    if explicit_parallel or auto_parallel_active:
+        max_workers = args.parallel if explicit_parallel else 4
+        if auto_parallel_active:
+            log.info(
+                "Auto-parallel: switching to parallel mode -- wave of %d independent tasks detected.",
+                max_wave,
+            )
+        _run_parallel_schedule(
+            seq_groups,
+            default_branch,
+            state,
+            run_task,
+            specs_by_name,
+            args.resume,
+            max_workers,
+            cooldown,
+            results,
+            outcomes,
+        )
     else:
         # Sequential mode (default). If the dependency graph has any wave
         # wider than one task, suggest --parallel once up-front so the user
         # knows the throughput win exists.
-        seq_groups = find_parallel_groups(ordered_specs)
-        max_wave = max((len(g) for g in seq_groups), default=0)
+        if auto_parallel_enabled and max_wave <= 1:
+            log.info("Auto-parallel enabled, but the dependency graph is fully serial -- staying sequential.")
         if max_wave > 1:
             log.info(
                 "Hint: dependency graph has a wave of %d independent tasks — "

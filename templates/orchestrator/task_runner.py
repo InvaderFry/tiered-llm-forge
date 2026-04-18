@@ -15,12 +15,14 @@ from .git_ops import (
     branch_tip,
     changed_files_between,
     checkout,
+    current_branch,
     merge_branch,
     resolve_dependency_base,
     GIT_TIMEOUT,
 )
 from .log import get_logger, reserve_log_path, write_timestamped_log
 from .model_router import (
+    _estimate_request_tokens,
     run_with_tier_fallback,
     is_request_too_large,
     is_invalid_model,
@@ -346,6 +348,38 @@ def _final_failure_label(test_output, llm_fail_reasons, had_successful_model_att
     return classify_terminal(test_output, llm_fail_reasons), test_failure_label
 
 
+def _assert_expected_branch(branch_name, cwd=None):
+    """Raise if HEAD is not on the expected task branch."""
+    actual_branch = current_branch(cwd=cwd)
+    if actual_branch == branch_name:
+        return
+
+    actual_label = actual_branch or "(detached HEAD)"
+    message = (
+        f"Refusing to run task attempts on the wrong branch: expected '{branch_name}', "
+        f"found '{actual_label}'."
+    )
+    log.warning("  [branch check] %s", message)
+    raise RuntimeError(message)
+
+
+def _remaining_tiers_can_accept_request(current_tier_name, message, target_file, read_files, cwd=None):
+    """Return True if any model in a later tier can accept the current request size."""
+    tier_names = [tier.get("name") for tier in get_config().get("tiers", [])]
+    if current_tier_name not in tier_names:
+        return False
+
+    estimated_tokens = _estimate_request_tokens(target_file, message, read_files, cwd)
+    for tier_name in tier_names[tier_names.index(current_tier_name) + 1:]:
+        tier = get_tier(tier_name)
+        model_meta = tier.get("model_meta", {})
+        for model in tier["models"]:
+            cap = model_meta.get(model, {}).get("max_input_tokens")
+            if cap is None or estimated_tokens <= cap:
+                return True
+    return False
+
+
 def _run_tier_attempts(
     tier_name, start_attempt, message_factory,
     target_file, test_file, read_files, cwd,
@@ -409,12 +443,34 @@ def _run_tier_attempts(
 
         if not success and not model_used:
             reasons_seen = {attempt_meta.get("reason") for attempt_meta in model_attempts}
+            reasons_seen.discard(None)
             if "request_too_large" in reasons_seen and "request_too_large" not in ctx["llm_fail_reasons"]:
                 ctx["llm_fail_reasons"].append("request_too_large")
             if "pre_screen_too_large" in reasons_seen and "pre_screen_too_large" not in ctx["llm_fail_reasons"]:
                 ctx["llm_fail_reasons"].append("pre_screen_too_large")
             if reasons_seen == {"invalid_model_config"} and "invalid_model_config" not in ctx["llm_fail_reasons"]:
                 ctx["llm_fail_reasons"].append("invalid_model_config")
+            if (
+                model_attempts
+                and all(
+                    attempt_meta.get("reason") in {"pre_screen_too_large", "request_too_large"}
+                    for attempt_meta in model_attempts
+                )
+                and reasons_seen.intersection({"pre_screen_too_large", "request_too_large"})
+                and not _remaining_tiers_can_accept_request(
+                    tier_name, message, target_file, read_files, cwd=cwd,
+                )
+            ):
+                ctx["stopped_early"] = True
+                ctx["terminal_failure_override"] = "request_too_large"
+                ctx["failure_note"] = (
+                    "All remaining configured models are below the estimated request size, so "
+                    "retrying later tiers would be wasted work."
+                )
+                log.warning(
+                    "  [stop retries] request exceeds the declared cap of every remaining configured model",
+                )
+                return "terminal_failure"
 
         head_after = branch_tip("HEAD", cwd=cwd)
         head_moved = bool(head_after) and head_after != head_before
@@ -493,7 +549,7 @@ def _run_tier_attempts(
             continue
 
         ctx["baseline_size"] = max(ctx["baseline_size"], file_size(target_file, cwd=cwd))
-        passed, _ = run_tests(test_file, cwd=cwd)
+        passed, test_output = run_tests(test_file, cwd=cwd)
 
         record_attempt(
             state, task_name, attempt, tier_name, model_used, success,
@@ -643,6 +699,7 @@ def _run_task_body(
         log.info("  Branch '%s' already exists -- checking previous result...", branch_name)
         if not worktree:
             checkout(branch_name)
+            _assert_expected_branch(branch_name, cwd=cwd)
         passed, output = run_tests(test_file, cwd=cwd)
         if passed:
             log.info("  Already passing -- skipping.")
@@ -710,6 +767,7 @@ def _run_task_body(
             if start_point != default_branch or extra_merges:
                 log.info("  Branching from '%s' (deps: %s)", start_point, ", ".join(dependencies) or "none")
             checkout(branch_name, create=True, start_point=start_point)
+            _assert_expected_branch(branch_name, cwd=cwd)
 
         for dep_branch in extra_merges:
             log.info("  Merging dependency branch %s into %s", dep_branch, branch_name)

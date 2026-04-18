@@ -1,4 +1,4 @@
-.PHONY: setup env preflight plan run resume parallel validate dry-run fix review status clean
+.PHONY: setup env preflight plan run resume parallel auto-parallel validate dry-run fix review status clean
 
 SHELL := /bin/bash
 LOG_DIR := forgeLogs
@@ -102,6 +102,19 @@ parallel: ## Run independent tasks concurrently in dependency waves (default 4 w
 		printf 'Start time: %s\n\n' "$$started_at"; \
 		status=0; \
 		$(PYTHON) -m orchestrator --parallel 2>&1 || status=$$?; \
+		printf '\nEnd time: %s\n' "$(LOG_TIME_STAMP)"; \
+		exit $$status; \
+	} | tee "$$log_file"
+
+auto-parallel: ## Auto-enable parallel wave mode only when the dependency graph has independent tasks
+	@mkdir -p $(LOG_DIR)
+	@log_file="$(LOG_DIR)/auto-parallel-$(LOG_FILE_STAMP).log"; \
+	started_at="$(LOG_TIME_STAMP)"; \
+	set -o pipefail; \
+	{ \
+		printf 'Start time: %s\n\n' "$$started_at"; \
+		status=0; \
+		$(PYTHON) -m orchestrator --auto-parallel 2>&1 || status=$$?; \
 		printf '\nEnd time: %s\n' "$(LOG_TIME_STAMP)"; \
 		exit $$status; \
 	} | tee "$$log_file"

@@ -3,6 +3,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -37,6 +38,12 @@ _KNOWN_BAD_MODEL_IDS = {
 _WARMED_MAVEN_ROOTS: set[str] = set()
 _MAVEN_WARMUP_LOCK = threading.Lock()
 MAVEN_WARMUP_TIMEOUT = 300
+PYTEST_COLLECTION_TIMEOUT = 30
+_COLLECTION_ERROR_NEEDLES = (
+    "ERROR collecting",
+    "errors during collection",
+    "ImportError while importing test",
+)
 
 
 def normalize_provider_env() -> list[str]:
@@ -66,6 +73,9 @@ def validate_config(cfg=None) -> tuple[list[str], list[str]]:
     tiers = cfg.get("tiers")
     if not isinstance(tiers, list) or not tiers:
         return ["models.yaml must define a non-empty 'tiers' list."], warnings
+    auto_parallel = cfg.get("auto_parallel")
+    if auto_parallel is not None and not isinstance(auto_parallel, bool):
+        errors.append("models.yaml key 'auto_parallel' must be true or false when set.")
 
     tier_names = set()
     seen_models = {}
@@ -179,6 +189,53 @@ def validate_runtime_prereqs(repo_root=None) -> tuple[list[str], list[str]]:
                 )
 
     return errors, warnings
+
+
+def _last_nonempty_line(text):
+    """Return the last non-empty line from subprocess output, if any."""
+    for line in reversed((text or "").splitlines()):
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def validate_pytest_collection(test_files, repo_root=None) -> tuple[list[str], list[str]]:
+    """Return (errors, warnings) for a startup pytest collection pass."""
+    files = [str(path) for path in test_files if str(path)]
+    if not files:
+        return [], []
+
+    root = Path(repo_root or Path.cwd()).resolve()
+    cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q", *files]
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=PYTEST_COLLECTION_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return [], [
+            "Pytest collection preflight timed out after "
+            f"{PYTEST_COLLECTION_TIMEOUT}s; continuing without a collection gate."
+        ]
+
+    output = (result.stdout or "") + (result.stderr or "")
+    if result.returncode == 0:
+        return [], []
+
+    detail = next(
+        (
+            line.strip()
+            for line in output.splitlines()
+            if any(needle in line for needle in _COLLECTION_ERROR_NEEDLES)
+        ),
+        _last_nonempty_line(output) or f"pytest --collect-only exited with code {result.returncode}",
+    )
+    return [f"Pytest collection failed during startup preflight. {detail}"], []
 
 
 def run_startup_preflight(repo_root=None) -> tuple[list[str], list[str]]:
