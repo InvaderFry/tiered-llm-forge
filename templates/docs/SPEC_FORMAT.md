@@ -81,6 +81,13 @@ file before editing yours."
 
 - **One target file per task.** If a feature needs multiple files, split into
   multiple tasks with dependency ordering.
+- **Validation enforces that contract.** Specs are rejected when their body
+  explicitly tells the implementer to create or update a second writable repo
+  path outside the declared `target`.
+- **Property-file edits and new test files are separate tasks.** Keep
+  `application.yml` / `application.properties` changes, test-class creation,
+  and other extra writable files in their own task unless the forge grows
+  multi-target support later.
 - **Zero-padded three digits:** `task-001`, `task-002`, etc.
 - **Soft token budget: ~12,000 characters (~3,000 words).** The orchestrator
   attaches the full spec to the implementer model as a read-only file, so

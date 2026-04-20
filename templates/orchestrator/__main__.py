@@ -386,11 +386,11 @@ def main():
                 log.info("  [cooldown: sleeping %.1fs between tasks]", cooldown_wait)
                 time.sleep(cooldown_wait)
 
-    print_summary(results, default_branch, state)
-
     # Append a lightweight run summary before the integration gate so the
-    # history is recorded even if the gate fails or is skipped.
+    # history is recorded even if the gate fails or is skipped. The end-of-run
+    # summary reads this so cumulative totals include the current invocation.
     append_run_summary(state, results)
+    print_summary(results, default_branch, state)
 
     # Integration gate: only run if every task succeeded (passed or skipped).
     # Failed tasks must be resolved before we try to assemble a merge.

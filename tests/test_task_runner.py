@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "templates"))
 import orchestrator.task_runner as task_runner
 from orchestrator.task_runner import (
     _build_read_context,
+    _classify_test_file_bug,
     _compute_resume_starts,
     _final_failure_label,
     _forbidden_changed_files,
@@ -18,6 +19,8 @@ from orchestrator.task_runner import (
     _pytest_failure_digest,
     _restore_retry_context,
     _run_tier_attempts,
+    _should_resume_existing_branch,
+    _target_file_is_trivial,
     run_task,
 )
 from orchestrator.state import load_state, record_task
@@ -186,6 +189,160 @@ class TestScopeGuidance:
         assert "application.yml" not in guidance
 
 
+class TestTrivialTargetDetection:
+    def test_detects_zero_byte_file(self, tmp_path):
+        target = tmp_path / "src" / "empty.py"
+        target.parent.mkdir()
+        target.write_text("")
+
+        assert _target_file_is_trivial("src/empty.py", cwd=str(tmp_path)) is True
+
+    def test_detects_whitespace_only_file(self, tmp_path):
+        target = tmp_path / "src" / "empty.py"
+        target.parent.mkdir()
+        target.write_text("   \n\t")
+
+        assert _target_file_is_trivial("src/empty.py", cwd=str(tmp_path)) is True
+
+    def test_allows_legitimate_tiny_file(self, tmp_path):
+        target = tmp_path / "src" / "tiny.py"
+        target.parent.mkdir()
+        target.write_text("x=1\n")
+
+        assert _target_file_is_trivial("src/tiny.py", cwd=str(tmp_path)) is False
+
+
+class TestExistingBranchRecoverability:
+    def test_resumes_empty_target_branch(self, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        target = tmp_path / "src" / "example.py"
+        target.parent.mkdir()
+        target.write_text("")
+
+        should_resume, reason = _should_resume_existing_branch(
+            state,
+            "task-001",
+            "src/example.py",
+            cwd=str(tmp_path),
+        )
+
+        assert should_resume is True
+        assert reason == "empty_target_file"
+
+    def test_resumes_nonproductive_history(self, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        target = tmp_path / "src" / "example.py"
+        target.parent.mkdir()
+        target.write_text("print('hello')\n")
+        state["tasks"]["task-001"] = {
+            "attempts_log": [
+                {
+                    "attempt": 1,
+                    "tier": "primary",
+                    "model": "m",
+                    "aider_success": False,
+                    "tests_passed": False,
+                    "post_check_reason": "no_commit",
+                    "model_attempts": [{"model": "m", "reason": "error", "success": False}],
+                }
+            ]
+        }
+
+        should_resume, reason = _should_resume_existing_branch(
+            state,
+            "task-001",
+            "src/example.py",
+            cwd=str(tmp_path),
+        )
+
+        assert should_resume is True
+        assert reason == "non_productive_latest_attempt"
+
+    def test_escalates_meaningful_prior_attempt(self, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        target = tmp_path / "src" / "example.py"
+        target.parent.mkdir()
+        target.write_text("print('hello')\n")
+        state["tasks"]["task-001"] = {
+            "attempts_log": [
+                {
+                    "attempt": 1,
+                    "tier": "primary",
+                    "model": "m",
+                    "aider_success": True,
+                    "tests_passed": False,
+                    "model_attempts": [{"model": "m", "reason": "ok", "success": True}],
+                }
+            ]
+        }
+
+        should_resume, reason = _should_resume_existing_branch(
+            state,
+            "task-001",
+            "src/example.py",
+            cwd=str(tmp_path),
+        )
+
+        assert should_resume is False
+        assert reason == "meaningful_prior_attempt"
+
+    def test_oversized_request_still_escalates(self, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        target = tmp_path / "src" / "example.py"
+        target.parent.mkdir()
+        target.write_text("print('hello')\n")
+        state["tasks"]["task-001"] = {
+            "attempts_log": [
+                {
+                    "attempt": 1,
+                    "tier": "primary",
+                    "model": "m",
+                    "aider_success": False,
+                    "tests_passed": False,
+                    "model_attempts": [{"model": "m", "reason": "request_too_large", "success": False}],
+                }
+            ]
+        }
+
+        should_resume, reason = _should_resume_existing_branch(
+            state,
+            "task-001",
+            "src/example.py",
+            cwd=str(tmp_path),
+        )
+
+        assert should_resume is False
+        assert reason == "oversized_request"
+
+
+class TestTestFileBugClassification:
+    def test_requires_operator_hint(self):
+        output = """
+=================================== FAILURES ===================================
+tests/test_001_example.py:12: in test_example
+    assert value == 2
+E   assert 1 == 2
+=========================== short test summary info ============================
+FAILED tests/test_001_example.py::test_example - assert 1 == 2
+"""
+        assert _classify_test_file_bug(output, "tests/test_001_example.py") is None
+
+    def test_returns_hint_when_task_test_and_hint_are_present(self):
+        output = """
+=================================== FAILURES ===================================
+tests/test_001_example.py:12: in test_example
+    assert value == 2
+E   assert 1 == 2
+HINT: planner-written test expects the wrong literal value
+=========================== short test summary info ============================
+FAILED tests/test_001_example.py::test_example - assert 1 == 2
+"""
+        assert _classify_test_file_bug(
+            output,
+            "tests/test_001_example.py",
+        ) == "planner-written test expects the wrong literal value"
+
+
 class TestFinalFailureLabel:
     def test_uses_test_failure_when_a_model_successfully_edited(self):
         failure_label, test_failure_label = _final_failure_label(
@@ -352,6 +509,70 @@ class TestRunTierAttempts:
         assert result is None
         assert ctx["terminal_failure_override"] is None
         assert "pre_screen_too_large" in ctx["llm_fail_reasons"]
+
+    def test_records_empty_target_file_as_recoverable_post_check(self, monkeypatch, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        target = tmp_path / "src" / "app.py"
+        target.parent.mkdir()
+        target.write_text("")
+        ctx = {
+            "baseline_size": 0,
+            "total_attempts": 0,
+            "models_tried": [],
+            "task_stats": {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 0.0},
+            "llm_fail_reasons": [],
+            "had_successful_model_attempt": False,
+            "last_forbidden_edit": None,
+            "dependency_forbidden_edit_count": 0,
+            "failure_note": None,
+            "stopped_early": False,
+            "terminal_failure_override": None,
+        }
+
+        monkeypatch.setattr(task_runner, "get_tier", lambda _: {"retries": 1})
+        monkeypatch.setattr(
+            task_runner,
+            "run_with_tier_fallback",
+            lambda *args, **kwargs: (
+                True,
+                "primary-model",
+                {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 0.0},
+                [{"model": "primary-model", "reason": "ok", "success": True, "wall_seconds": 0.0}],
+            ),
+        )
+        heads = iter(["head-0", "head-1"])
+        monkeypatch.setattr(task_runner, "branch_tip", lambda *args, **kwargs: next(heads))
+        monkeypatch.setattr(task_runner, "changed_files_between", lambda *args, **kwargs: ["src/app.py"])
+        monkeypatch.setattr(task_runner, "check_regression", lambda *args, **kwargs: False)
+        monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
+        reverted = {}
+        monkeypatch.setattr(task_runner, "revert_last_commit", lambda *args, **kwargs: reverted.setdefault("called", True))
+
+        result = _run_tier_attempts(
+            "primary",
+            1,
+            lambda attempt: f"attempt {attempt}",
+            "src/app.py",
+            "tests/test_app.py",
+            [],
+            str(tmp_path),
+            "task-001",
+            state,
+            False,
+            "main",
+            "primary-model",
+            ctx,
+            lambda: 0.1,
+            "main",
+            "base-sha",
+            {"src/app.py"},
+            [],
+        )
+
+        assert result is None
+        assert reverted["called"] is True
+        attempt = state["tasks"]["task-001"]["attempts_log"][0]
+        assert attempt["post_check_reason"] == "empty_target_file"
 
     def test_collection_error_does_not_stop_remaining_retries(self, monkeypatch, tmp_path):
         state = load_state(tmp_path / "state.json")
@@ -652,6 +873,93 @@ class TestRunTaskVerificationStatus:
         assert outcome == "skipped"
         assert state["tasks"]["task-001-example"]["verification_status"] == "recovered_after_prior_failure"
 
+    def test_existing_failed_branch_with_empty_target_auto_resumes_without_resume_flag(self, monkeypatch, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        spec = {
+            "task_name": "task-001-example",
+            "target": "src/example.py",
+            "test": "tests/test_001_example.py",
+            "path": tmp_path / "specs" / "task-001-example.md",
+            "dependencies": [],
+        }
+        target = tmp_path / "src" / "example.py"
+        target.parent.mkdir()
+        target.write_text("")
+
+        monkeypatch.setattr(task_runner, "branch_exists", lambda *args, **kwargs: True)
+        monkeypatch.setattr(task_runner, "checkout", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "current_branch", lambda *args, **kwargs: "task/task-001-example")
+        monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "resolve_dependency_base", lambda *args, **kwargs: ("main", []))
+        monkeypatch.setattr(task_runner, "branch_tip", lambda *args, **kwargs: "sha-1")
+        monkeypatch.setattr(task_runner, "file_size", lambda *args, **kwargs: 0)
+        monkeypatch.setattr(
+            task_runner,
+            "_build_read_context",
+            lambda *args, **kwargs: ([str(spec["path"]), spec["test"]], [], []),
+        )
+        monkeypatch.setattr(task_runner, "run_tests", lambda *args, **kwargs: (False, "AssertionError: assert 1 == 2"))
+        monkeypatch.setattr(task_runner, "reserve_log_path", lambda name: tmp_path / f"{name}.log")
+        monkeypatch.setattr(task_runner, "write_timestamped_log", lambda *args, **kwargs: None)
+
+        called = {}
+
+        def fake_run_tier_attempts(*args, **kwargs):
+            called["tier"] = args[0]
+            return "terminal_failure"
+
+        monkeypatch.setattr(task_runner, "_run_tier_attempts", fake_run_tier_attempts)
+        monkeypatch.setattr(
+            task_runner,
+            "get_tier",
+            lambda name: {"models": ["primary-model"], "retries": 1}
+            if name == "primary"
+            else {"models": ["escalation-model"], "retries": 0},
+        )
+
+        outcome = run_task(spec, "main", state, cwd=str(tmp_path), branch_preexisted=True)
+
+        assert outcome == "failed"
+        assert called["tier"] == "primary"
+
+    def test_existing_failed_branch_with_meaningful_history_escalates(self, monkeypatch, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        state["tasks"]["task-001-example"] = {
+            "attempts_log": [
+                {
+                    "attempt": 1,
+                    "tier": "primary",
+                    "model": "primary-model",
+                    "aider_success": True,
+                    "tests_passed": False,
+                    "model_attempts": [{"model": "primary-model", "reason": "ok", "success": True}],
+                }
+            ]
+        }
+        spec = {
+            "task_name": "task-001-example",
+            "target": "src/example.py",
+            "test": "tests/test_001_example.py",
+            "path": tmp_path / "specs" / "task-001-example.md",
+            "dependencies": [],
+        }
+        target = tmp_path / "src" / "example.py"
+        target.parent.mkdir()
+        target.write_text("print('hello')\n")
+
+        monkeypatch.setattr(task_runner, "branch_exists", lambda *args, **kwargs: True)
+        monkeypatch.setattr(task_runner, "checkout", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "current_branch", lambda *args, **kwargs: "task/task-001-example")
+        monkeypatch.setattr(task_runner, "run_tests", lambda *args, **kwargs: (False, "AssertionError: assert 1 == 2"))
+        monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "reserve_log_path", lambda name: tmp_path / f"{name}.log")
+        monkeypatch.setattr(task_runner, "write_timestamped_log", lambda *args, **kwargs: None)
+
+        outcome = run_task(spec, "main", state, cwd=str(tmp_path), branch_preexisted=True)
+
+        assert outcome == "failed"
+        assert "meaningful_prior_attempt" in state["tasks"]["task-001-example"]["failure_note"]
+
 class TestRunTaskFailureRouting:
     def test_early_stop_records_forbidden_file_edit_as_failure_class(self, monkeypatch, tmp_path):
         state = load_state(tmp_path / "state.json")
@@ -704,6 +1012,71 @@ class TestRunTaskFailureRouting:
         entry = state["tasks"]["task-001-example"]
         assert entry["failure_class"] == "forbidden_file_edit"
         assert entry["test_failure_class"] == "assertion"
+
+    def test_test_file_bug_stops_after_first_failing_attempt(self, monkeypatch, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        spec = {
+            "task_name": "task-001-example",
+            "target": "src/example.py",
+            "test": "tests/test_001_example.py",
+            "path": tmp_path / "specs" / "task-001-example.md",
+            "dependencies": [],
+        }
+
+        monkeypatch.setattr(task_runner, "branch_exists", lambda *args, **kwargs: False)
+        monkeypatch.setattr(task_runner, "resolve_dependency_base", lambda *args, **kwargs: ("main", []))
+        monkeypatch.setattr(task_runner, "branch_tip", lambda *args, **kwargs: "sha-1")
+        monkeypatch.setattr(task_runner, "checkout", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "current_branch", lambda *args, **kwargs: "task/task-001-example")
+        monkeypatch.setattr(task_runner, "file_size", lambda *args, **kwargs: 10)
+        monkeypatch.setattr(task_runner, "save_state", lambda *args, **kwargs: None)
+        monkeypatch.setattr(task_runner, "reserve_log_path", lambda name: tmp_path / f"{name}.log")
+        monkeypatch.setattr(task_runner, "write_timestamped_log", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            task_runner,
+            "_build_read_context",
+            lambda *args, **kwargs: ([str(spec["path"]), spec["test"]], [], []),
+        )
+        monkeypatch.setattr(task_runner, "check_regression", lambda *args, **kwargs: False)
+        monkeypatch.setattr(task_runner, "changed_files_between", lambda *args, **kwargs: ["src/example.py"])
+        monkeypatch.setattr(
+            task_runner,
+            "get_tier",
+            lambda name: {"models": ["primary-model"], "retries": 2}
+            if name == "primary"
+            else {"models": ["escalation-model"], "retries": 1},
+        )
+        monkeypatch.setattr(
+            task_runner,
+            "run_with_tier_fallback",
+            lambda *args, **kwargs: (
+                True,
+                "primary-model",
+                {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 0.0},
+                [{"model": "primary-model", "reason": "ok", "success": True, "wall_seconds": 0.0}],
+            ),
+        )
+        monkeypatch.setattr(
+            task_runner,
+            "run_tests",
+            lambda *args, **kwargs: (
+                False,
+                """tests/test_001_example.py:12: in test_example
+    assert value == 2
+E   assert 1 == 2
+HINT: planner-written test expects the wrong literal value
+=========================== short test summary info ============================
+FAILED tests/test_001_example.py::test_example - assert 1 == 2
+""",
+            ),
+        )
+
+        outcome = run_task(spec, "main", state)
+
+        assert outcome == "failed"
+        entry = state["tasks"]["task-001-example"]
+        assert entry["failure_class"] == "test_file_bug"
+        assert "planner-written task test" in entry["failure_note"]
 
     def test_resume_counts_previous_dependency_forbidden_edit_before_retrying(self, monkeypatch, tmp_path):
         state = load_state(tmp_path / "state.json")

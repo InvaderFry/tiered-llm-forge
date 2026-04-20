@@ -100,8 +100,10 @@ failure, the Gemini tier automatically attempts a fix before writing a
 failure log. Only a clean integration branch is considered ready for human
 merge review.
 
-Re-running is safe — passing branches are skipped, failing branches go straight
-to Claude review. Pipeline state persists across crashes.
+Re-running is safe — passing branches are skipped, recoverable/non-productive
+failed branches are retried automatically, and only meaningful prior
+implementation failures go straight to Claude review. Pipeline state persists
+across crashes.
 
 Before any real run, the referenced `specs/` and `tests/` files must already be
 tracked by git and clean. This is required so parallel worktrees and integration

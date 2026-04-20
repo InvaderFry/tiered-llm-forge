@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "templates"))
 
 from orchestrator.state import (
     load_state,
+    record_attempt,
     save_state,
     record_task,
 )
@@ -144,3 +145,19 @@ class TestState:
         assert entry["status"] == "failed"
         assert entry["failure_class"] == "assertion"
         assert "failure_note" not in entry
+
+    def test_record_attempt_keeps_post_check_reason(self, tmp_path):
+        state = load_state(tmp_path / "state.json")
+        record_attempt(
+            state,
+            "task-001",
+            1,
+            "primary",
+            "model-a",
+            aider_success=True,
+            tests_passed=False,
+            post_check_reason="empty_target_file",
+        )
+
+        attempt = state["tasks"]["task-001"]["attempts_log"][0]
+        assert attempt["post_check_reason"] == "empty_target_file"

@@ -10,9 +10,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "templates"))
 
 from orchestrator.model_router import (
     adaptive_cooldown_seconds,
+    effective_input_cap,
     get_fallback_models,
     _parse_retry_after,
     _parse_usage,
+    _record_observed_cap,
     _is_invalid_model_error,
     _wait_for_model,
     _mark_rate_limited,
@@ -86,6 +88,7 @@ class TestRateLimitCoordinator:
     def setup_method(self):
         _mr._next_available_at.clear()
         _mr._invalid_models.clear()
+        _mr._observed_caps.clear()
         _mr._last_provider_pressure_at = 0.0
         clear_request_too_large()
         self._fake_now = [1000.0]
@@ -99,6 +102,7 @@ class TestRateLimitCoordinator:
         _mr._sleep = _t.sleep
         _mr._next_available_at.clear()
         _mr._invalid_models.clear()
+        _mr._observed_caps.clear()
         _mr._last_provider_pressure_at = 0.0
         clear_request_too_large()
 
@@ -161,6 +165,7 @@ class TestRequestTooLargePerTask:
 
     def teardown_method(self):
         clear_request_too_large()
+        _mr._observed_caps.clear()
 
     def test_mark_and_query(self):
         assert is_request_too_large("groq/openai/gpt-oss-20b") is False
@@ -189,6 +194,22 @@ class TestRequestTooLargePerTask:
         assert other_thread_saw == [False]
         # Main thread still sees its own flag
         assert is_request_too_large("groq/openai/gpt-oss-20b") is True
+
+    def test_provider_rejection_records_observed_cap(self):
+        cap = _record_observed_cap(
+            "groq/openai/gpt-oss-20b",
+            "Request too large for model ... Limit 8000, Requested 8072",
+        )
+        assert cap == 8000
+        assert effective_input_cap("groq/openai/gpt-oss-20b", 16000) == 8000
+
+    def test_observed_cap_beats_declared_cap(self):
+        _record_observed_cap(
+            "groq/openai/gpt-oss-20b",
+            "Request too large for model ... Limit 8000, Requested 8072",
+        )
+        assert effective_input_cap("groq/openai/gpt-oss-20b", 32000) == 8000
+        assert effective_input_cap("groq/openai/gpt-oss-20b", 6000) == 6000
 
 
 class TestInvalidModelTracking:
@@ -263,3 +284,33 @@ class TestParseUsage:
     def test_no_match_returns_zeroes(self):
         stats = _parse_usage("nothing aider-shaped here")
         assert stats == {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0}
+
+
+class TestObservedCapPrescreen:
+    def teardown_method(self):
+        _mr._observed_caps.clear()
+
+    def test_run_with_tier_fallback_skips_when_observed_cap_is_lower(self, monkeypatch):
+        _mr._observed_caps["groq/openai/gpt-oss-20b"] = 8000
+        monkeypatch.setattr(_mr, "_estimate_request_tokens", lambda *args, **kwargs: 9000)
+        monkeypatch.setattr(_mr, "run_aider", lambda *args, **kwargs: pytest.fail("run_aider should not be called"))
+
+        success, model_used, stats, attempts = _mr.run_with_tier_fallback(
+            "primary",
+            "message",
+            "src/example.py",
+            read_files=[],
+            cwd=None,
+        )
+
+        assert success is False
+        assert model_used is None
+        assert stats == {"tokens_sent": 0, "tokens_received": 0, "cost_usd": 0.0, "wall_seconds": 0.0}
+        assert attempts == [
+            {
+                "model": "groq/openai/gpt-oss-20b",
+                "reason": "pre_screen_too_large",
+                "success": False,
+                "wall_seconds": 0.0,
+            }
+        ]

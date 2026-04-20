@@ -43,6 +43,7 @@ _next_available_at: dict = {}
 # is asking. Protected by the same _rate_limit_lock.
 _daily_quota_exhausted: set = set()
 _invalid_models: set = set()
+_observed_caps: dict = {}
 _last_provider_pressure_at = 0.0
 # Request-too-large is per-task and per-thread, not session-wide. A long spec
 # that blows past one task's Groq prescreen cap must not cause the NEXT task's
@@ -141,6 +142,22 @@ def is_invalid_model(model: str) -> bool:
     """Return True if the provider reported ``model`` as unsupported/not found."""
     with _rate_limit_lock:
         return model in _invalid_models
+
+
+def observed_cap(model: str):
+    """Return the provider-observed input cap for a model, if any."""
+    with _rate_limit_lock:
+        return _observed_caps.get(model)
+
+
+def effective_input_cap(model: str, declared_cap=None):
+    """Return the strictest known input cap for a model."""
+    seen = observed_cap(model)
+    if seen is None:
+        return declared_cap
+    if declared_cap is None:
+        return seen
+    return min(seen, declared_cap)
 
 
 def all_gemini_quota_exhausted() -> bool:
@@ -260,6 +277,20 @@ _INVALID_MODEL_STRINGS = (
 def _is_invalid_model_error(combined_output: str) -> bool:
     """Return True if provider output says the requested model id is invalid."""
     return any(s in combined_output for s in _INVALID_MODEL_STRINGS)
+
+
+def _record_observed_cap(model: str, combined_output: str):
+    """Parse and store a provider-reported hard cap for ``model``."""
+    match = re.search(r"Limit (\d+), Requested (\d+)", combined_output or "")
+    if not match:
+        return None
+
+    cap = int(match.group(1))
+    with _rate_limit_lock:
+        current = _observed_caps.get(model)
+        if current is None or cap < current:
+            _observed_caps[model] = cap
+    return cap
 
 
 # Aider stdout reports usage on lines like:
@@ -460,14 +491,20 @@ def run_aider(model, message, target_file, read_files=None, cwd=None, timeout_ov
             mark_invalid_model(model)
             return _finish(False, "invalid_model_config")
 
-        if "rate_limit_exceeded" in combined or "Rate limit reached" in combined:
-            # "Request too large" means the request itself exceeds the TPM cap —
-            # no amount of waiting will help, and it is not a time-based window
-            # so we do not record it in the coordinator.
-            if "Request too large" in combined:
+        if "Request too large" in combined:
+            cap = _record_observed_cap(model, combined)
+            if cap is not None:
+                log.warning(
+                    "  [request too large for model %s TPM cap -- observed hard cap %d]",
+                    model,
+                    cap,
+                )
+            else:
                 log.warning("  [request too large for model %s TPM cap -- falling back]", model)
-                _mark_request_too_large(model)
-                return _finish(False, "request_too_large")
+            _mark_request_too_large(model)
+            return _finish(False, "request_too_large")
+
+        if "rate_limit_exceeded" in combined or "Rate limit reached" in combined:
 
             wait = retry_after
             if wait:
@@ -520,10 +557,10 @@ def run_with_tier_fallback(tier_name, message, target_file, start_model=None, re
     estimated_tokens = _estimate_request_tokens(target_file, message, read_files, cwd)
     for model in models:
         meta = model_meta.get(model, {})
-        cap = meta.get("max_input_tokens")
+        cap = effective_input_cap(model, meta.get("max_input_tokens"))
         if cap and estimated_tokens > cap:
             log.info(
-                "  Skipping %s -- estimated %d tokens exceeds declared cap %d",
+                "  Skipping %s -- estimated %d tokens exceeds effective cap %d",
                 model,
                 estimated_tokens,
                 cap,

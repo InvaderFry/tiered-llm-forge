@@ -1,6 +1,6 @@
 # CLAUDE.md — Tiered LLM Coding Workflow Instructions
 
-This project uses an automated pipeline (`python3 -m orchestrator`) that feeds
+This project uses an automated pipeline (`make run`) that feeds
 spec files through escalating model tiers:
 **GPT-OSS 20B → GPT-OSS 120B → Llama 3.3 70B → Gemini 2.5 Flash**
 
@@ -63,6 +63,7 @@ explicit so the implementer has the right architectural background.
 ### Critical rules
 
 - **One target file per task.** Split multi-file work into separate tasks.
+- **Single-target enforcement is runtime-validated.** If the spec body tells the implementer to create or update another writable repo file, validation rejects it before orchestration.
 - **Zero-padded three-digit task numbers:** `task-001`, `task-002`, etc.
 - **Keep specs under ~12,000 characters.** Longer specs trigger warnings and should be split before orchestration.
 - **Commit planner inputs before orchestration.** Before `make run` or `make parallel`,
@@ -82,7 +83,7 @@ explicit so the implementer has the right architectural background.
 ### Quality bar for generated services
 
 - **Prefer production-leaning contracts over toy scaffolding.** If a task creates a service/client/CLI, the spec should demand explicit error handling, timeouts, and stable interfaces.
-- **For Java/Spring tasks:** prefer typed DTOs/records over raw `Map` parsing, constructor injection over field injection, explicit HTTP timeouts, and clear non-zero exit behavior for CLI failures.
+- **For Java/Spring tasks:** prefer typed DTOs/records over raw `Map` parsing, constructor injection over field injection, explicit HTTP timeouts, and clear non-zero exit behavior for CLI failures. Also call out `CommandLineRunner` / `ApplicationRunner` timing under `@SpringBootTest`, keep property-file edits as their own tasks, and note Mockito/JDK compatibility hazards when they affect test scaffolding.
 - **For external calls:** require local mocks in tests and explicit configuration points (`base-url`, output paths, timeouts) so acceptance tests can run without live services.
 - **For cross-cutting setup:** if the tests depend on warmed caches or toolchain state (for example `mvn -o`), note that in `SpecsReadMe.md` and keep the narrowest possible acceptance test that still proves the behavior.
 
@@ -136,8 +137,8 @@ Quick version:
    The log header includes a **failure class**
    (`dependency_cache_missing`, `invalid_model_config`, `rate_limit`,
    `gemini_quota_exhausted`, `request_too_large`,
-   `collection_error`, `missing_symbol`, `assertion`, `timeout`,
-   `forbidden_file_edit`, `regression_guard`, `merge_conflict`, `unknown`) and the list of
+   `forbidden_file_edit`, `test_file_bug`, `collection_error`, `missing_symbol`,
+   `assertion`, `timeout`, `regression_guard`, `merge_conflict`, `unknown`) and the list of
    models tried — use these to pick the right fix before reading the
    full output. If you see `gemini_quota_exhausted`, the Gemini tier
    was already attempted but had no daily quota remaining; this is not
@@ -194,7 +195,7 @@ integration safety + code quality, then MERGE / FIX THEN MERGE / FLAG.
 | `make preflight` | Validate config, provider env, and runtime prerequisites |
 | `make dry-run` | Preview pipeline without calling models |
 | `make run` | Run the full pipeline |
-| `make resume` | Resume failed tasks from last attempt instead of flagging for review |
+| `make resume` | Resume an interrupted/crashed run from the recorded attempt |
 | `make parallel` | Run independent tasks concurrently in dependency waves (default 4 workers) |
 | `make auto-parallel` | Auto-enable wave mode only when the dependency graph has parallel work |
 | `make status` | Show branches, failures, and pipeline state |
@@ -203,7 +204,7 @@ integration safety + code quality, then MERGE / FIX THEN MERGE / FLAG.
 
 | Flag | Effect |
 |------|--------|
-| `--resume` | Resume from the exact attempt that crashed/failed |
+| `--resume` | Resume from the exact recorded attempt after an interrupted/crashed run |
 | `--parallel [N]` | Run tasks concurrently in dependency waves using git worktrees (N = max workers, default 4) |
 | `--auto-parallel` | Auto-switch to parallel waves when the graph has a wave wider than one task |
 | `--no-auto-parallel` | Force sequential mode even if `models.yaml` sets `auto_parallel: true` |

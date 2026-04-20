@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "templates"))
 
-from orchestrator.failure_class import classify, classify_terminal
+from orchestrator.failure_class import classify, classify_terminal, extract_test_file_bug_hint
 
 
 class TestFailureClass:
@@ -50,3 +50,7 @@ class TestFailureClass:
 
     def test_terminal_class_uses_llm_reason_when_test_output_is_generic(self):
         assert classify_terminal("AssertionError: assert 1 == 2", ["invalid_model_config"]) == "invalid_model_config"
+
+    def test_extracts_test_file_bug_hint(self):
+        msg = "AssertionError\nHINT: planner-written test expects the wrong literal value\n"
+        assert extract_test_file_bug_hint(msg) == "planner-written test expects the wrong literal value"

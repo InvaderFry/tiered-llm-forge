@@ -172,7 +172,10 @@ After every task passes, the orchestrator runs an **integration gate**
 **Re-running is safe.** Passing branches are skipped. `pipeline-state.json`
 distinguishes `already_passing_existing_branch` from
 `recovered_after_prior_failure`, so resume state shows whether a branch was
-always green or fixed after an earlier failure.
+always green or fixed after an earlier failure. Existing failed branches with
+clearly non-productive history are retried automatically; `make resume` is for
+interrupted/crashed runs when you want to continue from the exact recorded
+attempt.
 
 ### Parallel mode
 
@@ -399,8 +402,9 @@ all models exhaust their retries, wait a few minutes — Groq limits reset
 hourly.
 
 **Task branch already exists**
-→ The orchestrator handles this automatically: skips passing branches, escalates
-failing branches to Claude review.
+→ The orchestrator handles this automatically: skips passing branches, retries
+recoverable/non-productive failures, and escalates only branches with a
+meaningful prior implementation attempt.
 
 **Spec validation errors**
 → Run `make validate` and fix all errors before `make run`.
@@ -408,8 +412,8 @@ failing branches to Claude review.
 **Pipeline crashed mid-run**
 → Run `make resume`. This resumes each task from the exact attempt where it
 left off (using the per-attempt log in `pipeline-state.json`) instead of
-re-evaluating the whole branch. If you prefer a fresh start, `make run`
-still works — passing branches are skipped, failing branches go to review.
+starting that task over. `make run` still works too — it re-checks existing
+branches and automatically retries recoverable, non-productive failures.
 
 **Integration gate failed with a merge conflict**
 → Read `forgeLogs/INTEGRATION-FAILED-<timestamp>.log` for the offending branch. Two tasks

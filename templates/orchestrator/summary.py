@@ -23,6 +23,7 @@ def print_summary(results, default_branch, state=None):
     failed = results["failed"]
     skipped = results["skipped"]
     blocked = results.get("blocked", [])
+    current_task_names = passed + failed + skipped + blocked
     recovered_skips = 0
     already_passing_skips = len(skipped)
     if state and state.get("tasks"):
@@ -46,6 +47,11 @@ def print_summary(results, default_branch, state=None):
     # Observability roll-up: per-model success/failure counts, task
     # timings, and token / cost totals scraped from aider's stdout.
     if state and state.get("tasks"):
+        current_entries = [
+            state["tasks"][name]
+            for name in current_task_names
+            if name in state["tasks"]
+        ]
         attempted_by_model = {}
         oversized_context = {
             "provider_rejections": 0,
@@ -57,7 +63,7 @@ def print_summary(results, default_branch, state=None):
         total_tokens_sent = 0
         total_tokens_received = 0
         total_cost = 0.0
-        for entry in state["tasks"].values():
+        for entry in current_entries:
             dur = entry.get("duration_seconds") or 0.0
             total_time += dur
             total_tokens_sent += entry.get("tokens_sent", 0) or 0
@@ -120,7 +126,7 @@ def print_summary(results, default_branch, state=None):
                 )
 
         fail_classes = {}
-        for entry in state["tasks"].values():
+        for entry in current_entries:
             fc = entry.get("failure_class")
             if fc:
                 fail_classes[fc] = fail_classes.get(fc, 0) + 1
@@ -178,14 +184,15 @@ def print_summary(results, default_branch, state=None):
                     gemini_exhausted_count,
                 )
 
-        for f in failed:
-            logs = sorted(FORGE_LOGS_DIR.glob(f"FAILED-{f}-*.log")) if FORGE_LOGS_DIR.exists() else []
-            fail_log = logs[-1] if logs else FORGE_LOGS_DIR / f"FAILED-{f}-[timestamp].log"
-            log.info("\n  Task:   %s", f)
-            log.info("  Branch: task/%s", f)
-            log.info("  Log:    %s", fail_log)
-            log.info("  Prompt: > Fix %s. The log is at %s.", f, fail_log)
-        log.info("\nAfter Claude fixes each failure, re-run: python3 -m orchestrator")
+            for f in failed:
+                logs = sorted(FORGE_LOGS_DIR.glob(f"FAILED-{f}-*.log")) if FORGE_LOGS_DIR.exists() else []
+                fail_log = logs[-1] if logs else FORGE_LOGS_DIR / f"FAILED-{f}-[timestamp].log"
+                log.info("\n  Task:   %s", f)
+                log.info("  Branch: task/%s", f)
+                log.info("  Log:    %s", fail_log)
+                log.info("  Prompt: > Fix %s. The log is at %s.", f, fail_log)
+        log.info("\nAfter Claude fixes each failure, re-run: make run")
+        log.info("Use make resume only when the previous run was interrupted and you want to continue from the recorded attempt.")
         log.info("Fixed tasks are detected as passing and skipped automatically.")
     elif blocked:
         log.info("\n%s", "=" * 50)
@@ -195,3 +202,17 @@ def print_summary(results, default_branch, state=None):
         log.info("\n%s", "=" * 50)
         log.info("All tasks passing -- ready to merge.")
         log.info("Open Claude Code and say: 'Review the task branches and merge them.'\n")
+
+    if state and len(state.get("runs", [])) > 1:
+        cumulative = {"passed": 0, "failed": 0, "skipped": 0, "blocked": 0}
+        for run in state["runs"]:
+            cumulative["passed"] += len(run.get("passed", []))
+            cumulative["failed"] += len(run.get("failed", []))
+            cumulative["skipped"] += len(run.get("skipped", []))
+            cumulative["blocked"] += len(run.get("blocked", []))
+
+        log.info("Cumulative session:")
+        log.info("  Passed:  %d", cumulative["passed"])
+        log.info("  Skipped: %d", cumulative["skipped"])
+        log.info("  Blocked: %d", cumulative["blocked"])
+        log.info("  Failed:  %d", cumulative["failed"])

@@ -9,7 +9,11 @@ from pathlib import Path
 
 from . import FORGE_LOGS_DIR
 from .config import get_config, get_tier
-from .failure_class import classify as classify_failure, classify_terminal
+from .failure_class import (
+    classify as classify_failure,
+    classify_terminal,
+    extract_test_file_bug_hint,
+)
 from .git_ops import (
     branch_exists,
     branch_tip,
@@ -23,6 +27,7 @@ from .git_ops import (
 from .log import get_logger, reserve_log_path, write_timestamped_log
 from .model_router import (
     _estimate_request_tokens,
+    effective_input_cap,
     run_with_tier_fallback,
     is_request_too_large,
     is_invalid_model,
@@ -110,6 +115,19 @@ def _path_size(path, cwd=None):
         return p.stat().st_size
     except OSError:
         return 0
+
+
+def _target_file_is_trivial(target_file, cwd=None):
+    """Return True when the current target output is empty or whitespace-only."""
+    path = Path(cwd) / target_file if cwd and not Path(target_file).is_absolute() else Path(target_file)
+    if not path.exists():
+        return True
+    try:
+        if path.stat().st_size == 0:
+            return True
+        return path.read_text(encoding="utf-8", errors="replace").strip() == ""
+    except OSError:
+        return False
 
 
 def _build_read_context(spec, test_file, dependencies, specs_by_name, cwd=None):
@@ -230,6 +248,64 @@ def _has_prior_failure(state, task_name):
         if attempt.get("tests_passed") is False:
             return True
     return False
+
+
+def _last_attempt_reasons(state, task_name):
+    """Return the latest recorded post-check/model reasons for a task."""
+    entry = state.get("tasks", {}).get(task_name, {})
+    attempts = entry.get("attempts_log", [])
+    if not attempts:
+        return set()
+
+    latest = attempts[-1]
+    reasons = set()
+    if latest.get("post_check_reason"):
+        reasons.add(latest["post_check_reason"])
+    for model_attempt in latest.get("model_attempts") or []:
+        reason = model_attempt.get("reason")
+        if reason:
+            reasons.add(reason)
+    return reasons
+
+
+def _has_meaningful_prior_attempt(state, task_name, target_file, cwd=None):
+    """Return True when history shows a real code attempt on a non-trivial target."""
+    if _target_file_is_trivial(target_file, cwd=cwd):
+        return False
+
+    entry = state.get("tasks", {}).get(task_name, {})
+    for attempt in entry.get("attempts_log", []):
+        if attempt.get("aider_success") and attempt.get("tests_passed") is False:
+            return True
+    return False
+
+
+def _should_resume_existing_branch(state, task_name, target_file, cwd=None):
+    """Return (should_resume, reason) for an existing failing branch."""
+    if _target_file_is_trivial(target_file, cwd=cwd):
+        return True, "empty_target_file"
+
+    reasons = _last_attempt_reasons(state, task_name)
+    if reasons.intersection({"request_too_large", "pre_screen_too_large"}):
+        return False, "oversized_request"
+    if reasons.intersection({"no_commit", "empty_target_file"}):
+        return True, "non_productive_latest_attempt"
+    if _has_meaningful_prior_attempt(state, task_name, target_file, cwd=cwd):
+        return False, "meaningful_prior_attempt"
+    return True, "non_productive_history"
+
+
+def _classify_test_file_bug(test_output, task_test_file):
+    """Return a supporting hint when evidence points at the task test/spec side."""
+    summary_match = _FAILED_SUMMARY_RE.search(test_output or "")
+    if not summary_match:
+        return None
+
+    failing_test_path = summary_match.group(1).strip().split("::", 1)[0]
+    if _normalize_relpath(failing_test_path) != _normalize_relpath(task_test_file):
+        return None
+
+    return extract_test_file_bug_hint(test_output)
 
 
 def _format_scope_guidance(
@@ -374,7 +450,7 @@ def _remaining_tiers_can_accept_request(current_tier_name, message, target_file,
         tier = get_tier(tier_name)
         model_meta = tier.get("model_meta", {})
         for model in tier["models"]:
-            cap = model_meta.get(model, {}).get("max_input_tokens")
+            cap = effective_input_cap(model, model_meta.get(model, {}).get("max_input_tokens"))
             if cap is None or estimated_tokens <= cap:
                 return True
     return False
@@ -536,6 +612,23 @@ def _run_tier_attempts(
             save_state(state)
             revert_last_commit(target_file, ctx["baseline_size"], cwd=cwd)
             continue
+        if head_moved and _target_file_is_trivial(target_file, cwd=cwd):
+            _record_time("reverted_or_failed_tests", pending_wall)
+            record_attempt(
+                state, task_name, attempt, tier_name, model_used, success,
+                tests_passed=False, model_attempts=model_attempts, wall_seconds=attempt_wall,
+                post_check_reason="empty_target_file",
+            )
+            save_state(state)
+            revert_last_commit(
+                target_file,
+                ctx["baseline_size"],
+                cwd=cwd,
+                reason=(
+                    "[EMPTY TARGET] Reverting attempt because the task target ended up empty or whitespace-only."
+                ),
+            )
+            continue
         if not head_moved and not success:
             # Aider never committed — nothing to revert, but also nothing to test.
             # Move to the next attempt without nuking dependency history.
@@ -585,6 +678,17 @@ def _run_tier_attempts(
             save_state(state)
             return "passed"
 
+        test_file_bug_hint = _classify_test_file_bug(test_output, test_file)
+        if test_file_bug_hint:
+            ctx["stopped_early"] = True
+            ctx["terminal_failure_override"] = "test_file_bug"
+            ctx["failure_note"] = (
+                "The failing assertion appears to come from the planner-written task test, "
+                "so automated implementation retries are unlikely to help. "
+                f"Operator hint: {test_file_bug_hint}"
+            )
+            return "terminal_failure"
+
         _record_time("reverted_or_failed_tests", pending_wall)
 
     return None  # tier exhausted without passing
@@ -620,8 +724,8 @@ def run_task(spec, default_branch, state, specs_by_name=None, resume=False,
 
     Re-run behaviour:
     - Branch exists + tests pass  -> skip (return 'skipped')
-    - Branch exists + tests fail + resume=False -> flag for Claude review
-    - Branch exists + tests fail + resume=True  -> resume from last attempt
+    - Branch exists + tests fail + recoverable history -> resume automatically
+    - Branch exists + tests fail + meaningful prior attempt -> flag for Claude review
     - Branch does not exist       -> normal first run
 
     Dependency handling:
@@ -695,6 +799,7 @@ def _run_task_body(
     # In worktree mode the caller tells us whether the branch pre-existed
     # (worktree creation itself creates the branch as a side effect).
     branch_was_preexisting = branch_preexisted if worktree else branch_exists(branch_name, cwd=cwd)
+    resume_existing_branch = False
     if branch_was_preexisting:
         log.info("  Branch '%s' already exists -- checking previous result...", branch_name)
         if not worktree:
@@ -719,22 +824,64 @@ def _run_task_body(
             save_state(state)
             return "skipped"
 
-        # Check if we should resume from where we left off
-        resume_point = get_resume_point(state, task_name) if resume else None
-        if resume_point:
-            log.info(
-                "  Resuming from %s tier, attempt %d (total prior attempts: %d)",
-                resume_point["tier"], resume_point["attempt"] + 1,
-                resume_point["total_attempts"],
+        test_file_bug_hint = _classify_test_file_bug(output, test_file)
+        if test_file_bug_hint:
+            log.info("  Existing branch failure looks like a planner-written test/spec bug.")
+            FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            fail_log = reserve_log_path(f"FAILED-{task_name}")
+            write_timestamped_log(
+                fail_log,
+                (
+                    "Existing branch still fails verification.\n"
+                    "Failure class: test_file_bug\n"
+                    f"Recommended action: The failing assertion appears to come from the task test/spec. Operator hint: {test_file_bug_hint}\n\n"
+                    f"{output}"
+                ),
+                started_at=task_started_at,
             )
-            # Stay on the branch — fall through to the retry loop below
+            if not worktree:
+                checkout(default_branch)
+            record_task(
+                state,
+                task_name,
+                "failed",
+                attempts=0,
+                duration_seconds=_elapsed(),
+                failure_class="test_file_bug",
+                test_failure_class=classify_failure(output),
+                failure_note=(
+                    "Existing branch still fails and the failure looks test/spec-side. "
+                    f"Operator hint: {test_file_bug_hint}"
+                ),
+            )
+            save_state(state)
+            return "failed"
+
+        should_resume, resume_reason = _should_resume_existing_branch(state, task_name, target_file, cwd=cwd)
+        if should_resume:
+            resume_existing_branch = True
+            resume_point = get_resume_point(state, task_name)
+            log.info(
+                "  Existing branch failure looks recoverable (%s) -- resuming automation.",
+                resume_reason,
+            )
+            if resume_point:
+                log.info(
+                    "  Resuming from %s tier, attempt %d (total prior attempts: %d)",
+                    resume_point["tier"], resume_point["attempt"] + 1,
+                    resume_point["total_attempts"],
+                )
         else:
             log.info("  Previously failed -- escalating to Claude review.")
             FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
             fail_log = reserve_log_path(f"FAILED-{task_name}")
             write_timestamped_log(
                 fail_log,
-                f"Previously attempted -- still failing on re-run.\n\n{output}",
+                (
+                    "Previously attempted -- still failing on re-run.\n"
+                    f"Recommended action: branch contains a meaningful prior implementation attempt "
+                    f"({resume_reason}); escalate instead of auto-resuming.\n\n{output}"
+                ),
                 started_at=task_started_at,
             )
             if not worktree:
@@ -746,7 +893,10 @@ def _run_task_body(
                 attempts=0,
                 duration_seconds=_elapsed(),
                 failure_class=classify_failure(output),
-                failure_note="Branch already existed and still failed verification on re-run.",
+                failure_note=(
+                    "Branch already existed and still failed verification on re-run. "
+                    f"Auto-resume skipped because history indicates {resume_reason}."
+                ),
             )
             save_state(state)
             return "failed"
@@ -754,14 +904,14 @@ def _run_task_body(
         resume_point = None
 
     # --- Normal first run (or resume): branch from dependency tip(s) ---
-    if not resume_point:
+    if not resume_existing_branch:
         start_point, extra_merges = resolve_dependency_base(dependencies, default_branch, cwd=cwd)
     else:
         # Resuming — branch already exists, no need to re-create
         start_point = default_branch
         extra_merges = []
 
-    if not resume_point:
+    if not resume_existing_branch:
         base_sha = branch_tip(start_point, cwd=cwd)
         if not worktree:
             if start_point != default_branch or extra_merges:

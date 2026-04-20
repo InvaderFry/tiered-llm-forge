@@ -21,9 +21,32 @@ _SAFE_BUILD_FILES = {
 _SAFE_CONFIG_FILES = {
     "application.yml",
     "application.yaml",
+    "application.properties",
     ".env.example",
     ".gitignore",
 }
+_CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+_WRITE_VERB_RE = re.compile(r"\b(create|write|modify|update|add)\b", re.IGNORECASE)
+_READ_ONLY_PREFIXES = (
+    "reads from",
+    "described in",
+    "see",
+    "references",
+    "imports from",
+    "extends",
+    "defined in",
+    "as shown in",
+)
+_REPO_PATH_RE = re.compile(
+    r"(?<![\w./-])("
+    r"(?:src|tests|docs|config|configs|resources)/[A-Za-z0-9_./-]+"
+    r"|pom\.xml"
+    r"|application\.yml"
+    r"|application\.yaml"
+    r"|application\.properties"
+    r")(?=[^A-Za-z0-9_./-]|$)"
+)
 
 
 def parse_frontmatter(spec_text):
@@ -137,6 +160,45 @@ def classify_target_path(target):
     )
 
 
+def _strip_code_fences(text):
+    """Remove fenced code blocks before sentence scanning."""
+    return _CODE_FENCE_RE.sub("", text or "")
+
+
+def _sentence_paths_with_write_intent(body, target):
+    """Return non-target writable paths mentioned with write intent."""
+    target_norm = _normalize_path_text(target)
+    offending = []
+    for raw_sentence in _SENTENCE_SPLIT_RE.split(_strip_code_fences(body)):
+        sentence = " ".join(raw_sentence.strip().split())
+        if not sentence:
+            continue
+
+        lower = sentence.lower()
+        if any(lower.startswith(prefix) for prefix in _READ_ONLY_PREFIXES):
+            continue
+        if not _WRITE_VERB_RE.search(sentence):
+            continue
+
+        paths = set()
+        for match in _REPO_PATH_RE.finditer(sentence):
+            path = _normalize_path_text(match.group(1))
+            prefix = sentence[:match.start()].lower().rstrip()
+            if any(prefix.endswith(signal) for signal in _READ_ONLY_PREFIXES):
+                continue
+            if path != target_norm:
+                paths.add(path)
+        if paths:
+            offending.extend(sorted(paths))
+
+    return sorted(set(offending))
+
+
+def _normalize_path_text(path):
+    """Normalize candidate path text for comparisons."""
+    return Path(path).as_posix().strip().rstrip(".,:;)]}`\"'")
+
+
 def validate_specs(specs_dir):
     """
     Validate all spec files in the specs directory.
@@ -168,6 +230,12 @@ def validate_specs(specs_dir):
             _, target_warning = classify_target_path(spec["target"])
             if target_warning:
                 warnings.append(f"{task_name}: {target_warning}")
+            extra_write_paths = _sentence_paths_with_write_intent(spec["body"], spec["target"])
+            if extra_write_paths:
+                errors.append(
+                    f"{task_name}: spec body instructs writes outside target '{spec['target']}': "
+                    + ", ".join(extra_write_paths)
+                )
 
         # Check for duplicate targets
         if spec["target"] in seen_targets:

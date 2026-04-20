@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "templates"))
 
 from orchestrator.spec_parser import (
     classify_target_path,
+    _sentence_paths_with_write_intent,
     parse_frontmatter,
     parse_target_file,
     load_spec,
@@ -215,12 +216,99 @@ class TestValidateSpecs:
         finally:
             os.chdir(old_cwd)
 
+    def test_rejects_write_instructions_for_second_file(self, tmp_path):
+        specs = tmp_path / "specs"
+        specs.mkdir()
+        tests = tmp_path / "tests"
+        tests.mkdir()
+        (specs / "task-001-foo.md").write_text(textwrap.dedent("""\
+            ---
+            target: src/foo.py
+            test: tests/test_001_foo.py
+            ---
+            Update src/foo.py to expose the formatter. Also create tests/test_001_helper.py for coverage.
+        """))
+        (tests / "test_001_foo.py").write_text("def test_x(): pass")
+
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            errors, warnings = validate_specs(specs)
+            assert errors == [
+                "task-001-foo: spec body instructs writes outside target 'src/foo.py': tests/test_001_helper.py"
+            ]
+        finally:
+            os.chdir(old_cwd)
+
+    def test_allows_read_only_reference_to_other_file(self, tmp_path):
+        specs = tmp_path / "specs"
+        specs.mkdir()
+        tests = tmp_path / "tests"
+        tests.mkdir()
+        (specs / "task-001-foo.md").write_text(textwrap.dedent("""\
+            ---
+            target: src/foo.py
+            test: tests/test_001_foo.py
+            ---
+            Update src/foo.py so it matches the payload shape described in docs/contracts.md.
+            See tests/test_001_foo.py for examples.
+        """))
+        (tests / "test_001_foo.py").write_text("def test_x(): pass")
+
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            errors, warnings = validate_specs(specs)
+            assert errors == []
+        finally:
+            os.chdir(old_cwd)
+
+    def test_ignores_code_fence_write_examples(self, tmp_path):
+        specs = tmp_path / "specs"
+        specs.mkdir()
+        tests = tmp_path / "tests"
+        tests.mkdir()
+        (specs / "task-001-foo.md").write_text(textwrap.dedent("""\
+            ---
+            target: src/foo.py
+            test: tests/test_001_foo.py
+            ---
+            Update src/foo.py.
+
+            ```text
+            create docs/example.md
+            ```
+        """))
+        (tests / "test_001_foo.py").write_text("def test_x(): pass")
+
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            errors, warnings = validate_specs(specs)
+            assert errors == []
+        finally:
+            os.chdir(old_cwd)
+
 
 class TestClassifyTargetPath:
     def test_recognizes_docs_build_and_config_paths(self):
         assert classify_target_path("README.md") == ("docs", None)
         assert classify_target_path("pom.xml") == ("build", None)
         assert classify_target_path("application.yml") == ("config", None)
+
+
+class TestSentencePathsWithWriteIntent:
+    def test_mentions_only_declared_target_is_allowed(self):
+        assert _sentence_paths_with_write_intent(
+            "Modify src/foo.py to add the missing branch.",
+            "src/foo.py",
+        ) == []
+
+    def test_finds_non_target_path_in_same_sentence(self):
+        assert _sentence_paths_with_write_intent(
+            "Update src/foo.py and add docs/usage.md for the new behavior.",
+            "src/foo.py",
+        ) == ["docs/usage.md"]
 
 
 class TestTopologicalSort:

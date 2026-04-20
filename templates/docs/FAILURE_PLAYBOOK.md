@@ -32,9 +32,9 @@ Read `forgeLogs/FAILED-task-NNN-name-<timestamp>.log`. The header now contains:
 - A `Start time:` line at the top and an `End time:` line at the bottom.
 - A **failure class** tag — one of `dependency_cache_missing`,
   `invalid_model_config`, `rate_limit`, `request_too_large`,
-  `forbidden_file_edit`, `collection_error`, `missing_symbol`, `assertion`,
-  `timeout`, `regression_guard`, `merge_conflict`, `gemini_quota_exhausted`,
-  or `unknown`.
+  `forbidden_file_edit`, `test_file_bug`, `collection_error`, `missing_symbol`,
+  `assertion`, `timeout`, `regression_guard`, `merge_conflict`,
+  `gemini_quota_exhausted`, or `unknown`.
 - The list of models tried in order.
 - The full pytest output from the last attempt.
 
@@ -48,6 +48,7 @@ Use the failure class to pick a strategy before reading the body:
 | `gemini_quota_exhausted` | Gemini daily quota hit before it could fix | Wait until midnight UTC, or fix with Claude now |
 | `request_too_large` | Spec exceeds the model's TPM cap | Split the spec into smaller tasks |
 | `forbidden_file_edit` | Model edited a file outside its allowed write scope | If it touched a dependency-owned file, reopen that dependency task or add a follow-up task; otherwise tighten the spec/prompt |
+| `test_file_bug` | The failing assertion originates in the planner-written test file — the implementation models could not fix it because they cannot modify the test | Read the test carefully; if the expected value or contract is wrong, fix the test and re-run |
 | `collection_error` | pytest could not even import the test file | Fix imports or missing module in target file |
 | `missing_symbol` | `ImportError` / `AttributeError` / `NameError` | Add the symbol the test expects, or fix the spec signature |
 | `assertion` | Tests ran but produced wrong answers | Genuine logic bug — debug normally |
@@ -94,8 +95,38 @@ to understand what state it's in.
 - Test expects behavior the spec doesn't describe
 - Spec references dependencies that don't exist yet
 - Spec is ambiguous — two valid interpretations possible
+- Failure class is `test_file_bug` (see below)
 
 → Fix the **spec AND tests first**, then fix the implementation.
+
+#### `test_file_bug` — planner-written test is wrong
+
+The orchestrator sets this class when two conditions are both true:
+
+1. The pytest `FAILED` summary line identifies the failing test as being in
+   the task's own test file (e.g. `FAILED tests/test_002_foo.py::test_bar`).
+2. A `HINT:` line appears in the test output or orchestrator log pointing at
+   the test/spec side.
+
+When you see `test_file_bug`, automated retries were stopped immediately
+because implementation models cannot modify the test file. Fix the test (and
+spec if needed) directly, then run `make run`.
+
+**Adding a `HINT:` line (for planners and reviewers)**
+
+If you spot a test-side bug while reading a failure log, you can help the
+orchestrator classify the next attempt correctly by adding a `HINT:` line to
+the test output. The simplest way is to add a failing assertion message in the
+test itself:
+
+```python
+assert result == expected, "HINT: expected value in the test is incorrect — update the fixture"
+```
+
+The orchestrator scans for lines starting with `HINT:` and uses the text as
+supporting evidence when the `FAILED` summary already points at the task's
+test file. Without a `HINT:`, the failure is classified as `assertion` and
+the full model ladder runs before escalating.
 
 **Implementation problem indicators:**
 - Functions exist but have wrong logic
@@ -129,7 +160,7 @@ on re-run and skips them automatically.
 
 Tell the user to re-run:
 ```bash
-python3 -m orchestrator
+make run
 ```
 
 Fixed tasks are detected as passing and skipped. Still-failing tasks get
